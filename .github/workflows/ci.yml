@@ -1,0 +1,30 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      JAO_LLM_PROVIDER: mock
+      JAO_DATABASE_URL: sqlite:///./data/test.db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: pip install -e '.[dev]'
+      - run: mkdir -p data && alembic upgrade head
+      - run: ruff check .
+      - run: pytest tests/unit tests/integration
+      - run: python -m playwright install --with-deps chromium
+      - run: pytest tests/e2e
+      - working-directory: frontend
+        run: npm ci
+      - working-directory: frontend
+        run: npm test
+      - working-directory: frontend
+        run: npm run typecheck
+      - working-directory: frontend
+        run: npm run lint
+      - working-directory: frontend
+        run: npm run build

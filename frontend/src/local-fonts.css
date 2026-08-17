@@ -1,0 +1,12 @@
+:root,
+.brandmark,
+.title h1,
+.adapterlogo,
+.model h2 {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.title h1,
+.model h2 {
+  font-weight: 700;
+}

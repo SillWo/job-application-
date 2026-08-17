@@ -1,0 +1,1 @@
+.upload.busy{cursor:wait;border-style:solid}.upload.busy span::before{content:"";display:inline-block;width:13px;height:13px;margin-right:9px;vertical-align:-2px;border:2px solid #e5e5e5;border-top-color:#0a0a0a;border-radius:50%;animation:upload-spin .8s linear infinite}@keyframes upload-spin{to{transform:rotate(360deg)}}

@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+from typing import Any, Literal, Protocol
+
+from pydantic import BaseModel, Field
+
+from backend.schemas.domain import ApplicationPlan, JobPosting
+
+
+class AdapterManifest(BaseModel):
+    site_id: str
+    display_name: str
+    allowed_domains: tuple[str, ...]
+    supports_work_format: bool = True
+    supports_submission: bool = True
+    safe_live_modes: tuple[str, ...] = ("analysis_only",)
+
+
+class LoginState(BaseModel):
+    authenticated: bool
+    message: str
+
+
+class JobRef(BaseModel):
+    external_id: str
+    url: str
+
+
+class ApplicationForm(BaseModel):
+    requires_cover_letter: bool = False
+    questions: list[str] = Field(default_factory=list)
+
+
+class FillResult(BaseModel):
+    success: bool
+    unknown_questions: list[str] = Field(default_factory=list)
+
+
+class SubmissionResult(BaseModel):
+    status: Literal["submitted", "already_applied", "unknown", "blocked"]
+    message: str
+
+
+class Blocker(BaseModel):
+    kind: Literal["captcha", "mfa", "blocked", "test", "sensitive", "unknown_form"]
+    message: str
+
+
+class JobSiteAdapter(Protocol):
+    site_id: str
+    display_name: str
+    allowed_domains: tuple[str, ...]
+    manifest: AdapterManifest
+
+    async def start(self, context: Any, settings: dict) -> None: ...
+    async def get_login_state(self, page: Any) -> LoginState: ...
+    async def open_search(self, page: Any, filters: dict) -> None: ...
+    async def collect_job_refs(self, page: Any) -> list[JobRef]: ...
+    async def collect_more_job_refs(self, page: Any) -> list[JobRef]: ...
+    async def open_job(self, page: Any, ref: JobRef) -> None: ...
+    async def extract_job(self, page: Any) -> JobPosting: ...
+    async def detect_page_type(self, page: Any) -> str: ...
+    async def open_application(self, page: Any) -> ApplicationForm: ...
+    async def fill_application(self, page: Any, plan: ApplicationPlan) -> FillResult: ...
+    async def submit_application(self, page: Any) -> SubmissionResult: ...
+    async def verify_submission(self, page: Any) -> SubmissionResult: ...
+    async def detect_blockers(self, page: Any) -> list[Blocker]: ...
