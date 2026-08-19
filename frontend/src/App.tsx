@@ -446,7 +446,7 @@ function SessionPage() {
       sessionResumes.data?.some((resume) => resume.selected_for_matching),
   );
   const adapter = "hh";
-  const [mode, setMode] = useState("autopilot");
+  const mode = "autopilot";
   const [viewedLimit, setViewedLimit] = useState("30");
   const [applicationLimit, setApplicationLimit] = useState("5");
   const [unlimitedViewed, setUnlimitedViewed] = useState(false);
@@ -522,19 +522,7 @@ function SessionPage() {
                 <option value="hh">HH.ru</option>
               </select>
             </label>
-            <label>
-              Режим
-              <select
-                value={mode}
-                onChange={(e) => setMode(e.target.value)}
-              >
-                <option value="analysis_only">Только анализ</option>
-                <option value="review_before_submit">
-                  Проверять перед отправкой
-                </option>
-                <option value="autopilot">Автопилот</option>
-              </select>
-            </label>
+            
           </div>
           <div className="row session-limits">
             <label>
@@ -650,8 +638,8 @@ function SessionPage() {
             {[
               ["Просмотрено", "viewed"],
               ["Отфильтровано", "filtered"],
-              ["Подходит", "matched"],
-              ["Отправлено", "submitted"],
+
+              ["Отклики", "submitted"],
               ["Уже откликались", "already_applied"],
               ["Тестовые", "skipped_test"],
               ["Проверка", "review"],

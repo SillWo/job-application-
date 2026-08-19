@@ -34,7 +34,12 @@ from backend.persistence.models import (
     ReviewItem,
     Vacancy,
 )
-from backend.schemas.domain import CandidateProfileData, ResumeData, SessionStatus
+from backend.schemas.domain import (
+    RELEVANCE_SCORE_THRESHOLD,
+    CandidateProfileData,
+    ResumeData,
+    SessionStatus,
+)
 from backend.services.reports import ensure_report_pdf
 from backend.services.resume import profile_from_import, resume_from_import, save_and_extract
 
@@ -46,7 +51,13 @@ class SessionCreate(BaseModel):
     # losing launch settings such as unlimited limits.
     model_config = ConfigDict(extra="forbid")
     profile_id: int
-    score_threshold: int = Field(default=75, ge=0, le=100)
+    # The relevance cutoff is an application invariant. Keep the field for
+    # compatibility with clients that send it, but reject every other value.
+    score_threshold: int = Field(
+        default=RELEVANCE_SCORE_THRESHOLD,
+        ge=RELEVANCE_SCORE_THRESHOLD,
+        le=RELEVANCE_SCORE_THRESHOLD,
+    )
     adapter_id: str
     mode: str = "analysis_only"
     viewed_limit: int | None = Field(default=30, ge=1)

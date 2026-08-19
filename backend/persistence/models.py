@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
+from backend.schemas.domain import RELEVANCE_SCORE_THRESHOLD
+
 from .database import Base
 
 
@@ -78,7 +80,9 @@ class JobSession(Base):
         ForeignKey("search_policies.id"), nullable=True
     )
     score_threshold: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="75"
+        Integer,
+        nullable=False,
+        server_default=str(RELEVANCE_SCORE_THRESHOLD),
     )
     adapter_id: Mapped[str] = mapped_column(String(50))
     mode: Mapped[str] = mapped_column(String(40), default="analysis_only")

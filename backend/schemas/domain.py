@@ -228,9 +228,12 @@ def default_scoring_criteria() -> list[ScoringCriterion]:
     ]
 
 
+RELEVANCE_SCORE_THRESHOLD = 70
+
+
 class SearchPolicy(BaseModel):
     request_text: str = Field(min_length=10)
-    score_threshold: int = Field(default=70, ge=0, le=100)
+    score_threshold: int = Field(default=RELEVANCE_SCORE_THRESHOLD, ge=0, le=100)
     green_flags: list[str] = Field(default_factory=list)
     red_flags: list[str] = Field(default_factory=list)
     flag_confidence_threshold: float = Field(default=0.70, ge=0, le=1)

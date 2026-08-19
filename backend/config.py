@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # - vacancy relevance analysis
     openai_base_url: str = "http://127.0.0.1:8045/v1"
     openai_api_key: str = "sk-placeholder"
-    openai_model: str = "gemini-3-flash"
+    openai_model: str = "gemini-3.7-flash-high"
     openai_timeout: float = 180.0
 
     # Relevance analysis still uses the dedicated adapter, but that adapter

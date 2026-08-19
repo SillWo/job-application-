@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from backend.schemas.domain import SearchPolicy
+from backend.schemas.domain import RELEVANCE_SCORE_THRESHOLD, SearchPolicy
 
 _NON_FACT_FLAG_TERMS = re.compile(
     r"(зарплат|salary|оклад|ожидан|отклик|reply|application|cover\s+letter|сопровод|письм|заполн|форма|вопрос|ответ|анкета|отправ|"
@@ -248,7 +248,9 @@ def _legacy_flags(request_text: str) -> tuple[list[str], list[str]]:
     return list(dict.fromkeys(green)), list(dict.fromkeys(red))
 
 
-def compile_policy(request_text: str, score_threshold: int = 75) -> SearchPolicy:
+def compile_policy(
+    request_text: str, score_threshold: int = RELEVANCE_SCORE_THRESHOLD
+) -> SearchPolicy:
     """Synchronous legacy compiler used for migrations and unavailable models."""
     green, red = _legacy_flags(request_text)
     green, red = _merge_request_coverage(request_text, green, red)
@@ -261,7 +263,7 @@ def compile_policy(request_text: str, score_threshold: int = 75) -> SearchPolicy
 
 
 async def compile_policy_with_ai(
-    request_text: str, score_threshold: int = 75, gateway=None
+    request_text: str, score_threshold: int = RELEVANCE_SCORE_THRESHOLD, gateway=None
 ) -> SearchPolicy:
     """Compile a policy through the dedicated structured AI role.
 
