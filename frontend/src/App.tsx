@@ -1,5 +1,5 @@
-import { ReactNode, useEffect, useState } from "react";
-import { NavLink, Route, Routes } from "react-router-dom";
+import { ReactNode, useEffect, useId, useRef, useState } from "react";
+import { NavLink, Route, Routes, useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
 import type {
@@ -12,35 +12,58 @@ import type {
   Language,
   PersonalProfileData,
   Profile,
-  Report,
   Resume,
-  Review,
+  ScoreComponent,
   Vacancy,
+  VacancyPage,
   WorkExperience,
+  Notification,
 } from "./types";
+
+const RELEVANCE_CRITERIA: ReadonlyArray<{ key: string; title: string; maxPoints: number; weight: number }> = [
+  { key: "title", title: "Название должности", maxPoints: 2, weight: 5 },
+  { key: "tasks", title: "Задачи", maxPoints: 3, weight: 30 },
+  { key: "industry", title: "Сфера", maxPoints: 4, weight: 25 },
+  { key: "required_years", title: "Годы опыта", maxPoints: 2, weight: 20 },
+  { key: "languages", title: "Языки", maxPoints: 2, weight: 10 },
+  { key: "skills", title: "Навыки", maxPoints: 3, weight: 10 },
+];
+
+function presentationBreakdown(rows: ScoreComponent[]): ScoreComponent[] {
+  return RELEVANCE_CRITERIA.map((criterion) => {
+    const row = rows.find((candidate) => candidate.key === criterion.key);
+    const hasRawScore = typeof row?.raw_points === "number" && typeof row?.raw_max_points === "number";
+    const points = hasRawScore
+      ? Math.min(criterion.maxPoints, Math.max(0, row!.raw_points!))
+      : Math.round(Math.min(1, Math.max(0, (row?.points ?? 0) / (row?.max_points || 1))) * criterion.maxPoints);
+    const rawPoints = hasRawScore
+      ? Math.min(criterion.maxPoints, Math.max(0, row!.raw_points!))
+      : points;
+    return {
+      ...(row ?? { key: criterion.key, description: "", explanation: "", evidence: [] }),
+      key: criterion.key,
+      title: criterion.title,
+      max_points: criterion.weight,
+      points: Math.round((rawPoints / criterion.maxPoints) * criterion.weight),
+      raw_points: rawPoints,
+      raw_max_points: criterion.maxPoints,
+    };
+  });
+}
 
 const nav = [
   ["/", "Обзор"],
   ["/profile", "Профиль"],
   ["/sites", "Сайты"],
   ["/session", "Сессия"],
-  ["/reviews", "Проверка"],
   ["/vacancies", "Вакансии"],
-  ["/reports", "Отчёты"],
   ["/model", "Модель"],
 ];
 
 function Shell({ children }: { children: ReactNode }) {
-  const model = useQuery({
-    queryKey: ["model"],
-    queryFn: () =>
-      api<{ connected: boolean; model_available: boolean; model: string }>(
-        "/model/status",
-      ),
-  });
   return (
     <div className="shell">
-      <aside className="sidebar" aria-label="Основная навигация">
+      <header className="topbar"><div className="topbar-inner">
         <div className="brand">
           <span className="brandmark">J</span>
           <div>
@@ -48,29 +71,15 @@ function Shell({ children }: { children: ReactNode }) {
             <small>локальный агент</small>
           </div>
         </div>
-        <nav>
+        <nav className="topbar-nav" aria-label="Основная навигация">
           {nav.map(([to, label]) => (
             <NavLink key={to} to={to} end={to === "/"}>
               {label}
             </NavLink>
           ))}
         </nav>
-        <div className="privacy">
-          <span>Данные остаются локально</span>
-          <small>Cookies и резюме не покидают компьютер</small>
-        </div>
-      </aside>
-      <main>
-        <header>
-          <div>
-            <span className={`dot ${model.data?.connected ? "ok" : ""}`}></span>
-            {model.data?.connected ? model.data.model : "Ollama недоступна"}
-          </div>
-          <a href="/docs" target="_blank">
-            API
-          </a>
-        </header>
-        {children}
+        <div className="topbar-actions"><Notifications /><a href="/docs" target="_blank">API</a></div></div></header>
+      <main>{children}
       </main>
     </div>
   );
@@ -124,14 +133,6 @@ function Dashboard() {
     queryKey: ["sessions"],
     queryFn: () => api<JobSession[]>("/sessions"),
   });
-  const reviews = useQuery({
-    queryKey: ["reviews"],
-    queryFn: () => api<Review[]>("/reviews"),
-  });
-  const reports = useQuery({
-    queryKey: ["reports"],
-    queryFn: () => api<Report[]>("/reports"),
-  });
   const active = sessions.data?.[0];
   return (
     <section className="page">
@@ -151,18 +152,6 @@ function Dashboard() {
           <small>Последняя сессия</small>
           <strong>{active?.status ?? "Нет"}</strong>
           <span>{active?.adapter_id ?? "создайте первую"}</span>
-        </article>
-        <article>
-          <small>Ручная проверка</small>
-          <strong>
-            {reviews.data?.filter((x) => x.status === "pending").length ?? "—"}
-          </strong>
-          <span>требуют решения</span>
-        </article>
-        <article>
-          <small>Отчёты</small>
-          <strong>{reports.data?.length ?? "—"}</strong>
-          <span>локальных файлов</span>
         </article>
       </div>
       <div className="grid2">
@@ -186,18 +175,18 @@ function Dashboard() {
         </article>
         <article className="panel dark">
           <span className="eyebrow">ПРИНЦИП РАБОТЫ</span>
-          <h2>ИИ ищет и откликается</h2>
+          <h2>ИИ ищет подходящие вакансии</h2>
           <p>
             Ваш запрос на естественном языке учитывается при оценке каждой вакансии.
-            Подходящие варианты проходят проверку перед откликом на HH.ru; CAPTCHA и вход
-            в аккаунт передаются пользователю.
+            На HireHi подходящие вакансии собираются в PDF-отчёт без отправки откликов.
+            На HH.ru отклики возможны после проверки пользователем.
           </p>
           <div className="flow">
             <span>Запрос</span>
             <i>→</i>
             <span>Оценить</span>
             <i>→</i>
-            <span>Проверить / откликнуться</span>
+            <span>Проверить и получить отчёт</span>
           </div>
         </article>
       </div>
@@ -284,41 +273,131 @@ function PersonalEditor({
         <div><span className="eyebrow">БЛОК 1</span><h2>Личная информация</h2></div>
         <span className="profile-progress">Профиль кандидата</span>
       </div>
-      <div className="row">
-        <label>ФИО<input value={value.full_name ?? ""} onChange={(e) => change("full_name", e.target.value)} /></label>
-        <label>Место проживания<input value={value.residence ?? ""} onChange={(e) => change("residence", e.target.value)} /></label>
+      <div className="form-content">
+      <div className="profile-pair-row">
+        <label className="profile-field">ФИО<input value={value.full_name ?? ""} onChange={(e) => change("full_name", e.target.value)} /></label>
+        <label className="profile-field">Место проживания<input value={value.residence ?? ""} onChange={(e) => change("residence", e.target.value)} /></label>
       </div>
-      <label>Где ищу работу<input value={value.job_search_locations.join(", ")} onChange={(e) => change("job_search_locations", e.target.value.split(",").map((item) => item.trim()).filter(Boolean))} placeholder="Города или направления через запятую" /></label>
-      <div className="subsection">
+      <label className="profile-full-field">Где ищу работу<input value={value.job_search_locations.join(", ")} onChange={(e) => change("job_search_locations", e.target.value.split(",").map((item) => item.trim()).filter(Boolean))} placeholder="Города или направления через запятую" /></label>
+      <div className="subsection form-rail">
         <div className="section-heading"><div><h3>Контакты</h3><small>Телефон, email и список мессенджеров.</small></div><button type="button" className="secondary" onClick={() => change("contacts", { ...value.contacts, messengers: [...value.contacts.messengers, ""] })}>+ Мессенджер</button></div>
         <div className="repeat-list">
-          <div className="repeat-row"><label>Телефон<input aria-label="Телефон" value={value.contacts.phone ?? ""} onChange={(e) => change("contacts", { ...value.contacts, phone: e.target.value })} /></label><label>Email<input aria-label="Email" value={value.contacts.email ?? ""} onChange={(e) => change("contacts", { ...value.contacts, email: e.target.value })} /></label></div>
-          {value.contacts.messengers.map((messenger, index) => <div className="repeat-row" key={index}><input aria-label={`Мессенджер ${index + 1}`} value={messenger} onChange={(e) => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.map((item, itemIndex) => itemIndex === index ? e.target.value : item) })} placeholder="Telegram, WhatsApp или другой мессенджер" /><button type="button" className="icon-button" aria-label={`Удалить мессенджер ${index + 1}`} onClick={() => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div>)}
+          <div className="profile-pair-row"><label className="profile-field">Телефон<input aria-label="Телефон" value={value.contacts.phone ?? ""} onChange={(e) => change("contacts", { ...value.contacts, phone: e.target.value })} /></label><label className="profile-field">Email<input aria-label="Email" value={value.contacts.email ?? ""} onChange={(e) => change("contacts", { ...value.contacts, email: e.target.value })} /></label></div>
+          {value.contacts.messengers.map((messenger, index) => <div className="profile-remove-row" key={index}><input className="profile-field" aria-label={`Мессенджер ${index + 1}`} value={messenger} onChange={(e) => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.map((item, itemIndex) => itemIndex === index ? e.target.value : item) })} placeholder="Telegram, WhatsApp или другой мессенджер" /><button type="button" className="icon-button" aria-label={`Удалить мессенджер ${index + 1}`} onClick={() => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div>)}
         </div>
       </div>
-      <div className="subsection">
+      <div className="subsection form-rail">
         <div className="section-heading"><div><h3>Образование</h3><small>Выберите тип для каждого учебного заведения.</small></div><button type="button" className="secondary" onClick={() => change("education", [...value.education, newEducation()])}>+ Образование</button></div>
         <div className="repeat-list">
-          {value.education.map((item, index) => <div className="nested-card" key={index}>
-            <div className="repeat-row"><select aria-label={`Тип образования ${index + 1}`} value={item.type} onChange={(e) => changeEducation(index, { type: e.target.value as EducationType })}>{educationOptions.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select><button type="button" className="icon-button" aria-label={`Удалить образование ${index + 1}`} onClick={() => change("education", value.education.filter((_, itemIndex) => itemIndex !== index))}>×</button></div>
-            <div className="row">
-              <label>{item.type === "higher" ? "Университет" : "Учебное заведение"}<input value={item.institution} onChange={(e) => changeEducation(index, { institution: e.target.value })} /></label>
-              {item.type !== "school" && <label>Факультет<input value={item.faculty ?? ""} onChange={(e) => changeEducation(index, { faculty: e.target.value })} /></label>}
+          {value.education.map((item, index) => <div className="nested-card education-card" key={index}>
+            <div className="profile-remove-row profile-education-header"><select className="profile-field" aria-label={`Тип образования ${index + 1}`} value={item.type} onChange={(e) => changeEducation(index, { type: e.target.value as EducationType })}>{educationOptions.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select><button type="button" className="icon-button" aria-label={`Удалить образование ${index + 1}`} onClick={() => change("education", value.education.filter((_, itemIndex) => itemIndex !== index))}>×</button></div>
+            <div className={item.type === "school" ? "profile-full-field" : "profile-pair-row"}>
+              <label className="profile-field">{item.type === "higher" ? "Университет" : "Учебное заведение"}<input value={item.institution} onChange={(e) => changeEducation(index, { institution: e.target.value })} /></label>
+              {item.type !== "school" && <label className="profile-field">Факультет<input value={item.faculty ?? ""} onChange={(e) => changeEducation(index, { faculty: e.target.value })} /></label>}
             </div>
-            {item.type === "higher" && <label>Степень<select value={item.degree ?? ""} onChange={(e) => changeEducation(index, { degree: (e.target.value || null) as Degree | null })}><option value="">Выберите степень</option><option value="bachelor">Бакалавр</option><option value="master">Магистр</option><option value="specialist">Специалист</option><option value="postgraduate">Аспирант</option></select></label>}
-            {item.type !== "school" && <label>Специальность<input value={item.specialty ?? ""} onChange={(e) => changeEducation(index, { specialty: e.target.value })} /></label>}
-            <div className="row"><label>Дата начала обучения<input type="month" value={item.start_date ?? ""} onChange={(e) => changeEducation(index, { start_date: e.target.value || null })} /></label><label>Дата окончания обучения<input type="month" value={item.end_date ?? ""} onChange={(e) => changeEducation(index, { end_date: e.target.value || null })} /></label></div>
+            {item.type === "higher" && <label className="profile-full-field">Степень<select value={item.degree ?? ""} onChange={(e) => changeEducation(index, { degree: (e.target.value || null) as Degree | null })}><option value="">Выберите степень</option><option value="bachelor">Бакалавр</option><option value="master">Магистр</option><option value="specialist">Специалист</option><option value="postgraduate">Аспирант</option></select></label>}
+            {item.type !== "school" && <label className="profile-full-field">Специальность<input value={item.specialty ?? ""} onChange={(e) => changeEducation(index, { specialty: e.target.value })} /></label>}
+            <div className="profile-pair-row"><label className="profile-field">Дата начала обучения<input type="month" value={item.start_date ?? ""} onChange={(e) => changeEducation(index, { start_date: e.target.value || null })} /></label><label className="profile-field">Дата окончания обучения<input type="month" value={item.end_date ?? ""} onChange={(e) => changeEducation(index, { end_date: e.target.value || null })} /></label></div>
           </div>)}
         </div>
       </div>
-      <div className="subsection">
+      <div className="subsection form-rail">
         <div className="section-heading"><div><h3>Языки</h3><small>Язык и уровень владения.</small></div><button type="button" className="secondary" onClick={() => change("languages", [...value.languages, { language: "", proficiency: "" }])}>+ Язык</button></div>
-        <div className="repeat-list">{value.languages.map((language, index) => <div className="repeat-row" key={index}><input aria-label={`Язык ${index + 1}`} value={language.language} onChange={(e) => changeLanguage(index, { language: e.target.value })} placeholder="Например, английский" /><input aria-label={`Уровень языка ${index + 1}`} value={language.proficiency} onChange={(e) => changeLanguage(index, { proficiency: e.target.value })} placeholder="Например, B2" /><button type="button" className="icon-button" aria-label={`Удалить язык ${index + 1}`} onClick={() => change("languages", value.languages.filter((_, itemIndex) => itemIndex !== index))}>×</button></div>)}</div>
+        <div className="repeat-list">{value.languages.map((language, index) => <div className="profile-pair-remove-row" key={index}><input className="profile-field" aria-label={`Язык ${index + 1}`} value={language.language} onChange={(e) => changeLanguage(index, { language: e.target.value })} placeholder="Например, английский" /><input className="profile-field" aria-label={`Уровень языка ${index + 1}`} value={language.proficiency} onChange={(e) => changeLanguage(index, { proficiency: e.target.value })} placeholder="Например, B2" /><button type="button" className="icon-button" aria-label={`Удалить язык ${index + 1}`} onClick={() => change("languages", value.languages.filter((_, itemIndex) => itemIndex !== index))}>×</button></div>)}</div>
       </div>
       <label className="checkline"><input type="checkbox" checked={value.driver_license ?? false} onChange={(e) => change("driver_license", e.target.checked)} /> Есть водительские права</label>
       <div className="actions"><button type="button" onClick={onSave} disabled={saving}>{saving ? "Сохраняю…" : "Сохранить личный профиль"}</button></div>
+      </div>
     </article>
   );
+}
+
+function MultiSelect({
+  label,
+  hint,
+  options,
+  values,
+  onToggle,
+}: {
+  label: string;
+  hint?: string;
+  options: ReadonlyArray<readonly [string, string]>;
+  values: string[];
+  onToggle: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const listId = useId();
+  const selectedLabels = options.filter(([value]) => values.includes(value)).map(([, optionLabel]) => optionLabel);
+  return <div className="multi-select field-wide">
+    <button type="button" className="multi-select-trigger" aria-label={label} aria-expanded={open} aria-controls={listId} onClick={() => setOpen((current) => !current)}>
+      <span className="multi-select-trigger-copy"><span className="multi-select-label">{label}</span><span className="multi-select-value">{selectedLabels.join(", ") || "Выберите варианты"}</span></span>
+      <span className={`multi-select-chevron${open ? " is-open" : ""}`} aria-hidden="true">⌄</span>
+    </button>
+    {hint && <small className="multi-select-hint">{hint}</small>}
+    {open && <div className="multi-select-popover" id={listId}>
+      <div className="multi-select-options">
+        {options.map(([value, optionLabel]) => <label className={`multi-select-option${values.includes(value) ? " is-selected" : ""}`} key={value}>
+          <input type="checkbox" checked={values.includes(value)} onChange={() => onToggle(value)} />
+          <span>{optionLabel}</span>
+        </label>)}
+      </div>
+      <button type="button" className="multi-select-confirm" onClick={() => setOpen(false)}>Выбрать</button>
+    </div>}
+  </div>;
+}
+
+export function Notifications() {
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
+  const knownIds = useRef<Set<number> | null>(null);
+  const query = useQuery({ queryKey: ["notifications"], queryFn: async () => { const value = await api<unknown>("/notifications"); return Array.isArray(value) ? value as Notification[] : []; }, refetchInterval: import.meta.env.MODE === "test" ? false : 2500, refetchIntervalInBackground: false, retry: false });
+  // Keep the client ordering identical to the API ordering.  The id tie-breaker
+  // is important when SQLite timestamps have the same precision (and also keeps
+  // malformed/missing timestamps from making the order unstable).
+  const notifications = [...(Array.isArray(query.data) ? query.data : [])].sort((a, b) => {
+    const byDate = (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0);
+    return byDate || b.id - a.id;
+  });
+  const unread = notifications.filter((item) => !item.read_at).length;
+  useEffect(() => {
+    if (!query.data) return;
+    const ids = new Set(query.data.map((item) => item.id));
+    if (knownIds.current && [...ids].some((id) => !knownIds.current!.has(id))) {
+      try {
+        const AudioContextClass = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (AudioContextClass) {
+          const context = new AudioContextClass();
+          const oscillator = context.createOscillator();
+          const gain = context.createGain();
+          oscillator.frequency.value = 660; gain.gain.setValueAtTime(0.04, context.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.12);
+          oscillator.connect(gain); gain.connect(context.destination); oscillator.onended = () => { void context.close().catch(() => undefined); }; oscillator.start(); oscillator.stop(context.currentTime + 0.12);
+        }
+      } catch { /* autoplay and unavailable AudioContext are harmless */ }
+    }
+    knownIds.current = ids;
+  }, [query.data]);
+  const markRead = async (item: Notification) => {
+    try {
+      if (!item.read_at) await api(`/notifications/${item.id}/read`, { method: "PATCH" });
+    } finally {
+      setOpen(false); navigate(item.target_path || "/session");
+      if (!item.read_at) await query.refetch().catch(() => undefined);
+    }
+  };
+  const readAll = async () => { if (unread) { await api("/notifications/read-all", { method: "POST" }); await query.refetch(); } };
+  return <div className="notifications" onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setOpen(false); }}>
+    <button type="button" className="notification-trigger" aria-label="Уведомления" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+      <svg className="notification-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+        <path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+        <path d="M10 21h4" />
+      </svg>{unread > 0 && <i role="status" className="notification-badge" aria-label={`${unread} непрочитанных`} />}
+    </button>
+    {open && <div className="notification-popover" role="dialog" aria-label="Уведомления">
+      <div className="notification-head"><strong>Уведомления</strong><button type="button" onClick={() => void readAll()} disabled={!unread}>Прочитать все</button></div>
+      {query.isLoading ? <p className="notification-empty">Загрузка…</p> : notifications.length === 0 ? <p className="notification-empty">Новых уведомлений нет</p> : <div className="notification-list">{notifications.map((item) => <button type="button" className={`notification-item${item.read_at ? "" : " unread"}`} key={item.id} onClick={() => void markRead(item)}><strong>{item.title}</strong><span>{item.message}</span><time dateTime={item.created_at}>{new Date(item.created_at).toLocaleString("ru-RU")}</time></button>)}</div>}
+    </div>}
+  </div>;
 }
 
 function ResumeEditor({ value, onSave, onCancel, saving }: { value: Resume; onSave: (value: Resume) => void; onCancel: () => void; saving: boolean }) {
@@ -331,16 +410,18 @@ function ResumeEditor({ value, onSave, onCancel, saving }: { value: Resume; onSa
   const updateExperience = (index: number, next: Partial<WorkExperience>) => update({ experiences: draft.experiences.map((item, itemIndex) => itemIndex === index ? { ...item, ...next } : item) });
   return <article className="panel form resume-editor">
     <div className="panelhead"><div><span className="eyebrow">БЛОК 2</span><h2>{draft.id ? "Редактирование резюме" : "Новое резюме"}</h2></div><button type="button" className="icon-button" onClick={onCancel} aria-label="Закрыть редактор резюме">×</button></div>
-    <label>Название резюме<input value={draft.name} onChange={(e) => update({ name: e.target.value })} placeholder="Например, Product Manager" /></label>
-    <div className="row"><label>Предполагаемая должность<input value={draft.desired_title ?? ""} onChange={(e) => update({ desired_title: e.target.value })} /></label><label>Желаемый доход<input value={draft.desired_salary ?? ""} onChange={(e) => update({ desired_salary: e.target.value })} placeholder="Например, 180 000 ₽" /></label></div>
-    <fieldset><legend>Желаемый тип занятости</legend><div className="option-grid">{employmentOptions.map(([key, label]) => <label className="checkline" key={key}><input type="checkbox" checked={draft.employment_types.includes(key)} onChange={() => toggleEmployment(key)} />{label}</label>)}</div></fieldset>
-    <div className="subsection"><div className="section-heading"><div><h3>Формат работы</h3><small>Можно выбрать несколько вариантов.</small></div></div><div className="option-grid">{formatOptions.map(([key, label]) => <label className="checkline" key={key}><input type="checkbox" checked={draft.work_formats.includes(key)} onChange={() => update({ work_formats: draft.work_formats.includes(key) ? draft.work_formats.filter((item) => item !== key) : [...draft.work_formats, key] })} />{label}</label>)}</div></div>
-    <label>Командировки<select value={draft.business_trips === null || draft.business_trips === undefined ? "" : draft.business_trips ? "can" : "cannot"} onChange={(e) => update({ business_trips: e.target.value === "" ? null : e.target.value === "can" })}><option value="">Выберите вариант</option><option value="can">Могу</option><option value="cannot">Не могу</option></select></label>
-    <div className="subsection"><div className="section-heading"><div><h3>Опыт работы</h3><small>Добавьте должности и обязанности.</small></div><button type="button" className="secondary" onClick={() => update({ experiences: [...draft.experiences, newExperience()] })}>+ Опыт</button></div><div className="repeat-list">{draft.experiences.map((experience, index) => <div className="nested-card" key={index}><div className="repeat-row"><strong>Опыт #{index + 1}</strong><button type="button" className="icon-button" aria-label={`Удалить опыт ${index + 1}`} onClick={() => update({ experiences: draft.experiences.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div><div className="row"><label>Компания<input value={experience.company} onChange={(e) => updateExperience(index, { company: e.target.value })} /></label><label>Должность<input value={experience.position} onChange={(e) => updateExperience(index, { position: e.target.value })} /></label></div><div className="row"><label>Начало работы<input type="month" value={experience.start_date ?? ""} onChange={(e) => updateExperience(index, { start_date: e.target.value || null })} /></label><label>Конец работы<input type="month" value={experience.end_date ?? ""} onChange={(e) => updateExperience(index, { end_date: e.target.value || null })} placeholder="Оставьте пустым, если работаете сейчас" /></label></div><label>Описание обязанностей<textarea value={experience.duties} onChange={(e) => updateExperience(index, { duties: e.target.value })} /></label></div>)}</div></div>
-    <label>Навыки<small>Введите навыки через запятую — каждый станет отдельным тегом.</small><input value={skillsText} onChange={(e) => setSkillsText(e.target.value)} placeholder="CustDev, Scrum, аналитика" /></label>
-    <div className="tag-list" aria-label="Навыки">{skillsText.split(",").map((skill) => skill.trim()).filter(Boolean).map((skill) => <span className="tag" key={skill}>{skill}</span>)}</div>
-    <label>О себе<textarea className="about-text" value={draft.about} onChange={(e) => { const words = e.target.value.trim() ? e.target.value.trim().split(/\s+/u) : []; if (words.length <= 500) update({ about: e.target.value }); }} /><small className={wordCount > 500 ? "word-limit" : ""}>{wordCount} / 500 слов</small></label>
-    <div className="actions"><button type="button" onClick={() => onSave({ ...draft, skills: skillsText.split(",").map((skill) => skill.trim()).filter(Boolean) })} disabled={saving}>{saving ? "Сохраняю…" : "Сохранить резюме"}</button><button type="button" className="secondary" onClick={onCancel}>Отмена</button></div>
+    <div className="form-content">
+    <label className="field-medium">Название резюме<input value={draft.name} onChange={(e) => update({ name: e.target.value })} placeholder="Например, Product Manager" /></label>
+    <div className="row form-row"><label className="field-medium">Предполагаемая должность<input value={draft.desired_title ?? ""} onChange={(e) => update({ desired_title: e.target.value })} /></label><label className="field-compact">Желаемый доход<input value={draft.desired_salary ?? ""} onChange={(e) => update({ desired_salary: e.target.value })} placeholder="Например, 180 000 ₽" /></label></div>
+    <MultiSelect label="Желаемый тип занятости" options={employmentOptions} values={draft.employment_types} onToggle={(type) => toggleEmployment(type as EmploymentType)} />
+    <MultiSelect label="Формат работы" hint="Можно выбрать несколько вариантов." options={formatOptions} values={draft.work_formats} onToggle={(format) => update({ work_formats: draft.work_formats.includes(format) ? draft.work_formats.filter((item) => item !== format) : [...draft.work_formats, format] })} />
+    <label className="field-compact">Командировки<select value={draft.business_trips === null || draft.business_trips === undefined ? "" : draft.business_trips ? "can" : "cannot"} onChange={(e) => update({ business_trips: e.target.value === "" ? null : e.target.value === "can" })}><option value="">Выберите вариант</option><option value="can">Могу</option><option value="cannot">Не могу</option></select></label>
+    <div className="subsection form-rail"><div className="section-heading"><div><h3>Опыт работы</h3><small>Добавьте должности и обязанности.</small></div><button type="button" className="secondary" onClick={() => update({ experiences: [...draft.experiences, newExperience()] })}>+ Опыт</button></div><div className="repeat-list">{draft.experiences.map((experience, index) => <div className="nested-card experience-card" key={index}><div className="repeat-row"><strong>Опыт #{index + 1}</strong><button type="button" className="icon-button" aria-label={`Удалить опыт ${index + 1}`} onClick={() => update({ experiences: draft.experiences.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div><div className="row form-row"><label className="field-medium">Компания<input value={experience.company} onChange={(e) => updateExperience(index, { company: e.target.value })} /></label><label className="field-medium">Должность<input value={experience.position} onChange={(e) => updateExperience(index, { position: e.target.value })} /></label></div><div className="row form-row"><label className="field-compact">Начало работы<input type="month" value={experience.start_date ?? ""} onChange={(e) => updateExperience(index, { start_date: e.target.value || null })} /></label><label className="field-compact">Конец работы<input type="month" value={experience.end_date ?? ""} onChange={(e) => updateExperience(index, { end_date: e.target.value || null })} placeholder="Оставьте пустым, если работаете сейчас" /></label></div><label className="field-prose">Описание обязанностей<textarea value={experience.duties} onChange={(e) => updateExperience(index, { duties: e.target.value })} /></label></div>)}</div></div>
+    <label className="field-wide">Навыки<small>Введите навыки через запятую — каждый станет отдельным тегом.</small><input value={skillsText} onChange={(e) => setSkillsText(e.target.value)} placeholder="CustDev, Scrum, аналитика" /></label>
+    <div className="tag-list field-wide" aria-label="Навыки">{skillsText.split(",").map((skill) => skill.trim()).filter(Boolean).map((skill) => <span className="tag" key={skill}>{skill}</span>)}</div>
+    <label className="field-prose">О себе<textarea className="about-text" value={draft.about} onChange={(e) => { const words = e.target.value.trim() ? e.target.value.trim().split(/\s+/u) : []; if (words.length <= 500) update({ about: e.target.value }); }} /><small className={wordCount > 500 ? "word-limit" : ""}>{wordCount} / 500 слов</small></label>
+    <div className="actions form-rail"><button type="button" onClick={() => onSave({ ...draft, skills: skillsText.split(",").map((skill) => skill.trim()).filter(Boolean) })} disabled={saving}>{saving ? "Сохраняю…" : "Сохранить резюме"}</button><button type="button" className="secondary" onClick={onCancel}>Отмена</button></div>
+    </div>
   </article>;
 }
 
@@ -429,6 +510,7 @@ function SessionPage() {
     queryFn: () => api<Profile[]>("/profiles"),
   });
   const sessionProfile = profiles.data?.[0];
+  const adapters = useQuery({ queryKey: ["adapters"], queryFn: async () => { const value = await api<Adapter[] | unknown>("/adapters"); return Array.isArray(value) ? value as Adapter[] : []; } });
   const sessionResumes = useQuery({
     queryKey: ["session-resumes", sessionProfile?.id],
     queryFn: () => api<Resume[]>(`/profiles/${sessionProfile?.id}/resumes`),
@@ -437,16 +519,15 @@ function SessionPage() {
   const sessions = useQuery({
     queryKey: ["sessions"],
     queryFn: () => api<JobSession[]>("/sessions"),
+    refetchInterval: 2000,
   });
-  const current = sessions.data?.[0];
-  const canCreate =
-    !current || ["COMPLETED", "STOPPED", "FAILED"].includes(current.status);
+  const terminalStatuses = ["COMPLETED", "STOPPED", "FAILED"];
   const profileReady = Boolean(
     sessionProfile &&
       sessionResumes.data?.some((resume) => resume.selected_for_matching),
   );
-  const adapter = "hh";
-  const mode = "autopilot";
+  const [adapter, setAdapter] = useState("hh");
+  const blockedByAdapter = (sessions.data ?? []).some((session) => session.adapter_id === adapter && !terminalStatuses.includes(session.status));
   const [viewedLimit, setViewedLimit] = useState("30");
   const [applicationLimit, setApplicationLimit] = useState("5");
   const [unlimitedViewed, setUnlimitedViewed] = useState(false);
@@ -464,7 +545,6 @@ function SessionPage() {
         body: JSON.stringify({
           profile_id: profiles.data?.[0]?.id,
           adapter_id: adapter,
-          mode,
           viewed_limit: unlimitedViewed ? null : Number(viewedLimit),
           application_limit: unlimitedApplications ? null : Number(applicationLimit),
         }),
@@ -479,14 +559,14 @@ function SessionPage() {
           : `Сессия #${session.id} запущена.`,
       );
       void qc.invalidateQueries({ queryKey: ["sessions"] });
+      void qc.invalidateQueries({ queryKey: ["session-report"] });
     },
     onError: (error) => setMessage(error.message),
   });
-  const action = async (name: string) => {
-    if (!current) return;
+  const action = async (sessionId: number, name: string) => {
     try {
       const response = await api<{ message?: string }>(
-        `/sessions/${current.id}/${name}`,
+        `/sessions/${sessionId}/${name}`,
         { method: "POST" },
       );
       setMessage(
@@ -494,13 +574,15 @@ function SessionPage() {
           (name === "start" ? "Сессия запущена." : "Состояние сессии обновлено."),
       );
       await qc.invalidateQueries({ queryKey: ["sessions"] });
+      await qc.invalidateQueries({ queryKey: ["session-report"] });
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Не удалось выполнить действие");
     }
   };
-  const counters = current?.counters ?? {};
-  const formatSessionLimit = (limit: number | null | undefined, legacyDefault: number) =>
-    limit === null ? "без ограничений" : (limit ?? legacyDefault);
+  const formatSessionLimit = (limit: number | null | undefined, legacyDefault: number): string =>
+    limit === null ? "без ограничений" : String(limit ?? legacyDefault);
+  const visibleSessions = (sessions.data ?? []).filter((session) => !terminalStatuses.includes(session.status));
+  const completedSessions = (sessions.data ?? []).filter((session) => terminalStatuses.includes(session.status));
   return (
     <section className="page">
       <Title
@@ -509,20 +591,19 @@ function SessionPage() {
       >
         Наблюдайте, не гадайте
       </Title>
-      {canCreate && (
         <article className="panel form">
-          {current && <span className="eyebrow">НОВАЯ СЕССИЯ</span>}
+          <span className="eyebrow">НОВАЯ СЕССИЯ</span>
           <div className="row">
             <label>
               Сайт
               <select
                 value={adapter}
-                disabled
+                onChange={(e) => setAdapter(e.target.value)}
               >
                 <option value="hh">HH.ru</option>
+                {(adapters.data ?? []).filter((item) => item.site_id !== "hh").map((item) => <option value={item.site_id} key={item.site_id}>{item.display_name}</option>)}
               </select>
             </label>
-            
           </div>
           <div className="row session-limits">
             <label>
@@ -543,9 +624,9 @@ function SessionPage() {
               </span>
             </label>
             <label>
-              Отправить откликов
+              Лимит вакансий в работе
               <input
-                aria-label="Лимит отправленных откликов"
+                aria-label="Лимит вакансий в работе"
                 type="number"
                 min="1"
                 step="1"
@@ -553,21 +634,20 @@ function SessionPage() {
                 disabled={unlimitedApplications}
                 onChange={(e) => setApplicationLimit(e.target.value)}
               />
-              <small>Считаются только отклики, подтверждённые HH.ru как отправленные.</small>
+              <small>{adapter === "hirehi" ? "Считаются выбранные вакансии." : "Считаются отклики, подтверждённые выбранной площадкой."}</small>
               <span className="checkline">
-                <input aria-label="Без ограничений: отправка откликов" type="checkbox" checked={unlimitedApplications} onChange={(e) => setUnlimitedApplications(e.target.checked)} />
+                <input aria-label={adapter === "hirehi" ? "Без ограничений: выбранные вакансии" : "Без ограничений: отправка откликов"} type="checkbox" checked={unlimitedApplications} onChange={(e) => setUnlimitedApplications(e.target.checked)} />
                 Без ограничений
               </span>
             </label>
           </div>
           <button
             onClick={() => create.mutate()}
-            disabled={
-              !profileReady || create.isPending || !limitsAreValid
-            }
+            disabled={!profileReady || create.isPending || !limitsAreValid || blockedByAdapter}
           >
             {create.isPending ? "Запускаем…" : "Создать и запустить"}
           </button>
+          {blockedByAdapter && <p className="notice" role="alert">Для выбранного сайта уже есть незавершённая сессия. Дождитесь её завершения.</p>}
           {!limitsAreValid && (
             <p className="notice error" role="alert">
               Введите целое положительное значение лимита или включите «Без ограничений».
@@ -577,59 +657,76 @@ function SessionPage() {
             <p className="notice">Сначала заполните профиль и выберите хотя бы одно резюме.</p>
           )}
         </article>
-      )}
       {message && (
         <p className={`notice ${create.isError ? "error" : ""}`} role="status">
           {message}
         </p>
       )}
-      {current && (
-        <>
-          <article className="panel sessiontop">
+      {visibleSessions.map((session) => {
+        return <SessionCard key={session.id} session={session} formatSessionLimit={formatSessionLimit} action={action} />;
+      })}
+      {completedSessions.length > 0 && (
+        <details className="session-history">
+          <summary>Завершённые сессии ({completedSessions.length})</summary>
+          {completedSessions.map((session) => (
+            <SessionCard key={session.id} session={session} formatSessionLimit={formatSessionLimit} action={action} />
+          ))}
+        </details>
+      )}
+    </section>
+  );
+}
+
+function SessionCard({ session, formatSessionLimit, action }: { session: JobSession; formatSessionLimit: (limit: number | null | undefined, legacyDefault: number) => string; action: (id: number, name: string) => Promise<void> }) {
+  const report = useQuery({ queryKey: ["session-report", session.id], queryFn: () => api<{ ready: boolean; pdf_url: string | null }>(`/sessions/${session.id}/report`), enabled: session.adapter_id === "hirehi", retry: false, refetchInterval: (query) => query.state.data?.ready ? false : 2000 });
+  const browserAvailable = session.adapter_id === "hh" || session.adapter_id === "hirehi";
+  const counters = session.counters ?? {};
+  return <>
+          <article className="panel sessiontop" data-testid={`session-${session.id}`}>
             <div>
               <span className="eyebrow">
-                СЕССИЯ #{current.id} · {current.adapter_id}
+                СЕССИЯ #{session.id} · {session.adapter_id}
               </span>
               <h2>
-                <Status value={current.status} />
+                <Status value={session.status} />
               </h2>
               <p>
-                {current.stop_reason ||
+                {session.stop_reason ||
                   "Обработка вакансий идёт последовательно"}
               </p>
               <p className="session-limits-summary">
-                Лимиты сессии: просмотр — {formatSessionLimit(current.viewed_limit, 30)}; отправка — {formatSessionLimit(current.application_limit, 5)}.
+                Лимиты сессии: просмотр — {formatSessionLimit(session.viewed_limit, 30)}; {session.adapter_id === "hirehi" ? "выбрано" : "отправка"} — {formatSessionLimit(session.application_limit, 5)}.
               </p>
             </div>
-            <div className="actions">
-              {current.status === "CREATED" && (
+            <div className="actions session-actions">
+              {report.data?.ready && report.data.pdf_url && <a className="button-link session-report-button" aria-label={`Скачать PDF HireHi #${session.id}`} href={report.data.pdf_url} target="_blank" rel="noreferrer"><svg className="session-report-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 3.75h8.25L19 8.5v11.75H6z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/><path d="M14 3.75V9h5M12.5 12v6m0 0-2.5-2.5m2.5 2.5 2.5-2.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg><span>Скачать PDF-отчёт</span></a>}
+              {session.status === "CREATED" && (
                 <>
-                  <button onClick={() => void action("start")}>Запустить</button>
-                  {current.adapter_id === "hh" && (
-                    <button className="secondary" onClick={() => void action("browser")}>Открыть браузер</button>
+                  <button onClick={() => void action(session.id, "start")}>Запустить</button>
+                  {browserAvailable && (
+                    <button className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
                   )}
                 </>
               )}
-              {current.status === "WAITING_FOR_LOGIN" && (
+              {session.status === "WAITING_FOR_LOGIN" && (
                 <>
-                  <button className="secondary" onClick={() => void action("browser")}>Открыть браузер</button>
-                  <button className="secondary" onClick={() => void action("browser/check")}>Проверить вход</button>
-                  <button className="danger" onClick={() => void action("stop")}>Остановить</button>
+                  <button className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
+                  <button className="secondary" onClick={() => void action(session.id, "browser/check")}>Проверить вход</button>
+                  <button className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
                 </>
               )}
-              {current.status === "RUNNING" && (
+              {session.status === "RUNNING" && (
                 <>
-                  {current.adapter_id === "hh" && (
-                    <button className="secondary" onClick={() => void action("browser")}>Открыть браузер</button>
+                  {browserAvailable && (
+                    <button className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
                   )}
-                  <button className="secondary" onClick={() => void action("pause")}>Пауза</button>
-                  <button className="danger" onClick={() => void action("stop")}>Остановить</button>
+                  <button className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
                 </>
               )}
-              {current.status === "PAUSED" && (
+              {session.status === "PAUSED" && (
                 <>
-                  <button onClick={() => void action("resume")}>Продолжить</button>
-                  <button className="danger" onClick={() => void action("stop")}>Остановить</button>
+                  <button onClick={() => void action(session.id, "resume")}>Продолжить</button>
+                  <button className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
                 </>
               )}
             </div>
@@ -640,10 +737,7 @@ function SessionPage() {
               ["Отфильтровано", "filtered"],
 
               ["Отклики", "submitted"],
-              ["Уже откликались", "already_applied"],
-              ["Тестовые", "skipped_test"],
-              ["Проверка", "review"],
-              ["Ошибки", "errors"],
+              ["Ошибка", "errors"],
             ].map(([label, key]) => (
               <article key={key}>
                 <small>{label}</small>
@@ -651,70 +745,24 @@ function SessionPage() {
               </article>
             ))}
           </div>
-        </>
-      )}
-    </section>
-  );
-}
-
-function ReviewsPage() {
-  const qc = useQueryClient();
-  const q = useQuery({
-    queryKey: ["reviews"],
-    queryFn: () => api<Review[]>("/reviews"),
-  });
-  const decide = (id: number, decision: string) =>
-    api(`/reviews/${id}/${decision}`, {
-      method: "POST",
-      body: JSON.stringify({ answer: "" }),
-    }).then(() => qc.invalidateQueries({ queryKey: ["reviews"] }));
-  return (
-    <section className="page">
-      <Title
-        eyebrow="РУЧНАЯ ПРОВЕРКА"
-        note="Автоматизация остановилась там, где нужен ваш контекст."
-      >
-        Решения, которые нельзя выдумывать
-      </Title>
-      {q.data?.length ? (
-        q.data.map((r) => (
-          <article className="panel review" key={r.id}>
-            <div>
-              <Status value={r.kind} />
-              <h2>{r.question}</h2>
-              <small>
-                Сессия #{r.session_id} · вакансия #{r.vacancy_id}
-              </small>
-            </div>
-            {r.status === "pending" ? (
-              <div className="actions">
-              <button onClick={() => decide(r.id, "approve")}>
-                Подтвердить отклик
-                </button>
-                <button
-                  className="secondary"
-                  onClick={() => decide(r.id, "reject")}
-                >
-                  Пропустить
-                </button>
-              </div>
-            ) : (
-              <Status value={r.status} />
-            )}
-          </article>
-        ))
-      ) : (
-        <Empty>Неизвестных вопросов, CAPTCHA и других блокеров пока нет.</Empty>
-      )}
-    </section>
-  );
+        </>;
 }
 
 function VacanciesPage() {
+  const [offset, setOffset] = useState(0);
+  const [allVacancies, setAllVacancies] = useState<Vacancy[]>([]);
   const q = useQuery({
-    queryKey: ["vacancies"],
-    queryFn: () => api<Vacancy[]>("/vacancies"),
+    queryKey: ["vacancies", offset],
+    queryFn: async () => {
+      const response = await api<VacancyPage | Vacancy[]>(offset ? `/vacancies?limit=30&offset=${offset}` : "/vacancies");
+      return Array.isArray(response)
+        ? { items: response, total: response.length, has_more: false }
+        : response ?? { items: [], total: 0, has_more: false };
+    },
   });
+  useEffect(() => {
+    if (q.data?.items) setAllVacancies((previous) => offset === 0 ? q.data!.items : [...previous, ...q.data!.items]);
+  }, [q.data, offset]);
   return (
     <section className="page">
       <Title
@@ -723,9 +771,9 @@ function VacanciesPage() {
       >
         Каждое решение объяснимо
       </Title>
-      {q.data?.length ? (
+      {allVacancies.length ? (
         <div className="vacancy-list">
-          {q.data.map((v) => (
+          {allVacancies.map((v) => (
             <details className="panel vacancy-score" key={v.id}>
               <summary>
                 <span className="vacancy-main">
@@ -744,76 +792,28 @@ function VacanciesPage() {
                     <span className="eyebrow">РЕЛЕВАНТНОСТЬ ПО РЕЗЮМЕ</span>
                     <small>Итоговая оценка по выбранному резюме</small>
                   </div>
-                  {v.evaluation.score_breakdown?.map((row) => (
-                    row.key === "green_flags" ? null : (
+                  {presentationBreakdown(v.evaluation.score_breakdown ?? []).map((row) => (
                     <div className="score-row" key={row.key}>
                       <div><b>{row.title}</b><span>{row.max_points > 0 ? `${row.points} / ${row.max_points}` : "не применяется"}</span></div>
                       {row.max_points > 0 && <div className="scorebar"><i style={{ width: `${Math.min(100, Math.max(0, (row.points / row.max_points) * 100))}%` }} /></div>}
+                      {typeof row.minimum_points === "number" ? (
+                        <small>{row.minimum_failed ?? ((row.raw_points ?? row.points) < row.minimum_points) ? `Минимум: ${row.minimum_points} — не выполнен` : `Минимум: ${row.minimum_points} — выполнен`}</small>
+                      ) : null}
                       <small>{row.explanation}</small>
                       {row.evidence?.length ? <em>{row.evidence.join(" · ")}</em> : null}
                     </div>
-                    )
                   ))}
-                  <a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на HH.ru</a>
+                  <a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a>
                 </div>
               ) : <p className="empty-score">Оценка ещё не завершена.</p>}
             </details>
           ))}
+          {q.data?.has_more && <button type="button" className="secondary" onClick={() => setOffset((value) => value + 30)} disabled={q.isFetching}>Показать ещё</button>}
         </div>
       ) : (
         <Empty>
-          Запустите сессию HH.ru, чтобы увидеть найденные вакансии.
+          Запустите сессию на выбранной площадке, чтобы увидеть найденные вакансии.
         </Empty>
-      )}
-    </section>
-  );
-}
-
-function ReportsPage() {
-  const q = useQuery({
-    queryKey: ["reports"],
-    queryFn: () => api<Report[]>("/reports"),
-  });
-  return (
-    <section className="page">
-      <Title
-        eyebrow="ОТЧЁТЫ"
-        note="Читаемый PDF создаётся локально после каждой завершённой сессии и содержит полную оценку всех вакансий."
-      >
-        Итоги без внешних сервисов
-      </Title>
-      {q.isPending ? (
-        <div className="empty" role="status"><b>Загружаем отчёты</b><p>Проверяем локальные результаты завершённых сессий.</p></div>
-      ) : q.isError ? (
-        <div className="empty error-state" role="alert"><b>Не удалось загрузить отчёты</b><p>{q.error.message}</p></div>
-      ) : q.data?.length ? (
-        q.data.map((r) => (
-          <article className="panel report-card" key={r.id}>
-            <div className="report-heading">
-              <div>
-                <span className="eyebrow">ОТЧЁТ #{r.id}</span>
-                <h2>Сессия #{r.session_id}</h2>
-                <small>{new Date(r.created_at).toLocaleString("ru")}</small>
-              </div>
-              <Status value={r.summary.status || "ЗАВЕРШЕНА"} />
-            </div>
-            <p>{r.summary.stop_reason || "Причина завершения не указана"}</p>
-            <div className="report-metrics">
-              {[
-                ["Вакансий", r.summary.aggregates?.total ?? r.summary.vacancies?.length ?? 0],
-                ["Оценено", r.summary.aggregates?.evaluated ?? 0],
-                ["Подходит", r.summary.aggregates?.matched ?? r.summary.counters?.matched ?? 0],
-                ["Отправлено", r.summary.aggregates?.submitted ?? r.summary.counters?.submitted ?? 0],
-                ["Ошибки", r.summary.aggregates?.errors ?? r.summary.counters?.errors ?? 0],
-              ].map(([label, value]) => <span key={String(label)}><b>{value}</b><small>{label}</small></span>)}
-            </div>
-            <a className="button-link" href={r.pdf_url} download>
-              Скачать PDF
-            </a>
-          </article>
-        ))
-      ) : (
-        <Empty>Отчёт появится после завершения первой сессии.</Empty>
       )}
     </section>
   );
@@ -835,10 +835,10 @@ function ModelPage() {
   return (
     <section className="page">
       <Title
-        eyebrow="ЛОКАЛЬНАЯ МОДЕЛЬ"
-        note="Одна физическая модель обслуживает несколько строго типизированных ролей."
+        eyebrow="ОБЛАЧНАЯ МОДЕЛЬ"
+        note="Одна облачная модель обслуживает несколько строго типизированных ролей."
       >
-        Ollama на вашем компьютере
+        OpenAI API
       </Title>
       <article className="panel model">
         <div
@@ -848,13 +848,13 @@ function ModelPage() {
           <Status
             value={q.data?.connected ? "Соединение есть" : "Нет соединения"}
           />
-          <h2>{q.data?.model || "qwen3.5:9b-q4_K_M"}</h2>
+          <h2>{q.data?.model || "Модель не указана"}</h2>
           <p>
             {q.data?.model_available
               ? "Модель готова к structured outputs."
-              : "Запустите Ollama и загрузите модель командой ниже."}
+              : "Проверьте OpenAI API URL и ключ в конфигурации приложения."}
           </p>
-          <code>ollama pull qwen3.5:9b-q4_K_M</code>
+          <code>JAO_OPENAI_BASE_URL / JAO_OPENAI_API_KEY</code>
         </div>
         <button onClick={() => qc.invalidateQueries({ queryKey: ["model"] })}>
           Проверить снова
@@ -872,9 +872,7 @@ export default function App() {
         <Route path="/profile" element={<ProfilePage />} />
         <Route path="/sites" element={<SitesPage />} />
         <Route path="/session" element={<SessionPage />} />
-        <Route path="/reviews" element={<ReviewsPage />} />
         <Route path="/vacancies" element={<VacanciesPage />} />
-        <Route path="/reports" element={<ReportsPage />} />
         <Route path="/model" element={<ModelPage />} />
       </Routes>
     </Shell>

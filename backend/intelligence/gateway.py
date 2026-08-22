@@ -19,7 +19,6 @@ _RESUME_ANALYSIS_CRITERIA = (
     "tasks",
     "industry",
     "required_years",
-    "seniority",
     "languages",
     "skills",
 )
@@ -35,43 +34,33 @@ def _schema_for_role(role: str, schema: type[BaseModel]) -> dict:
         result["required"] = list(result.get("properties", {}))
         assessment = result.get("$defs", {}).get("MatchAssessment", {})
         assessment["required"] = list(assessment.get("properties", {}))
-    elif role == "policy_filter" and schema.__name__ == "PolicyFilterResult":
-        result["required"] = list(result.get("properties", {}))
-        for definition_name in ("FlagMatch", "WorkFormatAssessment"):
-            definition = result.get("$defs", {}).get(definition_name, {})
-            definition["required"] = list(definition.get("properties", {}))
     return result
 
 
 def _system_prompt_for_role(role: str, payload: dict) -> str:
     prompt = ROLE_PROMPTS[role]
-    if role != "policy_filter":
-        return prompt
-    policy = payload.get("policy", {})
-    green_count = len(policy.get("green_flags", []))
-    red_count = len(policy.get("red_flags", []))
-    return (
-        f"{prompt} Верни ровно {green_count} объектов green_flags и ровно {red_count} объектов "
-        "red_flags: по одному объекту для каждого переданного policy flag, с точной строкой flag "
-        "и в исходном порядке. Даже absent или uncertain flag обязан быть отдельным объектом."
-    )
+    return prompt
 
 
 def _resume_analysis_missing_fields(parsed: BaseModel) -> list[str]:
     if parsed.__class__.__name__ != "ResumeAnalysis":
         return []
     missing = []
-    if "vacancy_seniority" not in parsed.model_fields_set:
-        missing.append("vacancy_seniority")
     for field_name in _RESUME_ANALYSIS_CRITERIA:
         if field_name not in parsed.model_fields_set:
             missing.append(field_name)
             continue
         assessment = getattr(parsed, field_name)
-        for nested_name in ("match", "confidence", "evidence"):
+        for nested_name in ("score", "confidence", "evidence"):
             if nested_name not in assessment.model_fields_set:
                 missing.append(f"{field_name}.{nested_name}")
-        if assessment.match > 0 and (
+        # The evaluator deterministically grounds the language criterion after
+        # the model response: when no foreign language is required it assigns
+        # the full score and may legitimately have no evidence.  Keep the
+        # structural checks above, but defer this value-level grounding check
+        # for languages so that this valid response is not rejected as an
+        # unavailable model result.
+        if field_name != "languages" and assessment.score > 0 and (
             assessment.confidence <= 0 or not assessment.evidence
         ):
             missing.append(f"{field_name}.grounding")
@@ -122,15 +111,26 @@ def _merge_resume_import(base: BaseModel, candidate: BaseModel) -> BaseModel:
 
 
 class ModelGateway:
-    _lock = asyncio.Lock()
-
     def __init__(self, provider: str | None = None) -> None:
         self.provider = provider or settings.llm_provider
+        self._lock = asyncio.Lock()
+        if self.provider not in {"openai_compat", "mock"}:
+            raise ValueError(
+                f"Unsupported AI provider: {self.provider}. Only openai_compat and mock are allowed."
+            )
 
     async def status(self) -> dict:
         if self.provider == "mock":
             return {"connected": True, "model_available": True, "provider": "mock", "model": "deterministic-mock"}
         if self.provider == "openai_compat":
+            if not settings.openai_api_key.strip():
+                return {
+                    "connected": False,
+                    "model_available": False,
+                    "provider": "openai_compat",
+                    "model": settings.openai_model,
+                    "message": "JAO_OPENAI_API_KEY is not configured",
+                }
             try:
                 async with httpx.AsyncClient(timeout=3) as client:
                     response = await client.get(
@@ -152,120 +152,19 @@ class ModelGateway:
                     "model": settings.openai_model,
                     "message": str(exc),
                 }
-        try:
-            async with httpx.AsyncClient(timeout=3) as client:
-                response = await client.get(f"{settings.ollama_base_url}/api/tags")
-                response.raise_for_status()
-            names = {item["name"] for item in response.json().get("models", [])}
-            wanted = settings.ollama_model
-            available = wanted in names or any(name.startswith(f"{wanted}:") for name in names)
-            return {"connected": True, "model_available": available, "provider": "ollama", "model": wanted}
-        except (httpx.HTTPError, KeyError, ValueError) as exc:
-            return {"connected": False, "model_available": False, "provider": "ollama", "model": settings.ollama_model, "message": str(exc)}
+        raise ValueError(f"Unsupported AI provider: {self.provider}")
 
     async def structured(self, role: str, payload: dict, schema: type[T]) -> T:
         if self.provider == "mock":
             return self._mock(role, payload, schema)
         if self.provider == "openai_compat":
             return await self._structured_openai(role, payload, schema)
-        async with self._lock:
-            body = {
-                "model": settings.ollama_model,
-                "stream": False,
-                "format": _schema_for_role(role, schema),
-                "messages": [
-                    {"role": "system", "content": _system_prompt_for_role(role, payload)},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                "options": {k: v for k, v in ROLE_OPTIONS[role].items() if k != "think"},
-                "think": ROLE_OPTIONS[role]["think"],
-            }
-            try:
-                request_timeout = 300 if role == "profile" else 180
-                async with httpx.AsyncClient(timeout=request_timeout) as client:
-                    attempts = 4 if role == "profile" and schema.__name__ == "ResumeImportData" else 2
-                    resume_candidate = None
-                    for attempt in range(attempts):
-                        response = await client.post(
-                            f"{settings.ollama_base_url}/api/chat", json=body
-                        )
-                        response.raise_for_status()
-                        content = response.json()["message"]["content"]
-                        try:
-                            if not content.strip():
-                                raise ValueError("Ollama returned an empty response")
-                            parsed = schema.model_validate_json(content)
-                            if role == "resume_analyst":
-                                missing_analysis = _resume_analysis_missing_fields(parsed)
-                                if missing_analysis:
-                                    raise ValueError(
-                                        "ResumeAnalysis contains defaulted or incomplete fields: "
-                                        + ", ".join(missing_analysis)
-                                    )
-                            if role == "profile" and _resume_import_is_incomplete(
-                                payload.get("resume_text", ""), parsed
-                            ):
-                                if resume_candidate is not None:
-                                    parsed = _merge_resume_import(resume_candidate, parsed)
-                                resume_candidate = parsed
-                                missing = _resume_import_missing_fields(
-                                    payload.get("resume_text", ""), parsed
-                                )
-                                if not missing:
-                                    return parsed
-                                if attempt == attempts - 1:
-                                    raise ModelUnavailable(
-                                        "Ollama вернула неполный ResumeImportData после repair-pass"
-                                    )
-                                body["messages"][0]["content"] += (
-                                    f" Обязательный targeted repair: пропущены поля/разделы {missing}. "
-                                    "Найди их в исходном тексте и заполни явно. Особенно проверь заголовки "
-                                    "Образование и Языки: верни все записи, даже если они находятся после "
-                                    "опыта работы. Не оставляй эти поля пустыми при наличии текста раздела."
-                                )
-                                raise ValueError("ResumeImportData contains defaulted fields")
-                            if (
-                                role == "profile"
-                                and schema.__name__ == "ResumeImportData"
-                                and resume_candidate is not None
-                            ):
-                                parsed = _merge_resume_import(resume_candidate, parsed)
-                            return parsed
-                        except (ValidationError, ValueError) as exc:
-                            if attempt == attempts - 1:
-                                raise ModelUnavailable(
-                                    "Ollama вернула неполный или некорректный JSON "
-                                    f"после повторной попытки: {exc}"
-                                ) from exc
-                        # Retry truncated or otherwise invalid structured output once with
-                        # a larger deterministic non-thinking response budget.
-                        body["think"] = False
-                        body["options"]["num_ctx"] = max(
-                            int(body["options"].get("num_ctx", 0)), 32768
-                        )
-                        body["options"]["num_predict"] = max(
-                            int(body["options"].get("num_predict", 0)), 12000
-                        )
-                        if role == "profile" and schema.__name__ == "ResumeImportData":
-                            body["messages"][0]["content"] += (
-                                " Предыдущий JSON не прошёл проверку. Повтори полный ResumeImportData: "
-                                "извлеки каждый явно присутствующий элемент из разделов education, languages, "
-                                "experiences, skills, desired_title, employment_types, work_formats и "
-                                "business_trips. Пустой массив запрещён, если соответствующий раздел есть в "
-                                "исходном тексте. Не выбирай значения по умолчанию и обязательно заверши JSON."
-                            )
-                        else:
-                            body["messages"][0]["content"] += (
-                                f" Предыдущий JSON не прошёл проверку. Повтори полный объект схемы "
-                                f"{schema.__name__}, сохрани все обязательные поля и заверши JSON без markdown."
-                            )
-            except ModelUnavailable:
-                raise
-            except (httpx.HTTPError, KeyError, ValueError) as exc:
-                raise ModelUnavailable(f"Ollama временно недоступна: {exc}") from exc
+        raise ValueError(f"Unsupported AI provider: {self.provider}")
 
     async def _structured_openai(self, role: str, payload: dict, schema: type[T]) -> T:
         """Call an OpenAI-compatible API endpoint to get a structured response."""
+        if not settings.openai_api_key.strip():
+            raise ModelUnavailable("JAO_OPENAI_API_KEY is not configured")
         client = AsyncOpenAI(
             base_url=settings.openai_base_url,
             api_key=settings.openai_api_key,
@@ -273,7 +172,9 @@ class ModelGateway:
         json_schema = _schema_for_role(role, schema)
         system_prompt = _system_prompt_for_role(role, payload)
         opts = ROLE_OPTIONS[role]
-        attempts = 4 if role == "profile" and schema.__name__ == "ResumeImportData" else 2
+        attempts = 4 if role == "resume_analyst" else (
+            4 if role == "profile" and schema.__name__ == "ResumeImportData" else 2
+        )
         request_timeout = 300 if role == "profile" else 180
 
         async with self._lock:
@@ -282,6 +183,7 @@ class ModelGateway:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ]
             resume_candidate = None
+            validation_error = "unknown validation error"
             try:
                 for attempt in range(attempts):
                     response = await client.chat.completions.create(
@@ -341,6 +243,7 @@ class ModelGateway:
                             parsed = _merge_resume_import(resume_candidate, parsed)
                         return parsed
                     except (ValidationError, ValueError) as exc:
+                        validation_error = str(exc)
                         if attempt == attempts - 1:
                             raise ModelUnavailable(
                                 "OpenAI-compat вернул неполный или некорректный JSON "
@@ -356,9 +259,20 @@ class ModelGateway:
                             "исходном тексте. Не выбирай значения по умолчанию и обязательно заверши JSON."
                         )
                     else:
+                        root_contract = ""
+                        if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
+                            root_contract = (
+                                " Для ResumeAnalysis корень JSON обязан быть самим объектом с ровно "
+                                "полями title, tasks, industry, required_years, languages, skills; "
+                                "НЕ оборачивай его в analysis, resumes, candidate_name, result или data "
+                                "и не возвращай массив. Каждое поле обязано быть объектом со score, "
+                                "confidence, explanation и evidence."
+                            )
                         messages[0]["content"] += (
-                            f" Предыдущий JSON не прошёл проверку. Повтори полный объект схемы "
-                            f"{schema.__name__}, сохрани все обязательные поля и заверши JSON без markdown."
+                            f" Предыдущий JSON не прошёл локальную проверку: {validation_error}. "
+                            f"Повтори полный объект схемы {schema.__name__}, сохрани все обязательные "
+                            "поля и заверши JSON без markdown. Не исправляй ошибку удалением полей."
+                            + root_contract
                         )
             except ModelUnavailable:
                 raise
@@ -368,91 +282,18 @@ class ModelGateway:
     def _mock(self, role: str, payload: dict, schema: type[T]) -> T:
         from backend.schemas.domain import (
             CoverLetterDraft,
-            FlagMatch,
             JobEvaluation,
             MatchAssessment,
-            PolicyCompilation,
-            PolicyFilterResult,
             ResumeAnalysis,
             ScoreComponent,
-            WorkFormatAssessment,
         )
+        if role == "hirehi_category":
+            from backend.intelligence.hirehi_category import deterministic_category
+            return deterministic_category(payload.get("resume", {}))
+        if role == "job_summary":
+            from backend.intelligence.hirehi_category import JobSummary
+            return JobSummary(summary=str(payload.get("job", {}).get("title", "Вакансия")))
 
-        if schema is PolicyCompilation:
-            request = str(payload.get("request_text", ""))
-            lower = request.lower()
-            green = []
-            red = []
-            if "gamedev" in lower or "game dev" in lower:
-                green.append("Вакансия связана с GameDev")
-            if "продаж" in lower or "sales" in lower:
-                red.append("Вакансия связана с продажами")
-            return schema.model_validate(
-                {
-                    "green_flags": green,
-                    "red_flags": red,
-                    "flag_confidence_threshold": 0.70,
-                }
-            )
-        if schema is PolicyFilterResult:
-            job = payload.get("job", {})
-            text = " ".join(
-                str(job.get(key, ""))
-                for key in ("title", "description", "responsibilities", "required_skills")
-            ).lower()
-            policy = payload.get("policy", {})
-            greens = [
-                FlagMatch(
-                    flag=flag,
-                    confidence=1 if any(part in text for part in flag.lower().split()[-1:]) else 0,
-                    evidence=[str(job.get("description", ""))[:240]] if any(part in text for part in flag.lower().split()[-1:]) else [],
-                    matched=any(part in text for part in flag.lower().split()[-1:]),
-                    verdict="present" if any(part in text for part in flag.lower().split()[-1:]) else "absent",
-                )
-                for flag in policy.get("green_flags", [])
-            ]
-            reds = [
-                FlagMatch(
-                    flag=flag,
-                    confidence=1 if "продаж" in text and "продаж" in flag.lower() else 0,
-                    evidence=[str(job.get("description", ""))[:240]] if "продаж" in text and "продаж" in flag.lower() else [],
-                    matched="продаж" in text and "продаж" in flag.lower(),
-                    verdict="present" if "продаж" in text and "продаж" in flag.lower() else "absent",
-                )
-                for flag in policy.get("red_flags", [])
-            ]
-            formats = list(payload.get("candidate_work_formats", []))
-            vacancy_format = job.get("work_format")
-            if not vacancy_format:
-                format_patterns = {
-                    "remote": ("удален", "удалён", "remote"),
-                    "hybrid": ("гибрид", "hybrid"),
-                    "office": ("офис", "очно", "на месте", "office"),
-                    "mobile": ("разъезд", "мобильн", "mobile"),
-                    "rotational": ("вахт", "rotational"),
-                }
-                vacancy_format = next(
-                    (
-                        format_name
-                        for format_name, patterns in format_patterns.items()
-                        if any(pattern in text for pattern in patterns)
-                    ),
-                    None,
-                )
-            compatible = None if not vacancy_format or not formats else vacancy_format in formats
-            return schema.model_validate(
-                {
-                    "green_flags": [item.model_dump() for item in greens],
-                    "red_flags": [item.model_dump() for item in reds],
-                    "work_format": WorkFormatAssessment(
-                        compatible=compatible,
-                        confidence=1 if compatible is not None else 0,
-                        vacancy_format=vacancy_format,
-                        candidate_formats=formats,
-                    ).model_dump(),
-                    "reason": "Детерминированный mock-фильтр",
-                }
-            )
         if schema is ResumeAnalysis:
             job = payload.get("job", {})
             resumes = payload.get("resumes", [])
@@ -464,38 +305,23 @@ class ModelGateway:
             skill_match = len(required & skills) / len(required) if required else 0
             description = str(job.get("description", ""))[:240]
             title_evidence = str(job.get("title", ""))
-            level = next(
-                (
-                    name
-                    for name, markers in {
-                        "junior": ("junior", "джун", "младш"),
-                        "middle": ("middle", "мидл"),
-                        "senior": ("senior", "сеньор", "старш"),
-                    }.items()
-                    if any(marker in f"{title} {description.lower()}" for marker in markers)
-                ),
-                None,
-            )
-
-            def mock_assessment(match, confidence, evidence):
+            def mock_assessment(score, confidence, evidence):
                 return MatchAssessment(
-                    match=match,
+                    score=score,
                     confidence=confidence,
                     explanation="Детерминированная mock-оценка",
-                    evidence=[evidence] if evidence and match > 0 else [],
+                    evidence=[evidence] if evidence and score > 0 else [],
                 ).model_dump()
 
             return schema.model_validate(
                 {
-                    "vacancy_seniority": level,
-                    "title": mock_assessment(title_match, 0.9, title_evidence),
-                    "tasks": mock_assessment(0.5, 0.7, description),
-                    "industry": mock_assessment(0.5, 0.7, description),
-                    "required_years": mock_assessment(0.5, 0.7, description),
-                    "seniority": mock_assessment(0.5 if level else 0, 0.7, title_evidence),
-                    "languages": mock_assessment(0.5, 0.7, description),
+                    "title": mock_assessment(2 if title_match else 0, 0.9, title_evidence),
+                    "tasks": mock_assessment(2, 0.7, description),
+                    "industry": mock_assessment(2, 0.7, description),
+                    "required_years": mock_assessment(1, 0.7, description),
+                    "languages": mock_assessment(1, 0.7, description),
                     "skills": mock_assessment(
-                        skill_match,
+                        3 if skill_match == 1 else (2 if skill_match > 0 else 0),
                         0.9,
                         next(iter(required & skills), ""),
                     ),
@@ -536,20 +362,14 @@ class ModelGateway:
             if "summary" in fields:
                 values["summary"] = " ".join(lines[1:3]) or None
             if "desired_title" in fields:
-                values["desired_title"] = next(
-                    (line for line in lines if "product manager" in line.lower()),
-                    None,
-                )
+                values["desired_title"] = self._extract_desired_title(lines)
             if "resume_text" in fields:
                 values["resume_text"] = text
             return schema.model_validate(values)
         if role == "profile" and schema.__name__ == "ResumeImportData":
             text = payload.get("resume_text", "")
             lines = [line.strip() for line in text.splitlines() if line.strip()]
-            title = next(
-                (line for line in lines if "product manager" in line.lower()),
-                None,
-            )
+            title = self._extract_desired_title(lines)
             return schema.model_validate(
                 {
                     "profile": {"full_name": lines[0] if lines else None},
@@ -565,11 +385,24 @@ class ModelGateway:
             return schema.model_validate(
                 {
                     "text": (
-                        f"Здравствуйте! Меня заинтересовала вакансия «{vacancy.get('title', 'Product Manager')}». "
-                        "Мой опыт управления продуктом, проверки гипотез и работы с командой "
-                        "разработки соответствует ключевым задачам позиции. Буду рад обсудить "
-                        "возможный вклад в развитие продукта на интервью."
+                        f"Здравствуйте! Меня заинтересовала вакансия «{vacancy.get('title', 'эта позиция')}». "
+                        "Мой опыт и навыки соответствуют ключевым задачам позиции. Буду рад обсудить "
+                        "возможный вклад в работу команды на интервью."
                     )
                 }
             )
         raise ValueError(f"Mock provider has no fixture for role={role}, schema={schema.__name__}")
+
+    @staticmethod
+    def _extract_desired_title(lines: list[str]) -> str | None:
+        """Extract a likely position title without assuming a profession."""
+        markers = ("желаемая должность", "desired title", "position", "должность")
+        for index, line in enumerate(lines):
+            lowered = line.lower()
+            if any(marker in lowered for marker in markers):
+                value = line.split(":", 1)[1].strip() if ":" in line else ""
+                if value:
+                    return value
+                if index + 1 < len(lines):
+                    return lines[index + 1]
+        return next((line for line in lines[1:] if len(line.split()) <= 8), None)

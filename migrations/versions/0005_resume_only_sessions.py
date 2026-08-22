@@ -30,7 +30,7 @@ def upgrade() -> None:
                 server_default="75",
             ),
         )
-    if not columns["policy_id"]["nullable"]:
+    if "policy_id" in columns and not columns["policy_id"]["nullable"]:
         with op.batch_alter_table("sessions") as batch_op:
             batch_op.alter_column(
                 "policy_id",

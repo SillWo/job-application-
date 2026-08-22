@@ -2,8 +2,19 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    event,
+    inspect,
+)
+from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from backend.schemas.domain import RELEVANCE_SCORE_THRESHOLD
 
@@ -24,11 +35,6 @@ class CandidateProfile(Base):
     education: Mapped[list] = mapped_column(JSON, default=list)
     languages: Mapped[list] = mapped_column(JSON, default=list)
     driver_license: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    # Legacy columns remain nullable so old sessions and reports can be read
-    # during the migration window. New API code does not use them as a resume.
-    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    resume_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
@@ -53,39 +59,17 @@ class Resume(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
 
-class SearchPolicy(Base):
-    __tablename__ = "search_policies"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    suitable_text: Mapped[str] = mapped_column(Text, default="")
-    excluded_text: Mapped[str] = mapped_column(Text, default="")
-    filters: Mapped[dict] = mapped_column(JSON, default=dict)
-    compiled: Mapped[dict] = mapped_column(JSON, default=dict)
-    confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
-
-
-class SiteAccount(Base):
-    __tablename__ = "site_accounts"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    site_id: Mapped[str] = mapped_column(String(50), unique=True)
-    login_state: Mapped[str] = mapped_column(String(40), default="unknown")
-
-
 class JobSession(Base):
     __tablename__ = "sessions"
     id: Mapped[int] = mapped_column(primary_key=True)
     profile_id: Mapped[int] = mapped_column(ForeignKey("candidate_profiles.id"))
-    # Kept only so historical sessions remain readable. New runtime sessions
-    # do not load or evaluate search policies.
-    policy_id: Mapped[int | None] = mapped_column(
-        ForeignKey("search_policies.id"), nullable=True
-    )
     score_threshold: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         server_default=str(RELEVANCE_SCORE_THRESHOLD),
     )
+    minimum_scores: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     adapter_id: Mapped[str] = mapped_column(String(50))
-    mode: Mapped[str] = mapped_column(String(40), default="analysis_only")
     # These values are a snapshot of the launch configuration.  ``None`` means
     # that the corresponding limit is disabled for this session.
     # API defaults are applied by SessionCreate.  Do not add ORM defaults:
@@ -99,11 +83,56 @@ class JobSession(Base):
     stop_reason: Mapped[str | None] = mapped_column(String(255))
 
 
+class Notification(Base):
+    """A user-facing event, intentionally generic and independent of sessions."""
+    __tablename__ = "notifications"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_type: Mapped[str] = mapped_column(String(80), index=True)
+    source_id: Mapped[str] = mapped_column(String(255), index=True)
+    target_path: Mapped[str] = mapped_column(String(500))
+    kind: Mapped[str] = mapped_column(String(80), index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    message: Mapped[str] = mapped_column(Text)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+
+
+@event.listens_for(Session, "before_flush")
+def _notify_session_status_changes(session: Session, _flush_context, _instances) -> None:
+    """Create status notifications in the same transaction as the update."""
+    for item in session.dirty:
+        if not isinstance(item, JobSession):
+            continue
+        history = inspect(item).attrs.status.history
+        if not history.has_changes() or not history.deleted or not history.added:
+            continue
+        old, new = history.deleted[0], history.added[0]
+        if old == new or (old == "WAITING_FOR_LOGIN" and new == "RUNNING"):
+            continue
+        launch = old == "CREATED" and new == "RUNNING"
+        session.add(Notification(
+            source_type="session",
+            source_id=str(item.id),
+            target_path="/session",
+            kind="session_started" if launch else "session_status_changed",
+            title=f"Сессия {item.id} запущена" if launch else f"Сессия {item.id}: статус изменён",
+            message=f"Сессия {item.id} запущена" if launch else f"Сессия {item.id}: статус изменён на {new}",
+        ))
+
+
 class Vacancy(Base):
     __tablename__ = "vacancies"
-    __table_args__ = (UniqueConstraint("source", "external_id"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "source",
+            "external_id",
+            name="uq_vacancies_session_source_external_id",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"))
+    # Historical HH vacancies may outlive their deleted session.
+    session_id: Mapped[int | None] = mapped_column(ForeignKey("sessions.id"), nullable=True)
     source: Mapped[str] = mapped_column(String(50))
     external_id: Mapped[str | None] = mapped_column(String(255))
     url: Mapped[str] = mapped_column(String(1000))
@@ -120,7 +149,6 @@ class VacancySnapshot(Base):
     vacancy_id: Mapped[int] = mapped_column(ForeignKey("vacancies.id"))
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-
 
 class Evaluation(Base):
     __tablename__ = "evaluations"
@@ -153,17 +181,6 @@ class CoverLetter(Base):
     text: Mapped[str] = mapped_column(Text)
 
 
-class ReviewItem(Base):
-    __tablename__ = "review_items"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"))
-    vacancy_id: Mapped[int | None] = mapped_column(ForeignKey("vacancies.id"))
-    kind: Mapped[str] = mapped_column(String(80))
-    question: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(40), default="pending")
-    answer: Mapped[str | None] = mapped_column(Text)
-
-
 class BrowserEvent(Base):
     __tablename__ = "browser_events"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -171,16 +188,4 @@ class BrowserEvent(Base):
     event_type: Mapped[str] = mapped_column(String(80))
     message: Mapped[str] = mapped_column(Text)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-
-
-class Report(Base):
-    __tablename__ = "reports"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"), unique=True)
-    summary: Mapped[dict] = mapped_column(JSON)
-    html_path: Mapped[str] = mapped_column(String(500))
-    json_path: Mapped[str] = mapped_column(String(500))
-    csv_path: Mapped[str] = mapped_column(String(500))
-    pdf_path: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

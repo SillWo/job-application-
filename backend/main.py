@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.api.router import router as api_router
 from backend.api.router import session_socket
 from backend.config import settings
-from backend.orchestrator.workflow import backfill_terminal_reports, recover_orphaned_sessions
+from backend.orchestrator.workflow import recover_orphaned_sessions
 from backend.persistence.database import init_database
 
 
@@ -17,13 +17,18 @@ from backend.persistence.database import init_database
 async def lifespan(app: FastAPI):
     init_database()
     recover_orphaned_sessions()
-    backfill_terminal_reports()
     yield
 
 
 app = FastAPI(title="Job Application Orchestrator", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
 app.include_router(api_router)
+
+# Keep the SPA fallback from masking misspelled or removed API endpoints.
+@app.get("/api/{path:path}", include_in_schema=False)
+def unknown_api_path(path: str) -> None:
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail="API endpoint not found")
 
 
 @app.websocket("/ws/sessions/{session_id}")

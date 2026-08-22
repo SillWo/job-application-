@@ -9,6 +9,14 @@ htmlcov/
 data/
 *.db
 *.sqlite*
+# Generated reports, PDFs, and visualisation output
+output/pdf/
+tmp/pdfs/
+tmp/pytest-*/
+.pytest-tmp*/
+# Local resume/report artifacts (tracked fixtures remain tracked)
+tmp/**/resume.pdf
+tmp/**/report.pdf
 frontend/node_modules/
 frontend/dist/
 frontend/coverage/
@@ -21,3 +29,7 @@ test-results/
 .DS_Store
 .idea/
 .vscode/
+repo-clean.git/
+tmp/
+.pdf-qa-*/
+prompt.md

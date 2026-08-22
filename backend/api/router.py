@@ -9,18 +9,25 @@ from fastapi import (
     Depends,
     File,
     HTTPException,
+    Query,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from backend.adapters import adapter_registry
 from backend.browser.executor import BrowserExecutor
-from backend.browser.sessions import get_browser, set_browser
+from backend.browser.sessions import (
+    acquire_browser_lease,
+    close_browser,
+    get_browser,
+    release_browser_lease,
+    set_browser,
+)
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
 from backend.orchestrator.workflow import workflow_manager
 from backend.persistence.database import get_db
@@ -29,9 +36,8 @@ from backend.persistence.models import (
     CandidateProfile,
     Evaluation,
     JobSession,
-    Report,
+    Notification,
     Resume,
-    ReviewItem,
     Vacancy,
 )
 from backend.schemas.domain import (
@@ -40,10 +46,56 @@ from backend.schemas.domain import (
     ResumeData,
     SessionStatus,
 )
-from backend.services.reports import ensure_report_pdf
 from backend.services.resume import profile_from_import, resume_from_import, save_and_extract
 
 router = APIRouter(prefix="/api")
+
+
+def notification_dict(item: Notification) -> dict:
+    return {
+        "id": item.id,
+        "source_type": item.source_type,
+        "source_id": item.source_id,
+        "target_path": item.target_path,
+        "kind": item.kind,
+        "title": item.title,
+        "message": item.message,
+        "read_at": item.read_at.isoformat() if item.read_at else None,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+    }
+
+
+@router.get("/notifications")
+def notifications(limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db)) -> list[dict]:
+    items = db.scalars(
+        select(Notification).order_by(Notification.created_at.desc(), Notification.id.desc()).limit(limit)
+    ).all()
+    return [notification_dict(item) for item in items]
+
+
+@router.patch("/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int, db: Session = Depends(get_db)) -> dict:
+    item = db.get(Notification, notification_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Уведомление не найдено")
+    if item.read_at is None:
+        item.read_at = datetime.now(timezone.utc)
+        db.commit()
+    return notification_dict(item)
+
+
+@router.post("/notifications/{notification_id}/read", include_in_schema=False)
+def mark_notification_read_legacy(notification_id: int, db: Session = Depends(get_db)) -> dict:
+    return mark_notification_read(notification_id, db)
+
+
+@router.post("/notifications/read-all")
+def mark_all_notifications_read(db: Session = Depends(get_db)) -> dict:
+    result = db.execute(
+        update(Notification).where(Notification.read_at.is_(None)).values(read_at=datetime.now(timezone.utc))
+    )
+    db.commit()
+    return {"updated": result.rowcount}
 
 
 class SessionCreate(BaseModel):
@@ -51,17 +103,29 @@ class SessionCreate(BaseModel):
     # losing launch settings such as unlimited limits.
     model_config = ConfigDict(extra="forbid")
     profile_id: int
-    # The relevance cutoff is an application invariant. Keep the field for
-    # compatibility with clients that send it, but reject every other value.
     score_threshold: int = Field(
         default=RELEVANCE_SCORE_THRESHOLD,
-        ge=RELEVANCE_SCORE_THRESHOLD,
-        le=RELEVANCE_SCORE_THRESHOLD,
+        ge=0,
+        le=100,
     )
+    minimum_scores: dict[str, int] | None = None
     adapter_id: str
-    mode: str = "analysis_only"
     viewed_limit: int | None = Field(default=30, ge=1)
     application_limit: int | None = Field(default=5, ge=1)
+
+    @classmethod
+    def _minimum_limits(cls) -> dict[str, int]:
+        return {"title": 2, "tasks": 3, "industry": 4, "required_years": 2, "languages": 2, "skills": 3}
+
+    @model_validator(mode="after")
+    def validate_minimum_scores(self) -> SessionCreate:
+        for key, value in (self.minimum_scores or {}).items():
+            maximum = self._minimum_limits().get(key)
+            if maximum is None:
+                raise ValueError(f"Неизвестный критерий минимального балла: {key}")
+            if isinstance(value, bool) or not 0 <= value <= maximum:
+                raise ValueError(f"Минимум {key} должен быть от 0 до {maximum}")
+        return self
 
 
 @router.get("/health")
@@ -103,7 +167,6 @@ async def _import_resume_for_profile(
             db.flush()
         else:
             _merge_personal_profile(profile, personal)
-        profile.data = _profile_data(profile).model_dump()
         resume_data = resume_from_import(imported, path=path, filename=file.filename or "resume")
         resume = Resume(
             profile_id=profile.id,
@@ -242,7 +305,6 @@ def patch_profile(profile_id: int, data: CandidateProfileData, db: Session = Dep
     item.education = [entry.model_dump() for entry in data.education]
     item.languages = [entry.model_dump() for entry in data.languages]
     item.driver_license = data.driver_license
-    item.data = data.model_dump()
     db.commit(); db.refresh(item)
     return serialize_profile(item, db)
 
@@ -314,18 +376,16 @@ def adapters() -> list[dict]:
 
 
 def session_dict(item: JobSession) -> dict:
-    return {"id": item.id, "profile_id": item.profile_id, "score_threshold": item.score_threshold, "adapter_id": item.adapter_id, "mode": item.mode, "viewed_limit": item.viewed_limit, "application_limit": item.application_limit, "status": item.status, "counters": item.counters or {}, "started_at": item.started_at.isoformat() if item.started_at else None, "finished_at": item.finished_at.isoformat() if item.finished_at else None, "stop_reason": item.stop_reason}
+    return {"id": item.id, "profile_id": item.profile_id, "score_threshold": item.score_threshold, "minimum_scores": item.minimum_scores or None, "adapter_id": item.adapter_id, "viewed_limit": item.viewed_limit, "application_limit": item.application_limit, "status": item.status, "counters": item.counters or {}, "started_at": item.started_at.isoformat() if item.started_at else None, "finished_at": item.finished_at.isoformat() if item.finished_at else None, "stop_reason": item.stop_reason}
 
 
 @router.post("/sessions")
 def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dict:
     if not db.get(CandidateProfile, payload.profile_id):
         raise HTTPException(400, "Сначала создайте профиль")
-    try: manifest = adapter_registry.get(payload.adapter_id).manifest
+    try: adapter_registry.get(payload.adapter_id)
     except KeyError as exc: raise HTTPException(400, str(exc)) from exc
-    if payload.mode not in manifest.safe_live_modes:
-        raise HTTPException(400, f"Режим {payload.mode} не поддерживается адаптером {payload.adapter_id}")
-    item = JobSession(profile_id=payload.profile_id, score_threshold=payload.score_threshold, adapter_id=payload.adapter_id, mode=payload.mode, viewed_limit=payload.viewed_limit, application_limit=payload.application_limit, status=SessionStatus.CREATED, counters={})
+    item = JobSession(profile_id=payload.profile_id, score_threshold=payload.score_threshold, minimum_scores=payload.minimum_scores or None, adapter_id=payload.adapter_id, viewed_limit=payload.viewed_limit, application_limit=payload.application_limit, status=SessionStatus.CREATED, counters={})
     db.add(item); db.commit(); db.refresh(item)
     return session_dict(item)
 
@@ -341,16 +401,14 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     if not item: raise HTTPException(404, "Сессия не найдена")
     if item.status != SessionStatus.CREATED:
         raise HTTPException(409, "Запустить можно только новую сессию")
-    workflow_manager.launch(session_id)
+    if workflow_manager.launch(session_id) is False:
+        raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
     return {"ok": True}
 
 
 @router.post("/sessions/{session_id}/pause")
 def pause_session(session_id: int, db: Session = Depends(get_db)) -> dict:
-    item = db.get(JobSession, session_id)
-    if not item: raise HTTPException(404, "Сессия не найдена")
-    item.status = SessionStatus.PAUSED; db.commit()
-    return session_dict(item)
+    raise HTTPException(409, "Ручная пауза отключена; сессию можно приостановить только при CAPTCHA")
 
 
 @router.post("/sessions/{session_id}/resume")
@@ -359,16 +417,20 @@ async def resume_session(session_id: int, db: Session = Depends(get_db)) -> dict
     if not item: raise HTTPException(404, "Сессия не найдена")
     if item.status not in {SessionStatus.PAUSED, SessionStatus.WAITING_FOR_LOGIN}:
         raise HTTPException(409, "Продолжить можно только приостановленную сессию")
-    item.status = SessionStatus.RUNNING; item.stop_reason = None; db.commit(); workflow_manager.launch(session_id)
+    if workflow_manager.launch(session_id) is False:
+        raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
+    item.status = SessionStatus.RUNNING; item.stop_reason = None; db.commit()
     return session_dict(item)
 
 
 @router.post("/sessions/{session_id}/stop")
-def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
+async def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
     if not item: raise HTTPException(404, "Сессия не найдена")
     item.status = SessionStatus.STOPPED; item.stop_reason = "Остановлено пользователем"; item.finished_at = datetime.now(timezone.utc); db.commit()
-    workflow_manager.ensure_terminal_report(db, item)
+    await close_browser(session_id)
+    if item.adapter_id == "hirehi":
+        workflow_manager.write_hirehi_report(session_id)
     return session_dict(item)
 
 
@@ -381,9 +443,16 @@ async def open_session_browser(session_id: int, db: Session = Depends(get_db)) -
     if existing:
         return {"ok": True, "message": "Браузер уже открыт"}
     adapter = adapter_registry.get(item.adapter_id)
+    if not acquire_browser_lease(session_id, adapter.site_id):
+        raise HTTPException(409, "Для этого сайта уже открыт браузер другой сессии")
     executor = BrowserExecutor(adapter.site_id, adapter.allowed_domains, headless=False)
-    await executor.start()
-    target = "https://hh.ru/"
+    try:
+        await executor.start()
+    except Exception:
+        release_browser_lease(session_id, adapter.site_id)
+        raise
+    target = "https://hirehi.ru/" if item.adapter_id == "hirehi" else "https://hh.ru"
+    site_name = getattr(adapter, "display_name", item.adapter_id)
     set_browser(session_id, executor)
     try:
         await executor.execute("navigate", url=target)
@@ -391,13 +460,13 @@ async def open_session_browser(session_id: int, db: Session = Depends(get_db)) -
         return {
             "ok": True,
             "message": (
-                "Chromium открыт. Автопереход на HH.ru не завершился; "
-                "при необходимости введите https://hh.ru вручную."
+                f"Chromium открыт. Автопереход на {site_name} не завершился; "
+                f"при необходимости откройте {target} вручную."
             ),
         }
     return {
         "ok": True,
-        "message": "Открыт отдельный постоянный профиль Chromium для входа в HH.ru",
+        "message": f"Открыт отдельный постоянный профиль Chromium для входа в {site_name}",
     }
 
 
@@ -408,16 +477,17 @@ async def check_session_browser(session_id: int, db: Session = Depends(get_db)) 
         raise HTTPException(404, "Сессия не найдена")
     executor = get_browser(session_id)
     if not executor:
-        raise HTTPException(400, "Сначала откройте Chromium для HH.ru")
+        raise HTTPException(400, f"Сначала откройте Chromium для {getattr(adapter_registry.get(item.adapter_id), 'display_name', item.adapter_id)}")
     adapter = adapter_registry.get(item.adapter_id)
     login = await adapter.get_login_state(executor.page)
     if not login.authenticated:
         raise HTTPException(400, login.message)
+    if workflow_manager.launch(session_id) is False:
+        raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
     item.status = SessionStatus.RUNNING
     item.stop_reason = None
     db.commit()
-    workflow_manager.launch(session_id)
-    return {"ok": True, "message": "Вход в HH.ru подтверждён, сессия продолжена"}
+    return {"ok": True, "message": f"Вход в {getattr(adapter, 'display_name', item.adapter_id)} подтверждён, сессия продолжена"}
 
 
 @router.get("/sessions/{session_id}")
@@ -427,42 +497,41 @@ def get_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     return session_dict(item)
 
 
+@router.get("/sessions/{session_id}/report")
+def session_report_status(session_id: int, db: Session = Depends(get_db)) -> dict:
+    item = db.get(JobSession, session_id)
+    if not item: raise HTTPException(404, "Сессия не найдена")
+    if item.adapter_id != "hirehi": raise HTTPException(400, "PDF-отчёт доступен только для HireHi")
+    path = Path("output/pdf") / f"hirehi-session-{session_id}.pdf"
+    return {"ready": path.is_file(), "pdf_url": f"/api/sessions/{session_id}/report/pdf" if path.is_file() else None}
+
+
+@router.get("/sessions/{session_id}/report/pdf")
+def session_report_pdf(session_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    item = db.get(JobSession, session_id)
+    if not item: raise HTTPException(404, "Сессия не найдена")
+    if item.adapter_id != "hirehi": raise HTTPException(400, "PDF-отчёт доступен только для HireHi")
+    path = Path("output/pdf") / f"hirehi-session-{session_id}.pdf"
+    if not path.is_file(): raise HTTPException(404, "PDF-отчёт ещё не готов")
+    return FileResponse(path, media_type="application/pdf", filename=f"hirehi-session-{session_id}.pdf")
+
+
 @router.get("/sessions/{session_id}/events")
 def events(session_id: int, after: int = 0, db: Session = Depends(get_db)) -> list[dict]:
     rows = db.scalars(select(BrowserEvent).where(BrowserEvent.session_id == session_id, BrowserEvent.id > after).order_by(BrowserEvent.id))
     return [{"id": e.id, "type": e.event_type, "message": e.message, "data": e.data, "created_at": e.created_at.isoformat()} for e in rows]
 
 
-@router.get("/reviews")
-def reviews(db: Session = Depends(get_db)) -> list[dict]:
-    return [{"id": r.id, "session_id": r.session_id, "vacancy_id": r.vacancy_id, "kind": r.kind, "question": r.question, "status": r.status, "answer": r.answer} for r in db.scalars(select(ReviewItem).order_by(ReviewItem.id.desc()))]
-
-
-class ReviewAnswer(BaseModel):
-    answer: str = ""
-
-
-def resolve_review(review_id: int, status: str, payload: ReviewAnswer, db: Session) -> dict:
-    item = db.get(ReviewItem, review_id)
-    if not item: raise HTTPException(404, "Проверка не найдена")
-    item.status = status; item.answer = payload.answer; db.commit()
-    return {"id": item.id, "status": item.status}
-
-
-@router.post("/reviews/{review_id}/approve")
-def approve_review(review_id: int, payload: ReviewAnswer, db: Session = Depends(get_db)) -> dict:
-    return resolve_review(review_id, "approved", payload, db)
-
-
-@router.post("/reviews/{review_id}/reject")
-def reject_review(review_id: int, payload: ReviewAnswer, db: Session = Depends(get_db)) -> dict:
-    return resolve_review(review_id, "rejected", payload, db)
-
-
 @router.get("/vacancies")
-def vacancies(db: Session = Depends(get_db)) -> list[dict]:
+def vacancies(
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    include_data: bool = Query(False),
+    db: Session = Depends(get_db),
+) -> dict:
+    total = db.scalar(select(func.count()).select_from(Vacancy)) or 0
     rows = []
-    for vacancy in db.scalars(select(Vacancy).order_by(Vacancy.id.desc())):
+    for vacancy in db.scalars(select(Vacancy).order_by(Vacancy.id.desc()).offset(offset).limit(limit)):
         evaluation = db.scalar(select(Evaluation).where(Evaluation.vacancy_id == vacancy.id))
         rows.append(
             {
@@ -472,48 +541,12 @@ def vacancies(db: Session = Depends(get_db)) -> list[dict]:
                 "company": vacancy.company,
                 "url": vacancy.url,
                 "state": vacancy.state,
-                "data": vacancy.data,
                 "evaluation": evaluation.data if evaluation else None,
             }
         )
-    return rows
-
-
-@router.get("/reports")
-def reports(db: Session = Depends(get_db)) -> list[dict]:
-    return [
-        {
-            "id": r.id,
-            "session_id": r.session_id,
-            "summary": r.summary,
-            "created_at": r.created_at.isoformat(),
-            "pdf_url": f"/api/reports/{r.id}/pdf",
-        }
-        for r in db.scalars(select(Report).order_by(Report.id.desc()))
-    ]
-
-
-@router.get("/reports/{report_id}")
-def report(report_id: int, db: Session = Depends(get_db)) -> dict:
-    item = db.get(Report, report_id)
-    if not item: raise HTTPException(404, "Отчёт не найден")
-    return {"id": item.id, "session_id": item.session_id, "summary": item.summary, "files": {"html": item.html_path, "json": item.json_path, "csv": item.csv_path, "pdf": item.pdf_path}, "pdf_url": f"/api/reports/{item.id}/pdf"}
-
-
-@router.get("/reports/{report_id}/pdf")
-def report_pdf(report_id: int, db: Session = Depends(get_db)) -> FileResponse:
-    item = db.get(Report, report_id)
-    if not item:
-        raise HTTPException(404, "Отчёт не найден")
-    try:
-        path = ensure_report_pdf(db, item)
-    except (FileNotFoundError, OSError, RuntimeError) as exc:
-        raise HTTPException(404, "PDF-отчёт не найден") from exc
-    return FileResponse(
-        path,
-        media_type="application/pdf",
-        filename=f"session-{item.session_id}-report.pdf",
-    )
+        if include_data:
+            rows[-1]["data"] = vacancy.data
+    return {"items": rows, "total": total, "limit": limit, "offset": offset, "has_more": offset + len(rows) < total}
 
 
 async def session_socket(websocket: WebSocket, session_id: int) -> None:

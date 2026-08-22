@@ -11,7 +11,7 @@ shadcn/ui is a monochromatic design-system workshop: pure white canvas, soft war
 |------|-------|-------|------|
 | Canvas | `#f5f5f5` | `--color-canvas` | Page background, muted surface fills, secondary buttons |
 | Paper | `#ffffff` | `--color-paper` | Card surfaces, popover backgrounds, primary button fills |
-| Surface Alt | `#fafafa` | `--color-surface-alt` | Sidebar background, subtle card variant, input resting state |
+| Surface Alt | `#fafafa` | `--color-surface-alt` | Subtle navigation surface, card variant, input resting state |
 | Ink | `#0a0a0a` | `--color-ink` | Primary text, headings, button labels, icon strokes |
 | Ink Soft | `#171717` | `--color-ink-soft` | Filled button backgrounds, secondary text on light surfaces |
 | Mid Gray | `#737373` | `--color-mid-gray` | Muted body text, placeholder text, helper labels, icon fills at rest |
@@ -84,6 +84,26 @@ shadcn/ui is a monochromatic design-system workshop: pure white canvas, soft war
 - **Section gap:** 48-80px
 - **Card padding:** 20px
 - **Element gap:** 8px
+- **Navigation:** sticky full-width top bar with centered inner content
+- **Main:** centered page on the canvas; cards span the page content width
+- **Forms:** full-width cards with a centered, left-aligned form content rail
+
+### Form Widths
+
+Forms use full-width cards with a left-aligned content rail. Apply the rail or
+field utility to the wrapper (not only its input) so labels, fieldsets,
+subsections, tag lists, and controls share the same readable measure. Choose a
+semantic size for the expected content: compact (320px), medium (480px), wide
+(720px), or prose (760px), within the 880px form rail. On mobile each utility
+becomes width 100% so controls remain within the viewport.
+
+| Name | Value | Token |
+|------|-------|-------|
+| Form content max | 880px | `--form-content-max` |
+| Compact field | 320px | `--field-compact` |
+| Medium field | 480px | `--field-medium` |
+| Wide field | 720px | `--field-wide` |
+| Prose field | 760px | `--field-prose` |
 
 ## Components
 
@@ -115,7 +135,17 @@ Asymmetric radius — top corners 24px on header, bottom corners 24px on footer.
 ### Input Field
 **Role:** Text entry, search, form controls
 
-Background #f5f5f5 (resting) or transparent (inline), text #0a0a0a, border none at rest with 1px #e5e5e5 on focus, radius 18px, padding 8px 10px, font 14px weight 400. The soft gray fill differentiates the input from the card surface beneath it; focus replaces the fill with a 1px ring.
+Background #f5f5f5 (resting) or transparent (inline), text #0a0a0a, and a persistent 1px #e5e5e5 hairline for editable resume fields. Hover may strengthen the hairline; focus uses the ink border and the global focus ring. Radius 18px, padding 8px 10px, font 14px weight 400. The boundary keeps controls legible against card surfaces without introducing color.
+
+### Multi-select Field
+**Role:** Compact selection of multiple resume options
+
+The collapsed trigger is a paper surface with a 1px hairline, a muted label, selected values, and an ink chevron. The opened popover uses the paper surface, hairline, and subtle shadow; options are stacked as full-width 48px rows with aligned 18px checkboxes. Selected rows use only a neutral surface shift and stronger ink border. The full-width `Выбрать` action closes the popover. Keep this component achromatic and preserve the underlying enum array in the API payload.
+
+### Resume Experience Card
+**Role:** Repeated work-experience entry
+
+Use a paper surface with a 1px hairline, 10px nested radius, and a separated header row. Individual controls retain their own persistent boundaries so adjacent fields cannot visually merge.
 
 ### Badge — Solid
 **Role:** Tag, status pill, counter
@@ -132,10 +162,10 @@ Background #f5f5f5, text #171717, radius 18px, padding 2px 8px, font 12px weight
 
 Transparent background, text #0a0a0a, radius 18px, padding 2px 8px. The lightest-weight tag — used when the label is informational rather than categorical.
 
-### Sidebar Surface
-**Role:** Left navigation panel
+### Top Navigation Surface
+**Role:** Sticky top navigation bar
 
-Background #fafafa, full-height, contained width. Sits one tonal step off the canvas (#f5f5f5) so the navigation reads as a distinct layer without introducing a divider line.
+Background #ffffff with slight transparency, full-width, and a hairline bottom border. It sits one tonal step above the canvas (#f5f5f5), keeping navigation distinct while the centered page remains the primary focus.
 
 ### Breadcrumb Trail
 **Role:** Hierarchical path indicator
@@ -165,7 +195,7 @@ Text or icon in #e7000b against the monochromatic palette. The red is the only c
 - Set display headlines at 48px/600 with -0.0500em tracking — Geist's geometric weight at this size with aggressive tightening produces the engineered headline voice.
 - Reserve #e7000b exclusively for destructive states; never use it for decoration, branding, or non-error emphasis.
 - Stack card shadows as 1px hairline + 1px + 2px offset — the combined effect is a barely-perceptible elevation that reads as 'card' without drama.
-- Use #f5f5f5 for secondary surfaces and inputs; use #fafafa for sidebar and subtle card variants — the three-tone surface stack (canvas → soft → paper) creates layering without borders.
+- Use #f5f5f5 for secondary surfaces and inputs; use #fafafa for subtle navigation and card variants — the three-tone surface stack (canvas → soft → paper) creates layering without borders.
 
 ### Don't
 - Do not introduce chromatic brand colors beyond #e7000b — the monochromatic palette is the system.
@@ -181,7 +211,7 @@ Text or icon in #e7000b against the monochromatic palette. The red is the only c
 | Level | Name | Value | Purpose |
 |-------|------|-------|---------|
 | 0 | Canvas | `#f5f5f5` | Page background, broadest layer |
-| 1 | Sidebar | `#fafafa` | Navigation surface, one step lighter than canvas |
+| 1 | Top navigation | `#fafafa` | Navigation surface, one step lighter than canvas |
 | 2 | Card | `#ffffff` | Primary content container, brightest surface |
 | 3 | Input Fill | `#f5f5f5` | Resting input field, matches canvas tone for subtle differentiation |
 
@@ -291,6 +321,11 @@ shadcn/ui is built on three principles visible in every token: (1) achromatic by
   --section-gap: 48-80px;
   --card-padding: 20px;
   --element-gap: 8px;
+  --form-content-max: 880px;
+  --field-compact: 320px;
+  --field-medium: 480px;
+  --field-wide: 720px;
+  --field-prose: 760px;
 
   /* Border Radius */
   --radius-md: 6px;
@@ -313,7 +348,7 @@ shadcn/ui is built on three principles visible in every token: (1) achromatic by
 
   /* Surfaces */
   --surface-canvas: #f5f5f5;
-  --surface-sidebar: #fafafa;
+  --surface-navigation: #fafafa;
   --surface-card: #ffffff;
   --surface-input-fill: #f5f5f5;
 }

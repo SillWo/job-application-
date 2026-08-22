@@ -117,13 +117,6 @@ class ResumeImportData(BaseModel):
     resume: ResumeData
 
 
-class SearchFilters(BaseModel):
-    viewed_limit: int = Field(default=30, ge=1, le=500)
-    application_limit: int = Field(default=5, ge=0, le=50)
-    duration_minutes: int = Field(default=60, ge=1, le=720)
-    mode: Literal["analysis_only", "review_before_submit", "autopilot"] = "analysis_only"
-
-
 class ScoringCriterion(BaseModel):
     key: str
     title: str
@@ -131,71 +124,15 @@ class ScoringCriterion(BaseModel):
     max_points: int = Field(ge=0, le=100)
 
 
-class FlagMatch(BaseModel):
-    """A model's evidence-backed match for one policy flag."""
-
-    flag: str = Field(min_length=1)
-    confidence: float = Field(default=0, ge=0, le=1)
-    evidence: list[str] = Field(default_factory=list)
-    matched: bool = True
-    # ``None`` preserves the pre-verdict API contract for stored evaluations;
-    # new model responses must use this explicit semantic verdict.
-    verdict: Literal["present", "absent", "uncertain"] | None = None
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def normalize_percentage_confidence(cls, value: Any) -> Any:
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and 1 < value <= 100:
-            return value / 100
-        return value
-
-
-class WorkFormatAssessment(BaseModel):
-    compatible: bool | None = None
-    confidence: float = Field(default=0, ge=0, le=1)
-    vacancy_format: str | None = None
-    candidate_formats: list[str] = Field(default_factory=list)
-    evidence: list[str] = Field(default_factory=list)
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def normalize_percentage_confidence(cls, value: Any) -> Any:
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and 1 < value <= 100:
-            return value / 100
-        return value
-
-
-class PolicyFilterResult(BaseModel):
-    green_flags: list[FlagMatch] = Field(default_factory=list)
-    red_flags: list[FlagMatch] = Field(default_factory=list)
-    work_format: WorkFormatAssessment = Field(default_factory=WorkFormatAssessment)
-    reason: str = ""
-
-
-class PolicyCompilation(BaseModel):
-    """Dedicated schema returned by the policy compiler role."""
-
-    green_flags: list[str] = Field(default_factory=list)
-    red_flags: list[str] = Field(default_factory=list)
-    flag_confidence_threshold: float = Field(default=0.70, ge=0, le=1)
-
-    @field_validator("flag_confidence_threshold", mode="before")
-    @classmethod
-    def normalize_percentage_threshold(cls, value: Any) -> Any:
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and 1 < value <= 100:
-            return value / 100
-        return value
-
-
 class MatchAssessment(BaseModel):
-    """Normalized [0, 1] match supplied by the model; arithmetic is local."""
+    """Discrete rubric score supplied by the model; weighted arithmetic is local."""
 
-    match: float = Field(default=0, ge=0, le=1)
+    score: int = Field(default=0, ge=0)
     confidence: float = Field(default=0, ge=0, le=1)
     evidence: list[str] = Field(default_factory=list)
     explanation: str = ""
 
-    @field_validator("match", "confidence", mode="before")
+    @field_validator("confidence", mode="before")
     @classmethod
     def normalize_percentage(cls, value: Any) -> Any:
         if isinstance(value, (int, float)) and not isinstance(value, bool) and 1 < value <= 100:
@@ -204,16 +141,22 @@ class MatchAssessment(BaseModel):
 
 
 class ResumeAnalysis(BaseModel):
-    vacancy_seniority: Literal["junior", "middle", "senior"] | None = None
-    title: MatchAssessment = Field(default_factory=MatchAssessment)
-    tasks: MatchAssessment = Field(default_factory=MatchAssessment)
-    industry: MatchAssessment = Field(default_factory=MatchAssessment)
-    required_years: MatchAssessment = Field(default_factory=MatchAssessment)
-    seniority: MatchAssessment = Field(default_factory=MatchAssessment)
-    languages: MatchAssessment = Field(default_factory=MatchAssessment)
-    skills: MatchAssessment = Field(default_factory=MatchAssessment)
+    title: MatchAssessment
+    tasks: MatchAssessment
+    industry: MatchAssessment
+    required_years: MatchAssessment
+    languages: MatchAssessment
+    skills: MatchAssessment
     category: str = ""
     reason: str = ""
+
+    @model_validator(mode="after")
+    def validate_discrete_scores(self) -> ResumeAnalysis:
+        maxima = {"title": 2, "tasks": 3, "industry": 4, "required_years": 2, "languages": 2, "skills": 3}
+        for key, maximum in maxima.items():
+            if getattr(self, key).score > maximum:
+                raise ValueError(f"{key}.score must be between 0 and {maximum}")
+        return self
 
 
 def default_scoring_criteria() -> list[ScoringCriterion]:
@@ -221,23 +164,13 @@ def default_scoring_criteria() -> list[ScoringCriterion]:
         ScoringCriterion(key="title", title="Название должности", description="Совпадение фактического названия должности с желаемой должностью в резюме.", max_points=5),
         ScoringCriterion(key="tasks", title="Задачи", description="Соответствие задач вакансии задачам из опыта пользователя.", max_points=30),
         ScoringCriterion(key="industry", title="Сфера", description="Соответствие сферы вакансии сфере предыдущего опыта.", max_points=25),
-        ScoringCriterion(key="required_years", title="Годы опыта", description="Соответствие требуемых лет опыта подтверждённому опыту пользователя; 10 баллов при указанном уровне, иначе 20.", max_points=10),
-        ScoringCriterion(key="seniority", title="Уровень позиции", description="Соответствие junior/middle/senior уровню позиции и опыту пользователя; применяется только при явно указанном уровне.", max_points=10),
+        ScoringCriterion(key="required_years", title="Годы опыта", description="Соответствие требуемых лет опыта опыту пользователя.", max_points=20),
         ScoringCriterion(key="languages", title="Языки", description="Соответствие требуемого уровня языка уровню языка пользователя.", max_points=10),
         ScoringCriterion(key="skills", title="Навыки", description="Совпадение требуемых навыков с навыками пользователя.", max_points=10),
     ]
 
 
 RELEVANCE_SCORE_THRESHOLD = 70
-
-
-class SearchPolicy(BaseModel):
-    request_text: str = Field(min_length=10)
-    score_threshold: int = Field(default=RELEVANCE_SCORE_THRESHOLD, ge=0, le=100)
-    green_flags: list[str] = Field(default_factory=list)
-    red_flags: list[str] = Field(default_factory=list)
-    flag_confidence_threshold: float = Field(default=0.70, ge=0, le=1)
-    scoring_criteria: list[ScoringCriterion] = Field(default_factory=default_scoring_criteria)
 
 
 class Salary(BaseModel):
@@ -266,6 +199,11 @@ class JobPosting(BaseModel):
     location: str | None = None
     work_format: str | None = None
     employment_type: str | None = None
+    payment_frequency: str | None = None
+    required_experience: str | None = None
+    hiring_format: str | None = None
+    work_schedule: str | None = None
+    working_hours: str | None = None
     salary: Salary | None = None
     requires_cover_letter: bool | None = None
     has_test_assignment: bool | None = None
@@ -285,6 +223,10 @@ class ScoreComponent(BaseModel):
     title: str
     points: int = Field(ge=0, le=100)
     max_points: int = Field(ge=0, le=100)
+    raw_points: int = Field(default=0, ge=0)
+    raw_max_points: int = Field(default=0, ge=0)
+    minimum_points: int | None = Field(default=None, ge=0)
+    minimum_failed: bool = False
     explanation: str
     evidence: list[str] = Field(default_factory=list)
 
@@ -296,13 +238,13 @@ class JobEvaluation(BaseModel):
     category: str
     score_breakdown: list[ScoreComponent] = Field(default_factory=list)
     hard_rule_violations: list[str] = Field(default_factory=list)
+    minimum_score_violations: list[str] = Field(default_factory=list)
     positive_evidence: list[Evidence] = Field(default_factory=list)
     negative_evidence: list[Evidence] = Field(default_factory=list)
     missing_requirements: list[str] = Field(default_factory=list)
     has_test_assignment: bool = False
     requires_manual_review: bool = False
     reason: str
-    flag_filter: PolicyFilterResult | None = None
 
     @field_validator("confidence", mode="before")
     @classmethod

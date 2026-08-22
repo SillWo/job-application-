@@ -1,6 +1,6 @@
 import re
 import unicodedata
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 from playwright.async_api import Error as PlaywrightError
 
@@ -23,15 +23,20 @@ class HHAdapter:
     display_name = "HH.ru"
     # HH redirects authenticated users to their regional subdomain and emits
     # vacancy links on that same host.
-    allowed_domains = ("hh.ru", "www.hh.ru", "krasnoyarsk.hh.ru")
+    allowed_domains = (
+        "hh.ru",
+        "www.hh.ru",
+        "krasnoyarsk.hh.ru",
+        "zarplata.ru",
+        "www.zarplata.ru",
+        "krasnoyarsk.zarplata.ru",
+    )
     manifest = AdapterManifest(
         site_id=site_id,
         display_name=display_name,
         allowed_domains=allowed_domains,
         supports_submission=True,
-        safe_live_modes=("analysis_only", "review_before_submit", "autopilot"),
     )
-
     async def start(self, context, settings: dict) -> None:
         return None
 
@@ -207,31 +212,22 @@ class HHAdapter:
             await links.first.wait_for(state="attached", timeout=timeout)
         except Exception:
             return []
-        ranked_refs: list[tuple[int, int, JobRef]] = []
+        refs: list[JobRef] = []
         for i in range(min(await links.count(), 100)):
             link = links.nth(i)
+            is_visible = getattr(link, "is_visible", None)
+            if is_visible is not None and not await is_visible():
+                continue
             href = await link.get_attribute("href")
             url = urljoin(page.url, href) if href else None
             parsed = urlparse(url) if url else None
-            vacancy_match = re.fullmatch(r"/vacancy/(\d+)/?", parsed.path) if parsed else None
+            path = unquote(parsed.path) if parsed else ""
+            vacancy_match = re.fullmatch(r"/vacancy/(\d+)/?", path)
             if parsed and parsed.hostname in self.allowed_domains and vacancy_match:
                 external_id = vacancy_match.group(1)
-                if all(ref.external_id != external_id for _, _, ref in ranked_refs):
-                    try:
-                        label = (await link.inner_text()).lower()
-                    except Exception:
-                        label = ""
-                    priority = (
-                        0
-                        if "product" in label or "продукт" in label
-                        else 1
-                        if "project" in label or "проект" in label
-                        else 2
-                    )
-                    ranked_refs.append(
-                        (priority, i, JobRef(external_id=external_id, url=url))
-                    )
-        return [ref for _, _, ref in sorted(ranked_refs)]
+                if all(ref.external_id != external_id for ref in refs):
+                    refs.append(JobRef(external_id=external_id, url=url))
+        return refs
 
     async def open_job(self, page, ref: JobRef) -> None:
         if urlparse(ref.url).hostname not in self.allowed_domains:
@@ -240,9 +236,41 @@ class HHAdapter:
         await page.wait_for_timeout(1_000)
 
     async def extract_job(self, page) -> JobPosting:
-        title = (await page.locator(locators.VACANCY_TITLE).inner_text(timeout=8_000)).strip()
-        company = (await page.locator(locators.COMPANY).inner_text(timeout=8_000)).strip()
-        description = (await page.locator(locators.DESCRIPTION).inner_text(timeout=8_000)).strip()
+        async def required_text(selector: str, label: str) -> str:
+            locator = page.locator(selector)
+            for index in range(await locator.count()):
+                candidate = locator.nth(index) if hasattr(locator, "nth") else locator.first
+                is_visible = getattr(candidate, "is_visible", None)
+                if is_visible is not None and not await is_visible():
+                    continue
+                try:
+                    value = (await candidate.inner_text(timeout=8_000)).strip()
+                except Exception:
+                    continue
+                if value:
+                    return value
+            raise ValueError(f"Не удалось извлечь {label} вакансии")
+
+        title = await required_text(locators.VACANCY_TITLE, "название")
+        company = await required_text(locators.COMPANY, "компанию")
+        description = await required_text(locators.DESCRIPTION, "описание")
+        async def optional_text(selector: str) -> str | None:
+            locator = page.locator(selector).first
+            if not await locator.count():
+                return None
+            try:
+                value = " ".join((await locator.inner_text(timeout=3_000)).split())
+            except Exception:
+                return None
+            return value or None
+
+        payment_frequency = await optional_text(locators.PAYMENT_FREQUENCY)
+        required_experience = await optional_text(locators.WORK_EXPERIENCE)
+        employment_type = await optional_text(locators.EMPLOYMENT)
+        hiring_format = await optional_text(locators.HIRING_FORMAT)
+        work_schedule = await optional_text(locators.WORK_SCHEDULE)
+        working_hours = await optional_text(locators.WORKING_HOURS)
+        work_format = await optional_text(locators.WORK_FORMAT)
         external_id = page.url.rstrip("/").split("/")[-1].split("?")[0]
         return JobPosting(
             source="hh",
@@ -252,20 +280,25 @@ class HHAdapter:
             company=company,
             description=description,
             has_test_assignment=self.has_test_assignment(description),
+            payment_frequency=payment_frequency,
+            required_experience=required_experience,
+            employment_type=employment_type,
+            hiring_format=hiring_format,
+            work_schedule=work_schedule,
+            working_hours=working_hours,
+            work_format=work_format,
         )
 
-    async def detect_page_type(self, page) -> str:
-        if await page.locator(locators.VACANCY_TITLE).count():
-            return "vacancy"
-        if "/search/vacancy" in page.url:
-            return "search"
-        return "unknown"
-
     async def open_application(self, page) -> ApplicationForm:
+        # Keep the result classification tied to this attempt.  HH's
+        # one-click response closes the form immediately and then exposes the
+        # same topic link used for responses that existed before this attempt.
+        self._application_attempt_clicked = False
         response = page.locator(locators.RESPONSE_BUTTON).first
         if not await response.count():
             return ApplicationForm()
         await response.click()
+        self._application_attempt_clicked = True
         await page.wait_for_timeout(800)
         questions = await self._application_questions(page)
         return ApplicationForm(
@@ -386,9 +419,11 @@ class HHAdapter:
         # With no active form, the topic link means the response existed
         # before this attempt.
         if await page.locator(locators.ALREADY_APPLIED).count():
+            if getattr(self, "_application_attempt_clicked", False):
+                return await self.verify_submission(page, just_submitted=True)
             return SubmissionResult(
                 status="already_applied",
-                message="HH.ru показывает ранее отправленный отклик",
+                message="hh.ru показывает ранее отправленный отклик",
             )
         return await self.verify_submission(page)
 
@@ -401,25 +436,25 @@ class HHAdapter:
             if await page.locator(locators.ALREADY_APPLIED).count():
                 if just_submitted:
                     return SubmissionResult(
-                        status="submitted", message="HH.ru подтвердил отправку отклика"
+                        status="submitted", message="hh.ru подтвердил отправку отклика"
                     )
                 return SubmissionResult(
                     status="already_applied",
-                    message="HH.ru показывает ранее отправленный отклик",
+                    message="hh.ru показывает ранее отправленный отклик",
                 )
             if await page.locator(locators.SUBMISSION_CONFIRMED).count():
                 return SubmissionResult(
-                    status="submitted", message="HH.ru подтвердил отправку отклика"
+                    status="submitted", message="hh.ru подтвердил отправку отклика"
                 )
             text = (await page.locator("body").inner_text()).lower()
             if any(marker in text for marker in locators.SUBMISSION_TEXT_MARKERS):
                 return SubmissionResult(
-                    status="submitted", message="HH.ru подтвердил отправку отклика"
+                    status="submitted", message="hh.ru подтвердил отправку отклика"
                 )
             if attempt < 9:
                 await page.wait_for_timeout(500)
         return SubmissionResult(
-            status="unknown", message="HH.ru не показал однозначное подтверждение отправки"
+            status="unknown", message="hh.ru не показал однозначное подтверждение отправки"
         )
 
     async def detect_blockers(self, page) -> list[Blocker]:

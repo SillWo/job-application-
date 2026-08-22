@@ -2,18 +2,16 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from backend.config import settings
 from backend.schemas.domain import (
     JobEvaluation,
     JobPosting,
-    MatchAssessment,
     ResumeAnalysis,
     ScoreComponent,
 )
 
-from .antigravity import analyze_relevance
 from .gateway import ModelGateway
 
 
@@ -29,46 +27,38 @@ def _payload(value: Any) -> Any:
     }
 
 
-def _points(assessment: MatchAssessment, maximum: int) -> int:
-    if maximum <= 0:
-        return 0
-    return round(maximum * min(max(assessment.match, 0), 1))
+CRITERIA = {
+    "title": (2, 5, "Название должности"),
+    "tasks": (3, 30, "Задачи"),
+    "industry": (4, 25, "Сфера"),
+    "required_years": (2, 20, "Годы опыта"),
+    "languages": (2, 10, "Языки"),
+    "skills": (3, 10, "Навыки"),
+}
+
+
+def _round_half_up(value: Decimal) -> int:
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def _assessment_rows(
-    job: JobPosting, analysis: ResumeAnalysis
+    job: JobPosting, analysis: ResumeAnalysis, minimum_scores: dict[str, int] | None = None
 ) -> list[ScoreComponent]:
-    has_level = analysis.vacancy_seniority is not None
-    criteria = {
-        "title": (analysis.title, 5),
-        "tasks": (analysis.tasks, 30),
-        "industry": (analysis.industry, 25),
-        "required_years": (analysis.required_years, 10 if has_level else 20),
-        "seniority": (analysis.seniority, 10 if has_level else 0),
-        "languages": (analysis.languages, 10),
-        "skills": (analysis.skills, 10),
-    }
-    titles = {
-        "title": "Название должности",
-        "tasks": "Задачи",
-        "industry": "Сфера",
-        "required_years": "Годы опыта",
-        "seniority": "Уровень позиции",
-        "languages": "Языки",
-        "skills": "Навыки",
-    }
-    return [
-        ScoreComponent(
-            key=key,
-            title=titles[key],
-            points=_points(assessment, maximum),
-            max_points=maximum,
-            explanation=assessment.explanation
-            or f"Совпадение по критерию: {assessment.match:.0%}",
+    rows = []
+    for key, (raw_max, weight, title) in CRITERIA.items():
+        assessment = getattr(analysis, key)
+        if assessment.score > raw_max:
+            raise ValueError(f"{key}.score must be between 0 and {raw_max}")
+        weighted = Decimal(assessment.score) / Decimal(raw_max) * Decimal(weight)
+        rows.append(ScoreComponent(
+            key=key, title=title, points=_round_half_up(weighted), max_points=weight,
+            raw_points=assessment.score, raw_max_points=raw_max,
+            minimum_points=(minimum_scores or {}).get(key),
+            minimum_failed=(key in (minimum_scores or {}) and assessment.score < minimum_scores[key]),
+            explanation=assessment.explanation or f"Оценка по шкале: {assessment.score}/{raw_max}",
             evidence=list(assessment.evidence),
-        )
-        for key, (assessment, maximum) in criteria.items()
-    ]
+        ))
+    return rows
 
 
 def _significant_terms(value: str) -> set[str]:
@@ -119,40 +109,6 @@ _RUSSIAN_LANGUAGE = r"(?:русск\w*|russian)"
 _LANGUAGE_LEVEL = (
     r"(?:a1|a2|b1|b2|c1|c2|fluent|advanced|intermediate|разговорн\w*)"
 )
-_SENIORITY_PATTERNS = {
-    "junior": r"(?<![\w-])(?:junior|jr\.?|джун\w*|младш\w*)(?![\w-])",
-    "middle": r"(?<![\w-])(?:middle|мидл\w*|миддл\w*)(?![\w-])",
-    "senior": r"(?<![\w-])(?:senior|sr\.?|сеньор\w*|старш\w*)(?![\w-])",
-}
-
-
-def _explicit_vacancy_seniority(job: JobPosting) -> str | None:
-    text = " ".join(
-        [job.title, job.description, *job.responsibilities, *job.required_skills]
-    )
-    detected = [
-        level
-        for level, pattern in _SENIORITY_PATTERNS.items()
-        if re.search(pattern, text, re.I)
-    ]
-    return detected[0] if len(detected) == 1 else None
-
-
-def _validate_vacancy_seniority(analysis: ResumeAnalysis, job: JobPosting) -> None:
-    explicit_level = _explicit_vacancy_seniority(job)
-    if explicit_level is not None and analysis.vacancy_seniority == explicit_level:
-        return
-    analysis.vacancy_seniority = explicit_level
-    analysis.seniority.match = 0
-    analysis.seniority.confidence = 0
-    analysis.seniority.evidence = []
-    analysis.seniority.explanation = (
-        "Уровень позиции не подтверждён явным junior/middle/senior маркером вакансии."
-        if explicit_level is None
-        else "Модельный уровень позиции не совпал с явным маркером вакансии."
-    )
-
-
 def _language_requirement_evidence(
     job: JobPosting, language_pattern: str
 ) -> list[str]:
@@ -199,8 +155,16 @@ def _ground_resume_analysis(
     profile: Any,
     resumes: Sequence[Any],
 ) -> ResumeAnalysis:
+    structured_job_fields = [
+        str(getattr(job, field))
+        for field in (
+            "payment_frequency", "required_experience", "employment_type",
+            "hiring_format", "work_schedule", "working_hours", "work_format",
+        )
+        if getattr(job, field, None)
+    ]
     job_source = " ".join(
-        [job.title, job.description, *job.responsibilities, *job.required_skills]
+        [job.title, job.description, *job.responsibilities, *job.required_skills, *structured_job_fields]
     )
     resume_source = " ".join(
         [str(_payload(profile)), *[str(_payload(item)) for item in resumes]]
@@ -211,7 +175,6 @@ def _ground_resume_analysis(
         "tasks",
         "industry",
         "required_years",
-        "seniority",
         "languages",
         "skills",
     ):
@@ -228,18 +191,17 @@ def _ground_resume_analysis(
             if not _quote_grounded(normalized, source):
                 grounded = False
                 break
-        if assessment.match > 0 and not grounded:
-            assessment.match = 0
+        if assessment.score > 0 and not grounded:
+            assessment.score = 0
             assessment.confidence = 0
             assessment.explanation = (
                 "Совпадение обнулено: evidence не подтверждено входными данными."
             )
             assessment.evidence = []
-    _validate_vacancy_seniority(analysis, job)
     foreign_requirements = _language_requirement_evidence(job, _FOREIGN_LANGUAGE)
     if not foreign_requirements:
         russian_requirements = _language_requirement_evidence(job, _RUSSIAN_LANGUAGE)
-        analysis.languages.match = 1
+        analysis.languages.score = 2
         analysis.languages.confidence = 1
         analysis.languages.evidence = russian_requirements
         analysis.languages.explanation = (
@@ -258,6 +220,7 @@ async def evaluate(
     resumes: Sequence[Any],
     score_threshold: int,
     gateway: ModelGateway,
+    minimum_scores: dict[str, int] | None = None,
 ) -> JobEvaluation:
     """Evaluate a vacancy only against selected resumes."""
     if not 0 <= score_threshold <= 100:
@@ -269,36 +232,49 @@ async def evaluate(
         "resumes": [_payload(resume) for resume in resumes],
     }
 
-    # Only relevance analysis is moved to Antigravity.
-    # All other LLM roles continue using the normal ModelGateway/Ollama.
-    if settings.relevance_provider == "antigravity":
-        analysis = await analyze_relevance(payload, ResumeAnalysis)
-    else:
-        analysis = await gateway.structured("resume_analyst", payload, ResumeAnalysis)
+    analysis = await gateway.structured("resume_analyst", payload, ResumeAnalysis)
 
     # Keep the project's deterministic safety layer unchanged.
     analysis = _ground_resume_analysis(analysis, job, profile, resumes)
-    rows = _assessment_rows(job, analysis)
-    score = sum(item.points for item in rows)
+    rows = _assessment_rows(job, analysis, minimum_scores)
+    weighted_total = sum(
+        Decimal(row.raw_points) / Decimal(row.raw_max_points) * Decimal(row.max_points)
+        for row in rows
+    )
+    score = _round_half_up(weighted_total)
 
     assessments = [
         analysis.title,
         analysis.tasks,
         analysis.industry,
         analysis.required_years,
-        analysis.seniority,
         analysis.languages,
         analysis.skills,
     ]
     reason = analysis.reason.strip() or "Оценка вакансии на основе резюме."
 
+    minimum_score_violations = []
+    for key, minimum in (minimum_scores or {}).items():
+        if key not in CRITERIA:
+            raise ValueError(f"Unknown minimum score criterion: {key}")
+        raw_max = CRITERIA[key][0]
+        if not 0 <= minimum <= raw_max:
+            raise ValueError(f"Minimum for {key} must be between 0 and {raw_max}")
+        actual = getattr(analysis, key).score
+        if actual < minimum:
+            minimum_score_violations.append(f"{key}: {actual}/{raw_max}, минимум {minimum}")
+    blocked = bool(minimum_score_violations)
+    if blocked:
+        reason = f"{reason} Не достигнут минимум: {'; '.join(minimum_score_violations)}"
+
     return JobEvaluation(
-        decision="apply" if score >= score_threshold else "skip",
+        decision="apply" if score >= score_threshold and not blocked else "skip",
         score=score,
         confidence=max((item.confidence for item in assessments), default=0),
         category=analysis.category or job.title,
         score_breakdown=rows,
+        minimum_score_violations=minimum_score_violations,
+        hard_rule_violations=[f"minimum_score:{item}" for item in minimum_score_violations],
         reason=reason,
         has_test_assignment=bool(job.has_test_assignment),
-        flag_filter=None,
     )
