@@ -13,6 +13,9 @@ class Gateway:
         self.analysis = analysis
 
     async def structured(self, role, payload, schema):
+        self.role = role
+        self.payload = payload
+        self.schema = schema
         return self.analysis.model_copy(deep=True)
 
 
@@ -90,37 +93,90 @@ def job() -> JobPosting:
 @pytest.mark.asyncio
 async def test_weighted_discrete_formula_and_breakdown(job):
     model_result = analysis(title=1, tasks=2, industry=3, required_years=1, languages=1, skills=2)
-    result = await evaluator.evaluate(job, {}, [], 70, Gateway(model_result))
+    result = await evaluator.evaluate(job, {}, [], Gateway(model_result))
 
     assert result.score == 68  # no explicit language requirement forces E=2
     assert [row.key for row in result.score_breakdown] == ["title", "tasks", "industry", "required_years", "languages", "skills"]
     assert result.score_breakdown[0].raw_points == 1
     assert result.score_breakdown[0].raw_max_points == 2
-    assert result.decision == "skip"
+    assert result.decision == "apply"
+    assert [row.minimum_points for row in result.score_breakdown] == [0, 2, 2, 1, 1, 2]
+    assert not any(row.minimum_failed for row in result.score_breakdown)
 
 
 @pytest.mark.asyncio
-async def test_minimum_scores_are_disabled_by_default(job):
-    result = await evaluator.evaluate(job, {}, [], 0, Gateway(analysis()), minimum_scores=None)
-    assert result.decision == "apply"
-    assert result.minimum_score_violations == []
+async def test_default_gates_reject_missing_criteria(job):
+    result = await evaluator.evaluate(job, {}, [], Gateway(analysis()))
+    assert result.decision == "skip"
+    assert {"tasks", "industry", "required_years", "skills"} == {
+        item.split(":", 1)[0] for item in result.minimum_score_violations
+    }
 
 
 @pytest.mark.asyncio
 async def test_total_uses_mathematical_half_up_rounding(job):
-    result = await evaluator.evaluate(job, {}, [], 13, Gateway(analysis(title=1)))
-    assert result.score == 13  # title 2.5 + default language 10 = 12.5
+    result = await evaluator.evaluate(
+        job, {}, [], Gateway(analysis(title=1, tasks=1, industry=1, required_years=1, skills=1)),
+        minimum_scores={"tasks": 1, "industry": 1, "skills": 1},
+    )
+    assert result.score == 42
     assert result.decision == "apply"
 
 
 @pytest.mark.asyncio
 async def test_minimum_score_blocks_even_when_total_passes(job):
     result = await evaluator.evaluate(
-        job, {}, [], 50,
-        Gateway(analysis(title=0, tasks=3, industry=4, required_years=2, languages=2, skills=3)),
-        minimum_scores={"title": 1},
+        job, {}, [],
+        Gateway(analysis(title=2, tasks=2, industry=4, required_years=2, languages=2, skills=3)),
+        minimum_scores={"tasks": 3},
     )
-    assert result.score == 95
+    assert result.score == 90
     assert result.decision == "skip"
-    assert result.minimum_score_violations == ["title: 0/2, минимум 1"]
-    assert result.score_breakdown[0].minimum_failed is True
+    assert result.minimum_score_violations == ["tasks: 2/3, минимум 3"]
+    assert result.score_breakdown[1].minimum_failed is True
+
+
+@pytest.mark.asyncio
+async def test_persisted_map_cannot_override_fixed_gates(job):
+    result = await evaluator.evaluate(
+        job,
+        {},
+        [],
+        Gateway(
+            analysis(
+                title=0,
+                tasks=2,
+                industry=2,
+                required_years=1,
+                languages=2,
+                skills=2,
+            )
+        ),
+        minimum_scores={"title": 2, "required_years": 0, "languages": 0},
+    )
+
+    assert result.decision == "apply"
+    assert [result.score_breakdown[i].minimum_points for i in (0, 3, 4)] == [0, 1, 1]
+    assert result.minimum_score_violations == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level, expected", [(1, 1), (2, 2), (3, 3)])
+async def test_configurable_gate_levels(level, expected, job):
+    result = await evaluator.evaluate(
+        job, {}, [], Gateway(analysis(tasks=expected, industry=expected, skills=expected)),
+        minimum_scores={"tasks": level, "industry": level, "skills": level},
+    )
+    assert [result.score_breakdown[i].minimum_points for i in (1, 2, 5)] == [expected] * 3
+
+
+@pytest.mark.asyncio
+async def test_payload_contains_all_six_criteria(job):
+    gateway = Gateway(analysis())
+    await evaluator.evaluate(job, {}, [], gateway)
+    assert gateway.role == "resume_analyst"
+    assert gateway.schema is ResumeAnalysis
+    assert set(gateway.payload) == {"job", "profile", "resumes"}
+    assert set(gateway.schema.model_fields) >= {
+        "title", "tasks", "industry", "required_years", "languages", "skills"
+    }

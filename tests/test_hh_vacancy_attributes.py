@@ -162,7 +162,7 @@ async def test_evaluate_passes_structured_attributes_to_resume_analyst():
         work_schedule="График: 5/2", working_hours="Рабочие часы: 8", work_format="Формат работы: удалённо",
     )
     gateway = RecordingGateway()
-    result = await evaluate(job, {}, [], 70, gateway)
+    result = await evaluate(job, {}, [], gateway)
     assert result.score == 74
     assert gateway.payload["job"]["required_experience"] == "Опыт работы: 1–3 года"
     for key in ("payment_frequency", "employment_type", "hiring_format", "work_schedule", "working_hours", "work_format"):

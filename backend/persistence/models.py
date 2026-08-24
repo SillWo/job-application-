@@ -17,8 +17,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
-from backend.schemas.domain import RELEVANCE_SCORE_THRESHOLD
-
 from .database import Base
 
 
@@ -64,11 +62,6 @@ class JobSession(Base):
     __tablename__ = "sessions"
     id: Mapped[int] = mapped_column(primary_key=True)
     profile_id: Mapped[int] = mapped_column(ForeignKey("candidate_profiles.id"))
-    score_threshold: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-        server_default=str(RELEVANCE_SCORE_THRESHOLD),
-    )
     minimum_scores: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     adapter_id: Mapped[str] = mapped_column(String(50))
     # These values are a snapshot of the launch configuration.  ``None`` means

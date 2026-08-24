@@ -494,7 +494,6 @@ class WorkflowManager:
             resume_file = (
                 _resume_file(selected_records[0], selected_resumes[0]) if selected_records else ""
             )
-            score_threshold = item.score_threshold
             minimum_scores = item.minimum_scores or None
             adapter_id = item.adapter_id
 
@@ -808,13 +807,14 @@ class WorkflowManager:
                             session_id,
                             "evaluation_payload",
                             "Payload вакансии передан на оценку",
-                            {"vacancy_id": vacancy.id, "job": _payload(posting)},
+                            {"vacancy_id": vacancy.id, "job": _payload(posting),
+                             "criteria": ["title", "tasks", "industry", "required_years", "languages", "skills"],
+                             "minimum_scores": minimum_scores},
                         )
                         result = await evaluate(
                             posting,
                             profile,
                             selected_resumes,
-                            score_threshold,
                             gateway,
                             minimum_scores,
                         )
@@ -835,11 +835,10 @@ class WorkflowManager:
                         db,
                         session_id,
                         "evaluation",
-                        f"Оценка {result.score}/100, порог {score_threshold}",
+                        f"Оценка {result.score}/100",
                         {
                             "vacancy_id": vacancy.id,
                             "score": result.score,
-                            "threshold": score_threshold,
                             "decision": result.decision,
                             "minimum_score_violations": result.minimum_score_violations,
                             "breakdown": [row.model_dump() for row in result.score_breakdown],

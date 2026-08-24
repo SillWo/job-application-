@@ -26,7 +26,7 @@ class DB:
 def session(adapter_id):
     return SimpleNamespace(
         id=7, profile_id=1, adapter_id=adapter_id, status=SessionStatus.RUNNING,
-        stop_reason=None, finished_at=None, counters={}, score_threshold=70,
+        stop_reason=None, finished_at=None, counters={},
         minimum_scores=None, viewed_limit=1, application_limit=1,
         started_at=None,
     )

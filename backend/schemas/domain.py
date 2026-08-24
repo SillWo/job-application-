@@ -170,9 +170,6 @@ def default_scoring_criteria() -> list[ScoringCriterion]:
     ]
 
 
-RELEVANCE_SCORE_THRESHOLD = 70
-
-
 class Salary(BaseModel):
     minimum: int | None = None
     maximum: int | None = None

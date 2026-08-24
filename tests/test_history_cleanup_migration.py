@@ -62,3 +62,26 @@ def test_fresh_upgrade_head_isolated(tmp_path):
     assert "vacancies" in {row[0] for row in db.execute("select name from sqlite_master where type='table'")}
     assert "session_id" in _columns(db, "vacancies")
     db.close()
+
+
+def test_database_url_environment_override_wins_without_touching_default(tmp_path, monkeypatch):
+    target = tmp_path / "env.db"
+    decoy = tmp_path / "decoy.db"
+    default = sqlite3.connect("data/orchestrator.db")
+    default_revision = default.execute("select version_num from alembic_version").fetchone()
+    default.close()
+
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{decoy.as_posix()}")
+    monkeypatch.setenv("JAO_DATABASE_URL", f"sqlite:///{target.as_posix()}")
+    command.upgrade(config, "head")
+
+    target_db = sqlite3.connect(target)
+    assert target_db.execute("select version_num from alembic_version").fetchone()[0] == "0018"
+    assert "vacancies" in {row[0] for row in target_db.execute("select name from sqlite_master where type='table'")}
+    target_db.close()
+    assert not decoy.exists()
+
+    default = sqlite3.connect("data/orchestrator.db")
+    assert default.execute("select version_num from alembic_version").fetchone() == default_revision
+    default.close()

@@ -7,6 +7,37 @@ import { Notifications } from './App'
 beforeEach(() => { vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] })) })
 afterEach(() => vi.unstubAllGlobals())
 
+test('configures influence sliders, accessible hints, and minimum score payload', async () => {
+  const requests: Array<{ url: string; method?: string; body?: string }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 77, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
+    if (url.endsWith('/api/sessions/77/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByRole('heading', { name: 'Влияние факторов на вакансии' })).toBeInTheDocument()
+  const sliders = await screen.findAllByRole('slider')
+  expect(sliders).toHaveLength(3)
+  expect(sliders.every((slider) => slider.getAttribute('aria-valuetext') === 'Средний')).toBe(true)
+  expect(screen.getAllByText('Низкий')).toHaveLength(3)
+  expect(screen.getAllByText('Средний')).toHaveLength(3)
+  expect(screen.getAllByText('Высокий')).toHaveLength(3)
+  expect(screen.getByRole('button', { name: 'Подсказка: Задачи' })).toHaveAttribute('data-tooltip', expect.stringContaining('обязанностей'))
+  fireEvent.focus(screen.getByRole('button', { name: 'Подсказка: Навыки' }))
+  fireEvent.change(sliders[0], { target: { value: '1' } })
+  fireEvent.change(sliders[2], { target: { value: '3' } })
+  expect(sliders[0]).toHaveAttribute('aria-valuetext', 'Низкий')
+  expect(sliders[2]).toHaveAttribute('aria-valuetext', 'Высокий')
+  const launch = await screen.findByRole('button', { name: 'Создать и запустить' }); await waitFor(() => expect(launch).toBeEnabled()); fireEvent.click(launch)
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/77/start'))).toBe(true))
+  const payload = JSON.parse(requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))?.body ?? '{}')
+  expect(payload.minimum_scores).toEqual({ tasks: 1, industry: 2, skills: 3 })
+  expect(JSON.stringify(payload)).not.toMatch(/secondary|общий|вторичн|threshold|проходн|балл/i)
+})
+
 test('configures a new cloud model key and clears it after saving', async () => {
   const requests: Array<{ url: string; init?: RequestInit }> = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {

@@ -1,3 +1,4 @@
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -8,7 +9,12 @@ from backend.persistence import models  # noqa: F401
 from backend.persistence.database import Base
 
 config = context.config
-if not config.get_main_option("sqlalchemy.url"):
+# An explicit environment override is intended for deployments and tests.  Keep
+# programmatic Alembic Config URLs working when no override is present.
+database_url_override = os.environ.get("JAO_DATABASE_URL")
+if database_url_override:
+    config.set_main_option("sqlalchemy.url", database_url_override)
+elif not config.get_main_option("sqlalchemy.url"):
     config.set_main_option("sqlalchemy.url", settings.database_url)
 if config.config_file_name:
     fileConfig(config.config_file_name)

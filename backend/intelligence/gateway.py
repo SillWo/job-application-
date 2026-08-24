@@ -370,7 +370,7 @@ class ModelGateway:
                 for item in criteria
             ]
             score = sum(item["points"] for item in breakdown)
-            return schema.model_validate({"decision": "apply" if score >= payload["policy"]["score_threshold"] else "skip", "score": score, "confidence": 0.9 if score >= 80 else 0.72, "category": job.get("title", "Вакансия"), "score_breakdown": breakdown, "has_test_assignment": has_test, "requires_manual_review": False, "reason": "Детерминированная mock-оценка", "positive_evidence": [], "negative_evidence": [], "missing_requirements": [], "hard_rule_violations": []})
+            return schema.model_validate({"decision": "apply", "score": score, "confidence": 0.9 if score >= 80 else 0.72, "category": job.get("title", "Вакансия"), "score_breakdown": breakdown, "has_test_assignment": has_test, "requires_manual_review": False, "reason": "Детерминированная mock-оценка", "positive_evidence": [], "negative_evidence": [], "missing_requirements": [], "hard_rule_violations": []})
         if role == "profile" and schema.__name__ in {
             "CandidateProfileData",
             "PersonalProfileData",

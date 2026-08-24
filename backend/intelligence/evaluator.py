@@ -36,6 +36,17 @@ CRITERIA = {
     "skills": (3, 10, "Навыки"),
 }
 
+# Primary-score gates. The fixed gates apply to every session; only tasks,
+# industry and skills can be overridden by the user's influence controls.
+DEFAULT_MINIMUM_SCORES = {
+    "title": 0,
+    "required_years": 1,
+    "languages": 1,
+    "tasks": 2,
+    "industry": 2,
+    "skills": 2,
+}
+
 
 def _round_half_up(value: Decimal) -> int:
     return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
@@ -218,13 +229,21 @@ async def evaluate(
     job: JobPosting,
     profile: Any,
     resumes: Sequence[Any],
-    score_threshold: int,
     gateway: ModelGateway,
     minimum_scores: dict[str, int] | None = None,
 ) -> JobEvaluation:
     """Evaluate a vacancy only against selected resumes."""
-    if not 0 <= score_threshold <= 100:
-        raise ValueError("score_threshold must be between 0 and 100")
+    effective_minimums = dict(DEFAULT_MINIMUM_SCORES)
+    supplied = minimum_scores or {}
+    unknown = set(supplied) - set(CRITERIA)
+    if unknown:
+        raise ValueError(f"Unknown minimum score criterion: {sorted(unknown)[0]}")
+    for key in ("tasks", "industry", "skills"):
+        if key in supplied:
+            value = supplied[key]
+            if isinstance(value, bool) or value not in (1, 2, 3):
+                raise ValueError(f"Minimum for {key} must be 1, 2 or 3")
+            effective_minimums[key] = value
 
     payload = {
         "job": job.model_dump(mode="json"),
@@ -236,7 +255,7 @@ async def evaluate(
 
     # Keep the project's deterministic safety layer unchanged.
     analysis = _ground_resume_analysis(analysis, job, profile, resumes)
-    rows = _assessment_rows(job, analysis, minimum_scores)
+    rows = _assessment_rows(job, analysis, effective_minimums)
     weighted_total = sum(
         Decimal(row.raw_points) / Decimal(row.raw_max_points) * Decimal(row.max_points)
         for row in rows
@@ -254,7 +273,7 @@ async def evaluate(
     reason = analysis.reason.strip() or "Оценка вакансии на основе резюме."
 
     minimum_score_violations = []
-    for key, minimum in (minimum_scores or {}).items():
+    for key, minimum in effective_minimums.items():
         if key not in CRITERIA:
             raise ValueError(f"Unknown minimum score criterion: {key}")
         raw_max = CRITERIA[key][0]
@@ -268,7 +287,7 @@ async def evaluate(
         reason = f"{reason} Не достигнут минимум: {'; '.join(minimum_score_violations)}"
 
     return JobEvaluation(
-        decision="apply" if score >= score_threshold and not blocked else "skip",
+        decision="apply" if not blocked else "skip",
         score=score,
         confidence=max((item.confidence for item in assessments), default=0),
         category=analysis.category or job.title,

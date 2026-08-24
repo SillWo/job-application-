@@ -3,47 +3,30 @@ from pydantic import ValidationError
 
 from backend.api.router import SessionCreate
 from backend.persistence.models import JobSession
-from backend.schemas.domain import RELEVANCE_SCORE_THRESHOLD
 
 
-def _session_payload(**overrides: object) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "profile_id": 1,
-        "adapter_id": "hh",
-    }
-    payload.update(overrides)
-    return payload
+def payload(**overrides: object) -> dict[str, object]:
+    return {"profile_id": 1, "adapter_id": "hh", **overrides}
 
+def test_session_has_canonical_gate_map() -> None:
+    assert SessionCreate.model_validate(payload()).minimum_scores == {"title": 0, "tasks": 2, "industry": 2, "skills": 2, "required_years": 1, "languages": 1}
 
-def test_new_session_payload_uses_default_relevance_threshold() -> None:
-    assert SessionCreate.model_validate(_session_payload()).score_threshold == 70
-    assert SessionCreate.model_validate(_session_payload(score_threshold=70)).score_threshold == 70
-    assert RELEVANCE_SCORE_THRESHOLD == 70
+def test_fixed_gates_cannot_be_overridden() -> None:
+    result = SessionCreate.model_validate(payload(minimum_scores={"tasks": 3, "title": 2, "required_years": 0}))
+    assert result.minimum_scores["title"] == 0 and result.minimum_scores["required_years"] == 1 and result.minimum_scores["languages"] == 1
 
-
-@pytest.mark.parametrize("override", [0, 69, 71, 100])
-def test_new_session_payload_accepts_client_threshold_override(override: int) -> None:
-    assert SessionCreate.model_validate(_session_payload(score_threshold=override)).score_threshold == override
-
-
-@pytest.mark.parametrize("override", [-1, 101])
-def test_new_session_payload_rejects_out_of_range_threshold(override: int) -> None:
+@pytest.mark.parametrize("value", [0, 4, True, False])
+def test_configurable_gate_values_are_strict(value: object) -> None:
     with pytest.raises(ValidationError):
-        SessionCreate.model_validate(_session_payload(score_threshold=override))
+        SessionCreate.model_validate(payload(minimum_scores={"tasks": value}))
 
-
-def test_minimum_scores_are_optional_and_validated() -> None:
-    assert SessionCreate.model_validate(_session_payload()).minimum_scores is None
-    assert SessionCreate.model_validate(_session_payload(minimum_scores={})).minimum_scores == {}
-    assert SessionCreate.model_validate(_session_payload(minimum_scores={"tasks": 2})).minimum_scores == {"tasks": 2}
+def test_unknown_gate_is_rejected() -> None:
     with pytest.raises(ValidationError):
-        SessionCreate.model_validate(_session_payload(minimum_scores={"tasks": 4}))
+        SessionCreate.model_validate(payload(minimum_scores={"unknown": 1}))
 
 
-def test_session_payload_rejects_removed_mode() -> None:
+def test_aggregate_threshold_is_rejected_and_absent_from_sessions() -> None:
     with pytest.raises(ValidationError):
-        SessionCreate.model_validate(_session_payload(mode="autopilot"))
+        SessionCreate.model_validate(payload(score_threshold=70))
 
-
-def test_orm_default_relevance_threshold_is_70() -> None:
-    assert str(JobSession.__table__.c.score_threshold.server_default.arg) == "70"
+    assert "score_threshold" not in JobSession.__table__.c

@@ -47,7 +47,6 @@ from backend.persistence.models import (
     Vacancy,
 )
 from backend.schemas.domain import (
-    RELEVANCE_SCORE_THRESHOLD,
     CandidateProfileData,
     ResumeData,
     SessionStatus,
@@ -245,22 +244,36 @@ class SessionCreate(BaseModel):
     # losing launch settings such as unlimited limits.
     model_config = ConfigDict(extra="forbid")
     profile_id: int
-    score_threshold: int = Field(
-        default=RELEVANCE_SCORE_THRESHOLD,
-        ge=0,
-        le=100,
-    )
-    minimum_scores: dict[str, int] | None = None
+    minimum_scores: dict[str, int | bool] | None = None
     adapter_id: str
     viewed_limit: int | None = Field(default=30, ge=1)
     application_limit: int | None = Field(default=5, ge=1)
 
     @classmethod
     def _minimum_limits(cls) -> dict[str, int]:
-        return {"title": 2, "tasks": 3, "industry": 4, "required_years": 2, "languages": 2, "skills": 3}
+        return {
+            "title": 2,
+            "tasks": 3,
+            "industry": 4,
+            "required_years": 2,
+            "languages": 2,
+            "skills": 3,
+        }
 
     @model_validator(mode="after")
     def validate_minimum_scores(self) -> SessionCreate:
+        # Store a complete gate map so old clients and the UI have one stable
+        # contract.  tasks/industry/skills are the only configurable values;
+        # title, years and languages are fixed by the relevance policy.
+        defaults = {"title": 0, "tasks": 2, "industry": 2, "skills": 2,
+                    "required_years": 1, "languages": 1}
+        supplied = dict(self.minimum_scores or {})
+        for key in ("tasks", "industry", "skills"):
+            if key in supplied and (isinstance(supplied[key], bool) or supplied[key] not in (1, 2, 3)):
+                raise ValueError(f"Минимум {key} должен быть 1, 2 или 3")
+        supplied = {**defaults, **supplied}
+        supplied.update({"title": 0, "required_years": 1, "languages": 1})
+        self.minimum_scores = supplied
         for key, value in (self.minimum_scores or {}).items():
             maximum = self._minimum_limits().get(key)
             if maximum is None:
@@ -518,17 +531,41 @@ def adapters() -> list[dict]:
 
 
 def session_dict(item: JobSession) -> dict:
-    return {"id": item.id, "profile_id": item.profile_id, "score_threshold": item.score_threshold, "minimum_scores": item.minimum_scores or None, "adapter_id": item.adapter_id, "viewed_limit": item.viewed_limit, "application_limit": item.application_limit, "status": item.status, "counters": item.counters or {}, "started_at": item.started_at.isoformat() if item.started_at else None, "finished_at": item.finished_at.isoformat() if item.finished_at else None, "stop_reason": item.stop_reason}
+    return {
+        "id": item.id,
+        "profile_id": item.profile_id,
+        "minimum_scores": item.minimum_scores or None,
+        "adapter_id": item.adapter_id,
+        "viewed_limit": item.viewed_limit,
+        "application_limit": item.application_limit,
+        "status": item.status,
+        "counters": item.counters or {},
+        "started_at": item.started_at.isoformat() if item.started_at else None,
+        "finished_at": item.finished_at.isoformat() if item.finished_at else None,
+        "stop_reason": item.stop_reason,
+    }
 
 
 @router.post("/sessions")
 def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dict:
     if not db.get(CandidateProfile, payload.profile_id):
         raise HTTPException(400, "Сначала создайте профиль")
-    try: adapter_registry.get(payload.adapter_id)
-    except KeyError as exc: raise HTTPException(400, str(exc)) from exc
-    item = JobSession(profile_id=payload.profile_id, score_threshold=payload.score_threshold, minimum_scores=payload.minimum_scores or None, adapter_id=payload.adapter_id, viewed_limit=payload.viewed_limit, application_limit=payload.application_limit, status=SessionStatus.CREATED, counters={})
-    db.add(item); db.commit(); db.refresh(item)
+    try:
+        adapter_registry.get(payload.adapter_id)
+    except KeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    item = JobSession(
+        profile_id=payload.profile_id,
+        minimum_scores=payload.minimum_scores or None,
+        adapter_id=payload.adapter_id,
+        viewed_limit=payload.viewed_limit,
+        application_limit=payload.application_limit,
+        status=SessionStatus.CREATED,
+        counters={},
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
     return session_dict(item)
 
 

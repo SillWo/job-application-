@@ -29,6 +29,14 @@ const RELEVANCE_CRITERIA: ReadonlyArray<{ key: string; title: string; maxPoints:
   { key: "skills", title: "Навыки", maxPoints: 3, weight: 10 },
 ];
 
+const INFLUENCE_CRITERIA = [
+  { key: "tasks", title: "Задачи", hint: "ИИ оценивает сходство обязанностей и задач вакансии с опытом в резюме." },
+  { key: "industry", title: "Сфера", hint: "ИИ оценивает соответствие отрасли и домена вакансии опыту кандидата." },
+  { key: "skills", title: "Навыки", hint: "ИИ оценивает соответствие требуемых навыков навыкам из резюме." },
+] as const;
+const INFLUENCE_LEVELS = ["low", "medium", "high"] as const;
+type InfluenceLevel = (typeof INFLUENCE_LEVELS)[number];
+
 function presentationBreakdown(rows: ScoreComponent[]): ScoreComponent[] {
   return RELEVANCE_CRITERIA.map((criterion) => {
     const row = rows.find((candidate) => candidate.key === criterion.key);
@@ -532,6 +540,7 @@ function SessionPage() {
   const [applicationLimit, setApplicationLimit] = useState("5");
   const [unlimitedViewed, setUnlimitedViewed] = useState(false);
   const [unlimitedApplications, setUnlimitedApplications] = useState(false);
+  const [influence, setInfluence] = useState<Record<string, InfluenceLevel>>({ tasks: "medium", industry: "medium", skills: "medium" });
   const [message, setMessage] = useState("");
   const validLimit = (value: string, unlimited: boolean) =>
     unlimited || /^[1-9]\d*$/.test(value);
@@ -547,6 +556,7 @@ function SessionPage() {
           adapter_id: adapter,
           viewed_limit: unlimitedViewed ? null : Number(viewedLimit),
           application_limit: unlimitedApplications ? null : Number(applicationLimit),
+          minimum_scores: Object.fromEntries(Object.entries(influence).map(([key, level]) => [key, INFLUENCE_LEVELS.indexOf(level) + 1])),
         }),
       });
       await api(`/sessions/${session.id}/start`, { method: "POST" });
@@ -641,6 +651,18 @@ function SessionPage() {
               </span>
             </label>
           </div>
+          <section className="influence-section" aria-labelledby="influence-heading">
+            <h3 id="influence-heading">Влияние факторов на вакансии</h3>
+            {INFLUENCE_CRITERIA.map((criterion) => {
+              const selected = influence[criterion.key];
+              const selectedIndex = INFLUENCE_LEVELS.indexOf(selected);
+              return <div className="influence-control" key={criterion.key}>
+                <div className="influence-control-head"><strong>{criterion.title}</strong><span className="tooltip-wrap"><button type="button" className="question-button" aria-label={`Подсказка: ${criterion.title}`} data-tooltip={criterion.hint}>?</button><span className="sr-only">{criterion.hint}</span></span></div>
+                <input className="influence-range" type="range" min="1" max="3" step="1" value={selectedIndex + 1} aria-label={`Уровень влияния: ${criterion.title}`} aria-valuetext={["Низкий", "Средний", "Высокий"][selectedIndex]} onChange={(event) => setInfluence((current) => ({ ...current, [criterion.key]: INFLUENCE_LEVELS[Number(event.target.value) - 1] }))} />
+                <div className="influence-levels" aria-hidden="true"><span>Низкий</span><span>Средний</span><span>Высокий</span></div>
+              </div>;
+            })}
+          </section>
           <button
             onClick={() => create.mutate()}
             disabled={!profileReady || create.isPending || !limitsAreValid || blockedByAdapter}
