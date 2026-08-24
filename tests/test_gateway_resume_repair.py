@@ -4,7 +4,6 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from backend.config import settings
 from backend.intelligence import gateway as gateway_module
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable, _schema_for_role
 from backend.intelligence.prompts import ROLE_PROMPTS
@@ -71,7 +70,13 @@ async def test_resume_analyst_repairs_wrappers_and_returns_valid_analysis(monkey
         + [_response(_valid_analysis())]
     )
     monkeypatch.setattr(gateway_module, "AsyncOpenAI", lambda **_: _FakeClient(completions))
-    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    saved = SimpleNamespace(
+        base_url="https://api.example.test/v1",
+        model="test-model",
+        encrypted_api_key="ciphertext",
+    )
+    monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
+    monkeypatch.setattr(gateway_module, "decrypt_secret", lambda _: "test-key")
 
     result = await ModelGateway(provider="openai_compat").structured(
         "resume_analyst", {"job": {}, "resumes": []}, ResumeAnalysis
@@ -89,7 +94,13 @@ async def test_resume_analyst_repairs_wrappers_and_returns_valid_analysis(monkey
 async def test_resume_analyst_four_invalid_responses_raise_model_unavailable(monkeypatch):
     completions = _FakeCompletions([_response({"analysis": {}})] * 4)
     monkeypatch.setattr(gateway_module, "AsyncOpenAI", lambda **_: _FakeClient(completions))
-    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    saved = SimpleNamespace(
+        base_url="https://api.example.test/v1",
+        model="test-model",
+        encrypted_api_key="ciphertext",
+    )
+    monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
+    monkeypatch.setattr(gateway_module, "decrypt_secret", lambda _: "test-key")
 
     with pytest.raises(ModelUnavailable, match="некорректный JSON"):
         await ModelGateway(provider="openai_compat").structured(

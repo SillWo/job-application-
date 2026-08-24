@@ -7,6 +7,54 @@ import { Notifications } from './App'
 beforeEach(() => { vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] })) })
 afterEach(() => vi.unstubAllGlobals())
 
+test('configures a new cloud model key and clears it after saving', async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push({ url, init })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: false, model_available: false, model: '' }) })
+    if (url.endsWith('/api/model/settings')) return Promise.resolve({ ok: true, json: async () => ({ base_url: 'https://api.example.test/v1', model: '', has_api_key: false, masked_key: '' }) })
+    if (url.endsWith('/api/model/models')) return Promise.resolve({ ok: true, json: async () => ({ models: ['cloud-a', 'cloud-b'] }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/model']}><App /></MemoryRouter></QueryClientProvider>)
+  const key = await screen.findByLabelText('API-ключ')
+  fireEvent.change(screen.getByLabelText(/Base URL/), { target: { value: 'https://api.example.test/v1' } })
+  fireEvent.change(key, { target: { value: 'secret-value' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Загрузить модели' }))
+  await screen.findByRole('option', { name: 'cloud-a' })
+  fireEvent.change(screen.getByLabelText('Модель'), { target: { value: 'cloud-b' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Сохранить изменения' }))
+  await screen.findByText('Настройки сохранены')
+  expect(key).toHaveValue('')
+  const modelRequest = requests.find((request) => request.url.endsWith('/api/model/models'))
+  const saveRequest = requests.find((request) => request.url.endsWith('/api/model/settings') && request.init?.method === 'PUT')
+  expect(JSON.parse(String(modelRequest?.init?.body))).toMatchObject({ api_key: 'secret-value' })
+  expect(JSON.parse(String(saveRequest?.init?.body))).toMatchObject({ model: 'cloud-b', api_key: 'secret-value' })
+})
+
+test('does not send a masked saved key back to the API', async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push({ url, init })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'saved-model' }) })
+    if (url.endsWith('/api/model/settings')) return Promise.resolve({ ok: true, json: async () => ({ base_url: 'https://api.example.test/v1', model: 'saved-model', has_api_key: true, masked_key: 'sk-...789' }) })
+    if (url.endsWith('/api/model/models')) return Promise.resolve({ ok: true, json: async () => ({ models: ['saved-model'] }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/model']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByText(/Сохранён: sk-\.\.\.789/)).toBeInTheDocument()
+  const key = screen.getByLabelText('API-ключ')
+  expect(key).toHaveValue('')
+  fireEvent.click(screen.getByRole('button', { name: 'Загрузить модели' }))
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/model/models'))).toBe(true))
+  const request = requests.find((item) => item.url.endsWith('/api/model/models'))
+  expect(JSON.parse(String(request?.init?.body))).not.toHaveProperty('api_key')
+  fireEvent.click(screen.getByRole('button', { name: 'Сохранить изменения' }))
+  await screen.findByText('Настройки сохранены')
+  const save = requests.find((item) => item.url.endsWith('/api/model/settings') && item.init?.method === 'PUT')
+  expect(JSON.parse(String(save?.init?.body))).not.toHaveProperty('api_key')
+})
+
 test('renders the Russian dashboard', async () => {
   render(<QueryClientProvider client={new QueryClient({defaultOptions:{queries:{retry:false}}})}><MemoryRouter><App /></MemoryRouter></QueryClientProvider>)
   expect(screen.getByText('Ваш поиск работы — под контролем')).toBeInTheDocument()

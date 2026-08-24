@@ -9,6 +9,9 @@ from openai import APIError, AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from backend.config import settings
+from backend.persistence.crypto import decrypt_secret
+from backend.persistence.database import SessionLocal
+from backend.persistence.models import AIModelSettings
 
 from .prompts import ROLE_OPTIONS, ROLE_PROMPTS
 
@@ -123,34 +126,43 @@ class ModelGateway:
         if self.provider == "mock":
             return {"connected": True, "model_available": True, "provider": "mock", "model": "deterministic-mock"}
         if self.provider == "openai_compat":
-            if not settings.openai_api_key.strip():
+            try:
+                config = self._saved_config()
+            except RuntimeError:
+                config = None
+            if config is None:
                 return {
                     "connected": False,
                     "model_available": False,
                     "provider": "openai_compat",
-                    "model": settings.openai_model,
-                    "message": "JAO_OPENAI_API_KEY is not configured",
+                    "model": "",
+                    "message": "Модель не настроена",
                 }
             try:
-                async with httpx.AsyncClient(timeout=3) as client:
+                async with httpx.AsyncClient(timeout=3, follow_redirects=False) as client:
+                    key = decrypt_secret(config.encrypted_api_key)
                     response = await client.get(
-                        f"{settings.openai_base_url.rstrip('/')}/models",
-                        headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+                        f"{config.base_url}/models", headers={"Authorization": f"Bearer {key}"},
                     )
                     response.raise_for_status()
+                    data = response.json()
+                    available = {
+                        item.get("id") for item in data.get("data", [])
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)
+                    }
                 return {
                     "connected": True,
-                    "model_available": True,
+                    "model_available": config.model in available,
                     "provider": "openai_compat",
-                    "model": settings.openai_model,
+                    "model": config.model,
                 }
-            except (httpx.HTTPError, KeyError, ValueError) as exc:
+            except (httpx.HTTPError, AttributeError, KeyError, RuntimeError, TypeError, ValueError):
                 return {
                     "connected": False,
                     "model_available": False,
                     "provider": "openai_compat",
-                    "model": settings.openai_model,
-                    "message": str(exc),
+                    "model": config.model,
+                    "message": "Не удалось подключиться к модели",
                 }
         raise ValueError(f"Unsupported AI provider: {self.provider}")
 
@@ -163,11 +175,17 @@ class ModelGateway:
 
     async def _structured_openai(self, role: str, payload: dict, schema: type[T]) -> T:
         """Call an OpenAI-compatible API endpoint to get a structured response."""
-        if not settings.openai_api_key.strip():
-            raise ModelUnavailable("JAO_OPENAI_API_KEY is not configured")
+        try:
+            config = self._saved_config()
+            key = decrypt_secret(config.encrypted_api_key) if config else ""
+        except (RuntimeError, ValueError):
+            config, key = None, ""
+        if config is None or not key:
+            raise ModelUnavailable("Модель не настроена или ключ недоступен")
         client = AsyncOpenAI(
-            base_url=settings.openai_base_url,
-            api_key=settings.openai_api_key,
+            base_url=config.base_url,
+            api_key=key,
+            timeout=settings.openai_timeout,
         )
         json_schema = _schema_for_role(role, schema)
         system_prompt = _system_prompt_for_role(role, payload)
@@ -187,7 +205,7 @@ class ModelGateway:
             try:
                 for attempt in range(attempts):
                     response = await client.chat.completions.create(
-                        model=settings.openai_model,
+                        model=config.model,
                         messages=messages,  # type: ignore[arg-type]
                         temperature=opts.get("temperature", 0.1),
                         max_tokens=opts.get("num_predict", 4096),
@@ -277,7 +295,12 @@ class ModelGateway:
             except ModelUnavailable:
                 raise
             except APIError as exc:
-                raise ModelUnavailable(f"OpenAI-compat API недоступен: {exc}") from exc
+                raise ModelUnavailable("OpenAI-compat API недоступен") from exc
+
+    @staticmethod
+    def _saved_config():
+        with SessionLocal() as db:
+            return db.get(AIModelSettings, 1)
 
     def _mock(self, role: str, payload: dict, schema: type[T]) -> T:
         from backend.schemas.domain import (

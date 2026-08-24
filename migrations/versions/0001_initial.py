@@ -64,6 +64,11 @@ def upgrade() -> None:
     # the legacy snapshot copied from the current ORM metadata.
     if "notifications" in legacy_metadata.tables:
         legacy_metadata.remove(legacy_metadata.tables["notifications"])
+    # User-managed model settings were introduced in 0017. Keep the initial
+    # snapshot independent from the current ORM metadata so a fresh upgrade
+    # does not create the table before its owning migration runs.
+    if "ai_model_settings" in legacy_metadata.tables:
+        legacy_metadata.remove(legacy_metadata.tables["ai_model_settings"])
     legacy_metadata.create_all(bind)
 
 

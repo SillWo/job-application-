@@ -652,6 +652,11 @@ button:disabled {
   border-radius: 18px;
   display: inline-block;
 }
+.model-settings { display: grid; gap: 16px; margin-top: 18px; }
+.model-settings label { display: grid; gap: 7px; font-weight: 600; }
+.model-settings input, .model-settings select { width: 100%; box-sizing: border-box; }
+.model-settings-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.model-settings small { color: var(--muted); }
 .vacancy-list {
   display: grid;
   gap: 12px;

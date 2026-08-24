@@ -63,9 +63,13 @@ async def test_model_gateway_instances_can_enter_api_concurrently(monkeypatch):
             self.chat = SimpleNamespace(completions=Completions())
 
     monkeypatch.setattr("backend.intelligence.gateway.AsyncOpenAI", FakeOpenAI)
-    from backend.config import settings
-    monkeypatch.setattr(settings, "openai_api_key", "test-key")
-    monkeypatch.setattr(settings, "openai_model", "test-model")
+    saved = SimpleNamespace(
+        base_url="https://api.example.test/v1",
+        model="test-model",
+        encrypted_api_key="ciphertext",
+    )
+    monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
+    monkeypatch.setattr("backend.intelligence.gateway.decrypt_secret", lambda _: "test-key")
 
     # Distinct instances must not share a process-wide lock.
     a, b = ModelGateway("openai_compat"), ModelGateway("openai_compat")

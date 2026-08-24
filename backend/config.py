@@ -23,7 +23,6 @@ class Settings(BaseSettings):
     # - cover letters
     # - vacancy relevance analysis
     openai_base_url: str = "https://api.openai.com/v1"
-    openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     openai_timeout: float = 180.0
 

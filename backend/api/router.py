@@ -4,18 +4,20 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 from fastapi import (
     APIRouter,
     Depends,
     File,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
@@ -28,10 +30,14 @@ from backend.browser.sessions import (
     release_browser_lease,
     set_browser,
 )
+from backend.config import settings
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
+from backend.intelligence.model_config import validate_base_url
 from backend.orchestrator.workflow import workflow_manager
+from backend.persistence.crypto import decrypt_secret, encrypt_secret
 from backend.persistence.database import get_db
 from backend.persistence.models import (
+    AIModelSettings,
     BrowserEvent,
     CandidateProfile,
     Evaluation,
@@ -49,6 +55,142 @@ from backend.schemas.domain import (
 from backend.services.resume import profile_from_import, resume_from_import, save_and_extract
 
 router = APIRouter(prefix="/api")
+
+
+def _check_model_origin(request: Request) -> None:
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        raise HTTPException(403, "Недопустимый источник запроса")
+    origin = request.headers.get("origin")
+    allowed = {"http://127.0.0.1:5173", "http://localhost:5173"}
+    if (
+        origin
+        and origin not in allowed
+        and origin != f"{request.url.scheme}://{request.url.netloc}"
+    ):
+        raise HTTPException(403, "Недопустимый источник запроса")
+
+
+class ModelSettingsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_url: str = Field(max_length=2048)
+    model: str = Field(min_length=1, max_length=255)
+    api_key: str | None = Field(default=None, max_length=8192)
+
+    @field_validator("model", "api_key", mode="before")
+    @classmethod
+    def strip_values(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class ModelModelsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_url: str = Field(max_length=2048)
+    api_key: str | None = Field(default=None, max_length=8192)
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def strip_key(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+def _no_store(data):
+    return JSONResponse(data, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/model/settings")
+def get_model_settings(db: Session = Depends(get_db)):
+    item = db.get(AIModelSettings, 1)
+    return _no_store(
+        {
+            "base_url": item.base_url if item else settings.openai_base_url,
+            "model": item.model if item else settings.openai_model,
+            "has_api_key": bool(item and item.encrypted_api_key),
+            "masked_key": "••••••••" if item and item.encrypted_api_key else "",
+        }
+    )
+
+
+async def _models(base_url: str, key: str) -> list[str]:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+        response = await client.get(
+            base_url.rstrip("/") + "/models", headers={"Authorization": "Bearer " + key}
+        )
+        response.raise_for_status()
+        if (
+            response.headers.get("content-length", "0").isdigit()
+            and int(response.headers["content-length"]) > 2 * 1024 * 1024
+        ):
+            raise ValueError("Ответ слишком большой")
+        body = await response.aread()
+        if len(body) > 2 * 1024 * 1024:
+            raise ValueError("Ответ слишком большой")
+        data = response.json()
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        raise ValueError("Некорректный список моделей")
+    models = {
+        x["id"]
+        for x in data["data"]
+        if isinstance(x, dict) and isinstance(x.get("id"), str) and 0 < len(x["id"]) <= 255
+    }
+    if not models:
+        raise ValueError("Список моделей пуст")
+    return sorted(models)
+
+
+@router.post("/model/models")
+async def list_model_models(
+    payload: ModelModelsIn, request: Request, db: Session = Depends(get_db)
+):
+    _check_model_origin(request)
+    try:
+        item = db.get(AIModelSettings, 1)
+        base = validate_base_url(
+            payload.base_url,
+            (settings.openai_base_url, item.base_url if item else ""),
+        )
+        key = payload.api_key or (
+            decrypt_secret(item.encrypted_api_key) if item else ""
+        )
+        if not key:
+            raise ValueError("API ключ не задан")
+        return _no_store({"models": await _models(base, key)})
+    except Exception as exc:
+        raise HTTPException(400, "Не удалось получить список моделей") from exc
+
+
+@router.put("/model/settings")
+async def save_model_settings(
+    payload: ModelSettingsIn, request: Request, db: Session = Depends(get_db)
+):
+    _check_model_origin(request)
+    try:
+        item = db.get(AIModelSettings, 1)
+        base = validate_base_url(
+            payload.base_url,
+            (settings.openai_base_url, item.base_url if item else ""),
+        )
+        key = payload.api_key or (decrypt_secret(item.encrypted_api_key) if item else "")
+        if not key:
+            raise ValueError("API ключ не задан")
+        models = await _models(base, key)
+        if payload.model not in models:
+            raise ValueError("Выбранная модель недоступна")
+        if item is None:
+            item = AIModelSettings(
+                id=1, base_url=base, model=payload.model, encrypted_api_key=encrypt_secret(key)
+            )
+            db.add(item)
+        else:
+            item.base_url, item.model = base, payload.model
+            if payload.api_key:
+                item.encrypted_api_key = encrypt_secret(key)
+        db.commit()
+        return get_model_settings(db)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(400, "Не удалось сохранить настройки модели") from exc
 
 
 def notification_dict(item: Notification) -> dict:
@@ -135,8 +277,8 @@ def health() -> dict:
 
 @router.get("/model/status")
 @router.post("/model/check")
-async def model_status() -> dict:
-    return await ModelGateway().status()
+async def model_status():
+    return _no_store(await ModelGateway().status())
 
 
 async def _import_resume_for_profile(

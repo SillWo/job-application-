@@ -822,7 +822,7 @@ function VacanciesPage() {
 function ModelPage() {
   const qc = useQueryClient();
   const q = useQuery({
-    queryKey: ["model"],
+    queryKey: ["model-status"],
     queryFn: () =>
       api<{
         connected: boolean;
@@ -832,6 +832,17 @@ function ModelPage() {
         message?: string;
       }>("/model/status"),
   });
+  const settings = useQuery({ queryKey: ["model-settings"], queryFn: () => api<{ base_url: string; model: string; has_api_key: boolean; masked_key: string }>("/model/settings") });
+  const [baseUrl, setBaseUrl] = useState("");
+  const [model, setModel] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [models, setModels] = useState<string[]>([]);
+  const [message, setMessage] = useState("");
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { if (settings.data) { setBaseUrl(settings.data.base_url || ""); setModel(settings.data.model || ""); } }, [settings.data]);
+  const loadModels = async () => { setLoadingModels(true); setMessage(""); try { const result = await api<{ models: string[] }>("/model/models", { method: "POST", body: JSON.stringify({ base_url: baseUrl, ...(apiKey ? { api_key: apiKey } : {}) }) }); setModels(result.models); if (result.models.length) setModel(result.models[0]); setMessage(`Доступно моделей: ${result.models.length}`); } catch (error) { setMessage(error instanceof Error ? error.message : "Не удалось загрузить модели"); } finally { setLoadingModels(false); } };
+  const save = async () => { setSaving(true); try { await api("/model/settings", { method: "PUT", body: JSON.stringify({ base_url: baseUrl, model, ...(apiKey ? { api_key: apiKey } : {}) }) }); setApiKey(""); setMessage("Настройки сохранены"); void qc.invalidateQueries({ queryKey: ["model-settings"] }); void qc.invalidateQueries({ queryKey: ["model-status"] }); } catch (error) { setMessage(error instanceof Error ? error.message : "Не удалось сохранить настройки"); } finally { setSaving(false); } };
   return (
     <section className="page">
       <Title
@@ -854,11 +865,19 @@ function ModelPage() {
               ? "Модель готова к structured outputs."
               : "Проверьте OpenAI API URL и ключ в конфигурации приложения."}
           </p>
-          <code>JAO_OPENAI_BASE_URL / JAO_OPENAI_API_KEY</code>
+          <code>Ключ хранится в защищённом хранилище DPAPI</code>
         </div>
-        <button onClick={() => qc.invalidateQueries({ queryKey: ["model"] })}>
+        <button type="button" onClick={() => { void qc.invalidateQueries({ queryKey: ["model-status"] }); void qc.invalidateQueries({ queryKey: ["model-settings"] }); }}>
           Проверить снова
         </button>
+      </article>
+      <article className="panel model-settings">
+        <label>Base URL (HTTPS или настроенный локальный gateway)<input value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setModels([]); setMessage(""); }} placeholder="https://api.openai.com/v1" inputMode="url" /></label>
+        <label>API-ключ<input type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setModels([]); setMessage(""); }} autoComplete="new-password" placeholder={settings.data?.has_api_key ? "Сохранённый ключ не отображается" : "Введите ключ"} /></label>
+        {settings.data?.has_api_key && <small>Сохранён: {settings.data.masked_key}. Ключ не показывается.</small>}
+        {models.length > 0 && <label>Модель<select value={model} onChange={(event) => setModel(event.target.value)}>{models.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>}
+        <div className="model-settings-actions"><button type="button" onClick={() => void loadModels()} disabled={!baseUrl || loadingModels}>{loadingModels ? "Загрузка…" : "Загрузить модели"}</button><button type="button" onClick={() => void save()} disabled={saving || !model || models.length === 0}>{saving ? "Сохранение…" : "Сохранить изменения"}</button></div>
+        {message && <p role="status">{message}</p>}
       </article>
     </section>
   );
