@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.api.router import mark_all_notifications_read, mark_notification_read, notifications
 from backend.persistence.database import Base
-from backend.persistence.models import CandidateProfile, JobSession, Notification
+from backend.persistence.models import CandidateProfile, JobSession, Notification, Vacancy
 
 
 def _db():
@@ -71,6 +71,55 @@ def test_status_notification_rollback_is_atomic():
         fresh = db.get(JobSession, item.id)
         assert fresh.status == "CREATED"
         assert db.scalar(select(Notification.id)) is None
+
+
+@pytest.mark.parametrize("state", ["ERROR", "UNKNOWN", "NEEDS_REVIEW"])
+def test_vacancy_insert_notification_contract(state):
+    Sessions = _db()
+    with Sessions() as db:
+        vacancy = Vacancy(source="hh", external_id="1", url="https://example.test/1",
+                          title="Python разработчик", company="Acme", state=state, data={})
+        db.add(vacancy)
+        db.commit()
+        row = db.scalar(select(Notification).where(Notification.source_type == "vacancy"))
+        assert row.source_id == str(vacancy.id)
+        assert row.target_path == "/vacancies"
+        assert row.kind == f"vacancy_{state.lower()}"
+        assert row.title == "Вакансия: Python разработчик"
+        assert "Python разработчик" in row.message
+        assert "Acme" in row.message
+        assert state in row.message
+
+
+def test_vacancy_transitions_notify_once_and_skip_non_target_states():
+    Sessions = _db()
+    with Sessions() as db:
+        vacancy = Vacancy(source="hh", external_id="1", url="u", title="T", state="DISCOVERED", data={})
+        db.add(vacancy); db.commit()
+        vacancy.state = "ERROR"; db.flush(); db.flush(); db.commit()
+        vacancy.state = "ERROR"; db.commit()
+        vacancy.state = "EXTRACTED"; db.commit()
+        vacancy.state = "UNKNOWN"; db.commit()
+        assert db.scalar(select(Notification).where(Notification.source_type == "vacancy").order_by(Notification.id.desc())).kind == "vacancy_unknown"
+        assert len(db.scalars(select(Notification).where(Notification.source_type == "vacancy")).all()) == 2
+
+
+def test_vacancy_insert_flush_then_same_state_no_duplicate():
+    Sessions = _db()
+    with Sessions() as db:
+        vacancy = Vacancy(source="hh", external_id="1", url="u", title="T", state="ERROR", data={})
+        db.add(vacancy); db.flush(); vacancy.state = "ERROR"; db.flush(); db.commit()
+        assert len(db.scalars(select(Notification).where(Notification.source_type == "vacancy")).all()) == 1
+
+
+def test_vacancy_notification_rollback_is_atomic():
+    Sessions = _db()
+    with Sessions() as db:
+        vacancy = Vacancy(source="hh", external_id="1", url="u", title="T", state="DISCOVERED", data={})
+        db.add(vacancy); db.commit()
+        vacancy.state = "ERROR"; db.flush(); db.rollback()
+        assert db.scalar(select(Notification).where(Notification.source_type == "vacancy")) is None
+        assert db.get(Vacancy, vacancy.id).state == "DISCOVERED"
 
 
 def test_notification_api_list_read_one_read_all_and_404():

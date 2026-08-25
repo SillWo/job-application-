@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from contextlib import suppress
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from backend.adapters.base.protocol import (
     AdapterManifest,
@@ -104,16 +104,28 @@ class HireHiAdapter:
         self._exhausted = False
         await page.goto("https://hirehi.ru/", wait_until="commit", timeout=15_000)
         await self._wait_for_search_dom(page)
-        opener = await self._first_visible(
-            page.get_by_role("button", name="Выбрать категорию вакансий")
-        )
-        if opener is None:
-            raise RuntimeError("Не найден фильтр категорий HireHi")
-        await opener.click()
-        dialog = await self._first_visible(page.get_by_role("dialog", name="Категория"))
-        choice = None
         category_pattern = re.compile(r"^" + re.escape(category) + r"$", re.I)
+        expected_path = self.CATEGORY_PATHS[category]
+        choice = None
         for _ in range(20):
+            # Some layouts expose the category sidebar directly, without the
+            # category picker button. Prefer a visible link with the exact
+            # category route to avoid hidden/mobile duplicate matches.
+            links = page.locator("a[href]")
+            for index in range(await links.count()):
+                link = links.nth(index)
+                href = await link.get_attribute("href")
+                if await link.is_visible() and urlparse(urljoin(page.url, href or "")).path.rstrip("/") == expected_path.rstrip("/") and (await link.inner_text()).strip().lower() == category:
+                    choice = link
+                    break
+            if choice is None:
+                opener = await self._first_visible(
+                    page.get_by_role("button", name="Выбрать категорию вакансий")
+                )
+                if opener is not None:
+                    await opener.click()
+                    await page.wait_for_timeout(100)
+            dialog = await self._first_visible(page.get_by_role("dialog", name="Категория"))
             if dialog is not None:
                 choice = await self._first_visible(
                     dialog.get_by_role("link", name=category_pattern)
@@ -141,6 +153,8 @@ class HireHiAdapter:
             )
             if await item.count() and await item.first.is_visible():
                 await item.first.click()
+        self._listing_url = page.url
+        self._listing_page = 1
 
     async def _apply_grade_filters(self, page, grades) -> None:
         """Select requested HireHi grade chips without toggling unrelated ones."""
@@ -244,10 +258,18 @@ class HireHiAdapter:
         except Exception:
             await page.wait_for_timeout(250)
 
+    def _is_listing_page(self, page) -> bool:
+        """Reject vacancy detail pages when unwinding browser history."""
+        path = urlparse(page.url).path.rstrip("/") or "/"
+        expected = self.CATEGORY_PATHS.get(getattr(self, "_category", "все вакансии"), "/").rstrip("/") or "/"
+        return path == expected
+
     async def _refs(self, page) -> list[JobRef]:
         links = page.locator("a[href]")
         refs = []
-        for i in range(min(await links.count(), 200)):
+        # The results page is an infinite list; do not truncate the DOM after
+        # 200 anchors (navigation and footer links are filtered below).
+        for i in range(await links.count()):
             href = await links.nth(i).get_attribute("href")
             url = urljoin(page.url, href or "")
             parsed = urlparse(url)
@@ -265,18 +287,38 @@ class HireHiAdapter:
         if not hasattr(self, "_seen"):
             self._seen = set()
         await self._wait_for_search_dom(page)
+        if not self._is_listing_page(page):
+            raise RuntimeError("Сбор вакансий HireHi вызван не на странице выдачи")
+        if not getattr(self, "_listing_url", ""):
+            self._listing_url = page.url
+            raw_page = dict(parse_qsl(urlparse(page.url).query)).get("page", "1")
+            try:
+                self._listing_page = max(1, int(raw_page))
+            except ValueError:
+                self._listing_page = 1
         return await self._refs(page)
 
     async def collect_more_job_refs(self, page) -> list[JobRef]:
         if self._exhausted:
             return []
-        next_button = page.get_by_role("button", name=re.compile("след|ещё|далее", re.I)).first
-        if await next_button.count() and await next_button.is_visible():
-            await next_button.click()
-            await page.wait_for_timeout(500)
+        listing_url = getattr(self, "_listing_url", "")
+        if not listing_url:
+            raise RuntimeError("Не сохранена URL выдачи HireHi")
+        self._listing_page = getattr(self, "_listing_page", 1) + 1
+        parsed = urlparse(listing_url)
+        query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key != "page"]
+        query.append(("page", str(self._listing_page)))
+        next_url = urlunparse(parsed._replace(query=urlencode(query)))
+        await page.goto(next_url, wait_until="commit", timeout=15_000)
+        if not self._is_listing_page(page):
+            raise RuntimeError("HireHi не открыла страницу выдачи")
+        await self._wait_for_search_dom(page)
+        for _ in range(12):
             refs = await self._refs(page)
             if refs:
+                self._listing_url = next_url
                 return refs
+            await page.wait_for_timeout(250)
         self._exhausted = True
         return []
 

@@ -13,6 +13,7 @@ from backend.intelligence.gateway import ModelGateway, ModelUnavailable
 from backend.intelligence.hirehi_category import JobSummary, choose_hirehi_category
 from backend.intelligence.hirehi_grade import hirehi_grades
 from backend.intelligence.letter_writer import write_cover_letter
+from backend.intelligence.search_planner import plan_search_queries
 from backend.orchestrator.application_guard import unresolved_application_questions
 from backend.persistence import models as persistence_models
 from backend.persistence.database import SessionLocal
@@ -30,6 +31,7 @@ from backend.persistence.models import (
 from backend.schemas import domain as domain_schemas
 from backend.schemas.domain import (
     ApplicationPlan,
+    DesiredJobPolicy,
     JobEvaluation,
     SessionStatus,
 )
@@ -105,6 +107,9 @@ def _duplicate_event_data(adapter: Any, posting: Any) -> dict[str, Any]:
     page = getattr(adapter, "current_result_page", None)
     if page is not None:
         data["page"] = page
+    query = getattr(adapter, "current_search_query", None)
+    if query is not None:
+        data["query"] = query
     return data
 
 
@@ -212,103 +217,6 @@ def _resume_desired_title(resume: dict) -> str:
             if title:
                 return title
     return ""
-
-
-_ADJACENT_TITLE_GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (
-        ("product manager", "менеджер продукта", "продакт"),
-        ("Product Owner", "Менеджер продукта", "Владелец продукта", "Growth Product Manager"),
-    ),
-    (
-        ("project manager", "менеджер проектов", "проджект"),
-        ("Project Manager", "Delivery Manager", "Координатор проектов", "Program Manager"),
-    ),
-    (
-        ("business analyst", "бизнес-аналит"),
-        ("Бизнес-аналитик", "Системный аналитик", "IT Analyst", "Product Analyst"),
-    ),
-    (
-        ("system analyst", "системный аналит"),
-        ("Системный аналитик", "Бизнес-аналитик", "Integration Analyst", "IT Analyst"),
-    ),
-    (
-        ("product analyst", "продуктовый аналит"),
-        ("Продуктовый аналитик", "Data Analyst", "BI Analyst", "Аналитик данных"),
-    ),
-    (
-        ("data analyst", "аналитик данных"),
-        ("Data Analyst", "BI Analyst", "Продуктовый аналитик", "Аналитик данных"),
-    ),
-    (
-        ("backend", "бэкенд"),
-        ("Backend Developer", "Backend Engineer", "Software Engineer", "Разработчик API"),
-    ),
-    (
-        ("frontend", "фронтенд"),
-        ("Frontend Developer", "Frontend Engineer", "Web Developer", "Fullstack Developer"),
-    ),
-    (
-        ("fullstack", "full stack", "фулстек"),
-        ("Fullstack Developer", "Software Engineer", "Backend Developer", "Frontend Developer"),
-    ),
-    (
-        ("quality assurance", " qa", "qa ", "тестиров"),
-        ("QA Engineer", "Test Engineer", "Инженер по тестированию", "QA Automation"),
-    ),
-    (
-        ("devops", "sre", "platform engineer"),
-        ("DevOps Engineer", "SRE", "Platform Engineer", "Cloud Engineer"),
-    ),
-    (
-        ("machine learning", "ml engineer", "data scientist"),
-        ("ML Engineer", "Machine Learning Engineer", "Data Scientist", "AI Engineer"),
-    ),
-    (
-        ("data engineer", "инженер данных"),
-        ("Data Engineer", "ETL Developer", "Analytics Engineer", "DWH Developer"),
-    ),
-    (
-        ("recruit", "рекрутер", "talent acquisition"),
-        ("IT Recruiter", "Talent Acquisition Specialist", "HR Recruiter", "Sourcer"),
-    ),
-)
-
-
-def _adjacent_titles(title: str) -> list[str]:
-    normalized = f" {title.casefold()} "
-    for markers, alternatives in _ADJACENT_TITLE_GROUPS:
-        if any(marker in normalized for marker in markers):
-            return list(alternatives)
-    return []
-
-
-def build_search_queries(resumes: list[dict], limit: int = 12) -> list[str]:
-    """Create bounded, deduplicated broad queries from selected resume data."""
-    values: list[str] = []
-    for resume in resumes:
-        title = _resume_desired_title(resume)
-        if title:
-            values.append(title)
-            values.extend(_adjacent_titles(title))
-        skills = resume.get("skills", [])
-        if isinstance(skills, list):
-            values.extend(str(x).strip() for x in skills if str(x).strip())
-        for key in ("adjacent_titles", "related_titles", "keywords"):
-            raw = resume.get(key, [])
-            if isinstance(raw, str):
-                raw = raw.split(",")
-            if isinstance(raw, list):
-                values.extend(str(x).strip() for x in raw if str(x).strip())
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        key = value.casefold()
-        if key not in seen:
-            seen.add(key)
-            result.append(value[:120])
-        if len(result) >= limit:
-            break
-    return result
 
 
 def _resume_file(record: Any, payload: dict) -> str:
@@ -495,6 +403,13 @@ class WorkflowManager:
                 _resume_file(selected_records[0], selected_resumes[0]) if selected_records else ""
             )
             minimum_scores = item.minimum_scores or None
+            stored_policy = item.preference_policy
+            preference_description = getattr(item, "desired_job_description", "") or ""
+            preference_policy = (
+                DesiredJobPolicy.model_validate(stored_policy)
+                if preference_description and stored_policy
+                else None
+            )
             adapter_id = item.adapter_id
 
         adapter = adapter_registry.get(adapter_id)
@@ -529,14 +444,13 @@ class WorkflowManager:
             return
 
         gateway = ModelGateway()
+        if preference_description and stored_policy is None:
+            raise ValueError("Политика желаемой вакансии не подготовлена до запуска сессии")
         hirehi_category: str | None = None
         hirehi_grade_values: list[str] | None = None
-        search_filters = {
-            "query": _resume_desired_title(selected_resumes[0]),
-            "queries": build_search_queries(selected_resumes),
-        }
+        search_filters = {}
         if adapter_id == "hirehi":
-            choice = await choose_hirehi_category(gateway, selected_resumes[0])
+            choice = await choose_hirehi_category(gateway, selected_resumes[0], preference_policy)
             hirehi_category = choice.category
             experience_years, hirehi_grade_values = hirehi_grades(selected_resumes[0])
             search_filters = {"category": choice.category, "grades": hirehi_grade_values}
@@ -547,6 +461,14 @@ class WorkflowManager:
                     "Грейды HireHi выбраны по опыту резюме",
                     {"years": experience_years, "grades": hirehi_grade_values},
                 )
+                event_db.commit()
+        else:
+            planned_queries = await plan_search_queries(gateway, selected_resumes, preference_policy=preference_policy)
+            search_filters = {"queries": planned_queries}
+            with SessionLocal() as event_db:
+                self.emit(event_db, session_id, "search_plan", "Сформирован план поисковых запросов", {
+                    "desired_title": _resume_desired_title(selected_resumes[0]), "queries": planned_queries,
+                })
                 event_db.commit()
         await adapter.open_search(executor.page, search_filters)
         blockers = await adapter.detect_blockers(executor.page)
@@ -808,8 +730,8 @@ class WorkflowManager:
                             "evaluation_payload",
                             "Payload вакансии передан на оценку",
                             {"vacancy_id": vacancy.id, "job": _payload(posting),
-                             "criteria": ["title", "tasks", "industry", "required_years", "languages", "skills"],
-                             "minimum_scores": minimum_scores},
+                             "criteria": ["tasks", "skills", "experience_depth", "role_match", "industry", "special_requirements"],
+                            "minimum_scores": minimum_scores},
                         )
                         result = await evaluate(
                             posting,
@@ -817,6 +739,7 @@ class WorkflowManager:
                             selected_resumes,
                             gateway,
                             minimum_scores,
+                            preference_policy,
                         )
                     except ModelUnavailable as exc:
                         vacancy.state = "ERROR"
@@ -892,7 +815,7 @@ class WorkflowManager:
                     else:
                         try:
                             letter = await write_cover_letter(
-                                posting, profile, selected_resumes, gateway
+                                posting, profile, selected_resumes, gateway, preference_policy
                             )
                         except ModelUnavailable as exc:
                             vacancy.state = "ERROR"
@@ -953,7 +876,10 @@ class WorkflowManager:
                             if not contact_text and contact and getattr(contact, "exhausted", False):
                                 contact_text = "Лимит прямых контактов HireHi исчерпан"
                             try:
-                                summary = await gateway.structured("job_summary", {"job": {"title": vacancy.title, "description": getattr(posting, "description", "")}}, JobSummary)
+                                summary_payload = {"job": {"title": vacancy.title, "description": getattr(posting, "description", "")}}
+                                if preference_policy:
+                                    summary_payload["preference_policy"] = preference_policy.model_dump(mode="json")
+                                summary = await gateway.structured("job_summary", summary_payload, JobSummary)
                                 short_description = summary.summary
                             except Exception:
                                 short_description = vacancy.title

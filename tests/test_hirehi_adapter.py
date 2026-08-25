@@ -82,6 +82,8 @@ class _Page:
         return _NodeEmpty()
 
     def get_by_role(self, role, name=None):
+        if role == "textbox":
+            return _Node("search")
         if (
             role == "link"
             and self.direct
@@ -517,6 +519,34 @@ async def test_open_search_chooses_visible_category_duplicate():
 
 
 @pytest.mark.asyncio
+async def test_open_search_uses_visible_direct_category_when_opener_is_absent():
+    class DirectCategoryPage(_SearchPage):
+        def __init__(self):
+            super().__init__()
+            self.direct = _Node("менеджмент", "https://hirehi.ru/vacancies/management")
+
+            async def click():
+                self.direct.clicked = True
+                self.url = self.direct.href
+
+            self.direct.click = click
+
+        def get_by_role(self, role, name=None):
+            if role == "button" and name == "Выбрать категорию вакансий":
+                return _NodeEmpty()
+            if role == "dialog":
+                return _NodeEmpty()
+            if role == "link" and name and name.search("менеджмент"):
+                return self.direct
+            return super().get_by_role(role, name)
+
+    page = DirectCategoryPage()
+    await HireHiAdapter().open_search(page, {"category": "менеджмент"})
+    assert page.direct.clicked is True
+    assert page.url == "https://hirehi.ru/vacancies/management"
+
+
+@pytest.mark.asyncio
 async def test_open_search_supports_current_sidebar_without_dialog():
     class SidebarPage(_SearchPage):
         def get_by_role(self, role, name=None):
@@ -612,3 +642,75 @@ async def test_collect_refs_supports_real_vacancies_urls_and_deduplicates():
         ("79531", "https://hirehi.ru/management/menedzher-produkta-v-hr-tech-79531"),
         ("79572", "https://hirehi.ru/analytics/product-analyst-79572"),
     ]
+
+
+class _DirectPagingPage:
+    """Deterministic page URLs with repeated listing filters."""
+
+    base = "https://hirehi.ru/vacancies/management?grade=middle&grade=senior&application_type=direct"
+
+    def __init__(self):
+        self.url = self.base
+        self.goto_urls = []
+        self.history = []
+        self.go_back_calls = 0
+        self.page = 1
+    def _hrefs(self):
+        if "/job-" in self.url:
+            return [f"/management/similar-{i}" for i in range(900, 906)]
+        if self.page > 4:
+            return []
+        start = (self.page - 1) * 51 + 1
+        return [f"/management/job-{i}" for i in range(start, start + 51)]
+
+    async def goto(self, url, **kwargs):
+        if url != self.url:
+            self.history.append(self.url)
+        self.goto_urls.append(url)
+        self.url = url
+        if "page=" in url:
+            self.page = int(url.split("page=", 1)[1].split("&", 1)[0])
+
+    async def go_back(self, **kwargs):
+        self.go_back_calls += 1
+        if self.history:
+            self.url = self.history.pop()
+
+    async def wait_for_timeout(self, _value):
+        return None
+
+    async def wait_for_url(self, *_args, **_kwargs):
+        return None
+
+    def locator(self, selector):
+        if selector == "a[href]":
+            return _Links(self._hrefs())
+        if selector == "h1":
+            return _Node("Vacancy") if "/job-" in self.url else _NodeEmpty()
+        return _NodeEmpty()
+
+    def get_by_role(self, role, name=None):
+        return _NodeEmpty()
+
+@pytest.mark.asyncio
+async def test_direct_pagination_preserves_filtered_listing_query_across_four_pages():
+    adapter = HireHiAdapter()
+    adapter._category = "менеджмент"
+    adapter._exhausted = False
+    page = _DirectPagingPage()
+    refs = await adapter.collect_job_refs(page)
+    assert len(refs) == 51
+
+    for expected_page in (2, 3, 4):
+        await adapter.open_job(page, refs[0])
+        refs = await adapter.collect_more_job_refs(page)
+        assert len(refs) == 51
+        assert page.url == (
+            f"{_DirectPagingPage.base}&page={expected_page}"
+        )
+
+    assert len(adapter._seen) == 204
+    await adapter.open_job(page, refs[0])
+    assert await adapter.collect_more_job_refs(page) == []
+    assert adapter.search_exhausted is True
+    assert page.url == f"{_DirectPagingPage.base}&page=5"

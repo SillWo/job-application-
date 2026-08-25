@@ -73,7 +73,7 @@ export type Evaluation = {
   score_breakdown: ScoreComponent[];
 };
 export type Adapter = { site_id: string; display_name: string; allowed_domains: string[] };
-export type JobSession = { id: number; profile_id: number; adapter_id: string; viewed_limit?: number | null; application_limit?: number | null; status: string; counters: Record<string, number>; started_at: string | null; finished_at: string | null; stop_reason: string | null };
+export type JobSession = { id: number; profile_id: number; adapter_id: string; desired_job_description?: string | null; viewed_limit?: number | null; application_limit?: number | null; status: string; counters: Record<string, number>; started_at: string | null; finished_at: string | null; stop_reason: string | null };
 export type Vacancy = { id: number; session_id: number | null; title: string; company: string | null; url: string; state: string; data?: Record<string, unknown>; evaluation: Evaluation | null };
 export type VacancyPage = { items: Vacancy[]; total: number; limit: number; offset: number; has_more: boolean };
 export type Notification = {

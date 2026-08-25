@@ -21,31 +21,74 @@ import type {
 } from "./types";
 
 const RELEVANCE_CRITERIA: ReadonlyArray<{ key: string; title: string; maxPoints: number; weight: number }> = [
-  { key: "title", title: "Название должности", maxPoints: 2, weight: 5 },
-  { key: "tasks", title: "Задачи", maxPoints: 3, weight: 30 },
-  { key: "industry", title: "Сфера", maxPoints: 4, weight: 25 },
-  { key: "required_years", title: "Годы опыта", maxPoints: 2, weight: 20 },
-  { key: "languages", title: "Языки", maxPoints: 2, weight: 10 },
-  { key: "skills", title: "Навыки", maxPoints: 3, weight: 10 },
+  { key: "tasks", title: "Задачи", maxPoints: 4, weight: 35 },
+  { key: "skills", title: "Навыки", maxPoints: 2, weight: 20 },
+  { key: "experience_depth", title: "Годы опыта", maxPoints: 4, weight: 15 },
+  { key: "role_match", title: "Роль", maxPoints: 4, weight: 10 },
+  { key: "industry", title: "Сфера", maxPoints: 4, weight: 10 },
+  { key: "special_requirements", title: "Особые требования", maxPoints: 2, weight: 10 },
 ];
 
+const SESSION_DRAFT_STORAGE_KEY = "job-orchestrator.session-draft";
+type SessionDraft = {
+  adapter: string;
+  viewedLimit: string;
+  applicationLimit: string;
+  desiredJobDescription: string;
+  unlimitedViewed: boolean;
+  unlimitedApplications: boolean;
+  influence: Record<string, InfluenceLevel>;
+};
+
+function readSessionDraft(): Partial<SessionDraft> {
+  try {
+    const raw = window.localStorage.getItem(SESSION_DRAFT_STORAGE_KEY);
+    if (!raw) return {};
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object") return {};
+    const candidate = value as Record<string, unknown>;
+    const draft: Partial<SessionDraft> = {};
+    if (candidate.adapter === "hh" || candidate.adapter === "hirehi") draft.adapter = candidate.adapter;
+    for (const key of ["viewedLimit", "applicationLimit", "desiredJobDescription"] as const) {
+      if (typeof candidate[key] === "string") draft[key] = candidate[key];
+    }
+    for (const key of ["unlimitedViewed", "unlimitedApplications"] as const) {
+      if (typeof candidate[key] === "boolean") draft[key] = candidate[key];
+    }
+    if (candidate.influence && typeof candidate.influence === "object") {
+      const influence: Record<string, InfluenceLevel> = {};
+      for (const key of ["tasks", "skills", "experience_depth", "role_match", "industry"]) {
+        const level = (candidate.influence as Record<string, unknown>)[key];
+        if (level === "low" || level === "medium" || level === "high" || level === "maximum") influence[key] = level;
+      }
+      draft.influence = influence;
+    }
+    return draft;
+  } catch {
+    return {};
+  }
+}
+
 const INFLUENCE_CRITERIA = [
-  { key: "tasks", title: "Задачи", hint: "ИИ оценивает сходство обязанностей и задач вакансии с опытом в резюме." },
-  { key: "industry", title: "Сфера", hint: "ИИ оценивает соответствие отрасли и домена вакансии опыту кандидата." },
-  { key: "skills", title: "Навыки", hint: "ИИ оценивает соответствие требуемых навыков навыкам из резюме." },
+  { key: "tasks", title: "Задачи", levels: ["Низкий", "Средний", "Высокий", "Максимальный"], hint: `ИИ оценивает сходство задач и обязанностей из вакансии с вашим резюме. Чем выше фактор — тем выше должно быть сходство, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит` },
+  { key: "skills", title: "Навыки", levels: ["Низкий", "Высокий"], hint: `ИИ оценивает насколько ваш набор навыков соответствует требованиям вакансии. Чем выше фактор — тем выше должно быть сходство, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит` },
+  { key: "experience_depth", title: "Годы опыта", levels: ["Низкий", "Средний", "Высокий", "Максимальный"], hint: `ИИ оценивает уровень и глубину подтверждённого опыта. Чем выше фактор — тем выше должно быть соответствие, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит` },
+  { key: "role_match", title: "Роль", levels: ["Низкий", "Средний", "Высокий", "Максимальный"], hint: `ИИ оценивает фактическое соответствие прошлой роли новой, а не только название должности. Чем выше фактор — тем выше должно быть соответствие, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит` },
+  { key: "industry", title: "Сфера", levels: ["Низкий", "Средний", "Высокий", "Максимальный"], hint: `ИИ оценивает сходство вакансии и ваших прошлых мест работы по сфере. Чем выше фактор — тем выше должно быть сходство, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит` },
 ] as const;
-const INFLUENCE_LEVELS = ["low", "medium", "high"] as const;
+const INFLUENCE_LEVELS = ["low", "medium", "high", "maximum"] as const;
 type InfluenceLevel = (typeof INFLUENCE_LEVELS)[number];
 
 function presentationBreakdown(rows: ScoreComponent[]): ScoreComponent[] {
   return RELEVANCE_CRITERIA.map((criterion) => {
-    const row = rows.find((candidate) => candidate.key === criterion.key);
+    const legacyKey = criterion.key === "experience_depth" ? "required_years" : criterion.key === "role_match" ? "title" : criterion.key === "special_requirements" ? "languages" : null;
+    const row = rows.find((candidate) => candidate.key === criterion.key) ?? (legacyKey ? rows.find((candidate) => candidate.key === legacyKey) : undefined);
     const hasRawScore = typeof row?.raw_points === "number" && typeof row?.raw_max_points === "number";
     const points = hasRawScore
-      ? Math.min(criterion.maxPoints, Math.max(0, row!.raw_points!))
+      ? Math.min(criterion.maxPoints, Math.max(0, row!.raw_points! / (row!.raw_max_points! || 1) * criterion.maxPoints))
       : Math.round(Math.min(1, Math.max(0, (row?.points ?? 0) / (row?.max_points || 1))) * criterion.maxPoints);
     const rawPoints = hasRawScore
-      ? Math.min(criterion.maxPoints, Math.max(0, row!.raw_points!))
+      ? Math.min(criterion.maxPoints, Math.max(0, row!.raw_points! / (row!.raw_max_points! || 1) * criterion.maxPoints))
       : points;
     return {
       ...(row ?? { key: criterion.key, description: "", explanation: "", evidence: [] }),
@@ -62,7 +105,6 @@ function presentationBreakdown(rows: ScoreComponent[]): ScoreComponent[] {
 const nav = [
   ["/", "Обзор"],
   ["/profile", "Профиль"],
-  ["/sites", "Сайты"],
   ["/session", "Сессия"],
   ["/vacancies", "Вакансии"],
   ["/model", "Модель"],
@@ -141,63 +183,33 @@ function Dashboard() {
     queryKey: ["sessions"],
     queryFn: () => api<JobSession[]>("/sessions"),
   });
+  const adapters = useQuery({
+    queryKey: ["adapters"],
+    queryFn: () => api<Adapter[]>("/adapters"),
+  });
   const active = sessions.data?.[0];
+  const hasProfile = Boolean(profiles.data?.length);
+  const hasResume = Boolean(dashboardResumes.data?.some((resume) => resume.selected_for_matching));
+  const activeStatus = active?.status?.replaceAll("_", " ") ?? "Нет активной сессии";
   return (
-    <section className="page">
-      <Title
-        eyebrow="ЦЕНТР УПРАВЛЕНИЯ"
-        note="Один спокойный маршрут от резюме до проверенного решения."
-      >
-        Ваш поиск работы — под контролем
-      </Title>
-      <div className="stats">
-        <article>
-          <small>Профили</small>
-          <strong>{profiles.data?.length ?? "—"}</strong>
-          <span>личные профили</span>
-        </article>
-        <article>
-          <small>Последняя сессия</small>
-          <strong>{active?.status ?? "Нет"}</strong>
-          <span>{active?.adapter_id ?? "создайте первую"}</span>
-        </article>
+    <section className="page overview-page">
+      <div className="overview-hero">
+        <div className="overview-copy">
+          <span className="eyebrow">JOB ORCHESTRATOR · ЦЕНТР ПОИСКА</span>
+          <h1>Меньше шума.<br /><em>Больше подходящих вакансий.</em></h1>
+          <p>Соберите профиль один раз, а затем поручите ИИ найти и разобрать вакансии по вашим критериям. Вы всегда решаете, что делать дальше.</p>
+          <div className="overview-actions"><NavLink className="button-link overview-primary" to="/profile">Настроить профиль <span aria-hidden="true">→</span></NavLink><NavLink className="overview-text-link" to="/session">Открыть сессию</NavLink></div>
+        </div>
+        <div className="overview-preview" aria-label="Статус рабочего процесса">
+          <div className="preview-top"><span className="preview-dot" /> Рабочий процесс <span className="preview-live">{activeStatus}</span></div>
+          <div className="preview-job"><span className="preview-logo">J</span><div><strong>Подходящие вакансии</strong><small>Оценка по вашему профилю и запросу</small></div><b>{active ? "В работе" : "Готово"}</b></div>
+          <div className="preview-line"><i className={hasProfile ? "is-done" : ""}>✓</i><span>Профиль и резюме</span><small>{hasResume ? "Резюме выбрано" : "Нужно настроить"}</small></div>
+          <div className="preview-line"><i className={active ? "is-done" : ""}>✓</i><span>Поиск и оценка</span><small>{active ? activeStatus : "Запустите сессию"}</small></div>
+          <div className="preview-line"><i>3</i><span>Ваше решение</span><small>Проверить результат</small></div>
+        </div>
       </div>
-      <div className="grid2">
-        <article className="panel">
-          <div className="panelhead">
-            <div>
-              <span className="eyebrow">БЫСТРЫЙ СТАРТ</span>
-              <h2>Готовность к сессии</h2>
-            </div>
-          </div>
-          {[
-            ["1", "Заполните личный профиль", Boolean(profiles.data?.length)],
-            ["2", "Выберите резюме для оценки", Boolean(dashboardResumes.data?.some((resume) => resume.selected_for_matching))],
-            ["3", "Запустите сессию на HH.ru", !!active],
-          ].map(([n, text, done]) => (
-            <div className="step" key={String(n)}>
-              <b className={done ? "done" : ""}>{done ? "✓" : n}</b>
-              <span>{String(text)}</span>
-            </div>
-          ))}
-        </article>
-        <article className="panel dark">
-          <span className="eyebrow">ПРИНЦИП РАБОТЫ</span>
-          <h2>ИИ ищет подходящие вакансии</h2>
-          <p>
-            Ваш запрос на естественном языке учитывается при оценке каждой вакансии.
-            На HireHi подходящие вакансии собираются в PDF-отчёт без отправки откликов.
-            На HH.ru отклики возможны после проверки пользователем.
-          </p>
-          <div className="flow">
-            <span>Запрос</span>
-            <i>→</i>
-            <span>Оценить</span>
-            <i>→</i>
-            <span>Проверить и получить отчёт</span>
-          </div>
-        </article>
-      </div>
+      <div className="overview-benefits"><article><strong>01</strong><h2>Один профиль</h2><p>Опыт, навыки и пожелания — в одном месте.</p></article><article><strong>02</strong><h2>Умная оценка</h2><p>ИИ сравнивает вакансию с вашим реальным опытом.</p></article><article><strong>03</strong><h2>Два сценария</h2><p>HH.ru — работа с откликами. HireHi — сбор вакансий в PDF.</p></article></div>
+      <div className="overview-footer"><span>Ваши данные остаются под вашим контролем</span><span>Профиль → Сессия → Вакансии</span></div>
     </section>
   );
 }
@@ -479,38 +491,6 @@ function ProfilePage() {
   </section>;
 }
 
-function SitesPage() {
-  const { data } = useQuery({
-    queryKey: ["adapters"],
-    queryFn: () => api<Adapter[]>("/adapters"),
-  });
-  return (
-    <section className="page">
-      <Title
-        eyebrow="ПОДКЛЮЧЁННЫЕ САЙТЫ"
-        note="Каждая площадка работает в отдельном постоянном профиле Chromium."
-      >
-        Адаптеры без скрытых API
-      </Title>
-      <div className="cards">
-        {data?.map((a) => (
-          <article className="panel" key={a.site_id}>
-            <span className="adapterlogo">hh</span>
-            <h2>{a.display_name}</h2>
-            <p>
-              Поиск, анализ и отправка откликов после ручного входа в аккаунт.
-            </p>
-            <div className="panelhead">
-              <Status value="Доступен" />
-              <small>{a.allowed_domains.join(", ")}</small>
-            </div>
-          </article>
-        ))}
-      </div>
-    </section>
-  );
-}
-
 function SessionPage() {
   const qc = useQueryClient();
   const profiles = useQuery({
@@ -534,13 +514,21 @@ function SessionPage() {
     sessionProfile &&
       sessionResumes.data?.some((resume) => resume.selected_for_matching),
   );
-  const [adapter, setAdapter] = useState("hh");
+  const [adapter, setAdapter] = useState(() => readSessionDraft().adapter || "hh");
   const blockedByAdapter = (sessions.data ?? []).some((session) => session.adapter_id === adapter && !terminalStatuses.includes(session.status));
-  const [viewedLimit, setViewedLimit] = useState("30");
-  const [applicationLimit, setApplicationLimit] = useState("5");
-  const [unlimitedViewed, setUnlimitedViewed] = useState(false);
-  const [unlimitedApplications, setUnlimitedApplications] = useState(false);
-  const [influence, setInfluence] = useState<Record<string, InfluenceLevel>>({ tasks: "medium", industry: "medium", skills: "medium" });
+  const [viewedLimit, setViewedLimit] = useState(() => readSessionDraft().viewedLimit || "30");
+  const [applicationLimit, setApplicationLimit] = useState(() => readSessionDraft().applicationLimit || "5");
+  const [desiredJobDescription, setDesiredJobDescription] = useState(() => readSessionDraft().desiredJobDescription || "");
+  const [unlimitedViewed, setUnlimitedViewed] = useState(() => readSessionDraft().unlimitedViewed || false);
+  const [unlimitedApplications, setUnlimitedApplications] = useState(() => readSessionDraft().unlimitedApplications || false);
+  const [influence, setInfluence] = useState<Record<string, InfluenceLevel>>(() => ({ tasks: "medium", skills: "low", experience_depth: "medium", role_match: "medium", industry: "medium", ...readSessionDraft().influence }));
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SESSION_DRAFT_STORAGE_KEY, JSON.stringify({ adapter, viewedLimit, applicationLimit, desiredJobDescription, unlimitedViewed, unlimitedApplications, influence }));
+    } catch {
+      // Storage may be unavailable in private browsing; the form remains usable.
+    }
+  }, [adapter, viewedLimit, applicationLimit, desiredJobDescription, unlimitedViewed, unlimitedApplications, influence]);
   const [message, setMessage] = useState("");
   const validLimit = (value: string, unlimited: boolean) =>
     unlimited || /^[1-9]\d*$/.test(value);
@@ -556,7 +544,8 @@ function SessionPage() {
           adapter_id: adapter,
           viewed_limit: unlimitedViewed ? null : Number(viewedLimit),
           application_limit: unlimitedApplications ? null : Number(applicationLimit),
-          minimum_scores: Object.fromEntries(Object.entries(influence).map(([key, level]) => [key, INFLUENCE_LEVELS.indexOf(level) + 1])),
+          desired_job_description: desiredJobDescription.trim(),
+          minimum_scores: { ...Object.fromEntries(Object.entries(influence).map(([key, level]) => [key, INFLUENCE_LEVELS.indexOf(level) + 1])), special_requirements: 1 },
         }),
       });
       await api(`/sessions/${session.id}/start`, { method: "POST" });
@@ -615,6 +604,18 @@ function SessionPage() {
               </select>
             </label>
           </div>
+          <label className="profile-full-field session-description-field">
+            Описание желаемой вакансии
+            <textarea
+              aria-label="Описание желаемой вакансии"
+              maxLength={2000}
+              rows={5}
+              value={desiredJobDescription}
+              onChange={(event) => setDesiredJobDescription(event.target.value)}
+              placeholder="Опишите желательные и нежелательные факторы вакансии"
+            />
+            <small>{desiredJobDescription.length} / 2000 символов</small>
+          </label>
           <div className="row session-limits">
             <label>
               Просмотреть вакансий
@@ -656,10 +657,15 @@ function SessionPage() {
             {INFLUENCE_CRITERIA.map((criterion) => {
               const selected = influence[criterion.key];
               const selectedIndex = INFLUENCE_LEVELS.indexOf(selected);
+              const levels = criterion.levels;
+              const max = levels.length;
+              const levelIndex = Math.min(selectedIndex, max - 1);
               return <div className="influence-control" key={criterion.key}>
-                <div className="influence-control-head"><strong>{criterion.title}</strong><span className="tooltip-wrap"><button type="button" className="question-button" aria-label={`Подсказка: ${criterion.title}`} data-tooltip={criterion.hint}>?</button><span className="sr-only">{criterion.hint}</span></span></div>
-                <input className="influence-range" type="range" min="1" max="3" step="1" value={selectedIndex + 1} aria-label={`Уровень влияния: ${criterion.title}`} aria-valuetext={["Низкий", "Средний", "Высокий"][selectedIndex]} onChange={(event) => setInfluence((current) => ({ ...current, [criterion.key]: INFLUENCE_LEVELS[Number(event.target.value) - 1] }))} />
-                <div className="influence-levels" aria-hidden="true"><span>Низкий</span><span>Средний</span><span>Высокий</span></div>
+                <div className="influence-control-head"><strong>{criterion.title}</strong><span className="tooltip-wrap"><button type="button" className="question-button" aria-label={`Подсказка: ${criterion.title}`} data-tooltip={criterion.hint}>?</button><span className="tooltip" role="tooltip"><span>{criterion.hint.split('\n')[0]}</span><em>{criterion.hint.split('\n')[1]}</em></span><span className="sr-only">{criterion.hint}</span></span></div>
+                <div className="influence-axis">
+                  <input className="influence-range" style={{ '--range-progress': `${levelIndex / (max - 1) * 100}%` } as React.CSSProperties} type="range" min="1" max={max} step="1" value={levelIndex + 1} aria-label={`Уровень влияния: ${criterion.title}`} aria-valuetext={levels[levelIndex]} onChange={(event) => setInfluence((current) => ({ ...current, [criterion.key]: INFLUENCE_LEVELS[Number(event.target.value) - 1] }))} />
+                  <div className="influence-levels" aria-hidden="true">{levels.map((level, index) => <span key={level} style={{ '--level-position': `${index / (max - 1) * 100}%` } as React.CSSProperties}>{level}</span>)}</div>
+                </div>
               </div>;
             })}
           </section>
@@ -911,7 +917,6 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/profile" element={<ProfilePage />} />
-        <Route path="/sites" element={<SitesPage />} />
         <Route path="/session" element={<SessionPage />} />
         <Route path="/vacancies" element={<VacanciesPage />} />
         <Route path="/model" element={<ModelPage />} />

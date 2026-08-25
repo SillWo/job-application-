@@ -4,8 +4,43 @@ import { MemoryRouter } from 'react-router-dom'
 import App from './App'
 import { Notifications } from './App'
 
-beforeEach(() => { vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] })) })
+beforeEach(() => { localStorage.clear(); vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] })) })
 afterEach(() => vi.unstubAllGlobals())
+
+test('persists every new-session parameter across remounts', async () => {
+  localStorage.clear()
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru', allowed_domains: ['hh.ru'] }, { site_id: 'hirehi', display_name: 'HireHi', allowed_domains: ['hirehi.ru'] }] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  const mount = () => render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  const first = mount()
+  expect(await screen.findByRole('heading', { name: 'Влияние факторов на вакансии' })).toBeInTheDocument()
+  await screen.findByRole('option', { name: 'HireHi' })
+  fireEvent.change(screen.getByRole('combobox', { name: 'Сайт' }), { target: { value: 'hirehi' } })
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'Лимит просмотра вакансий' }), { target: { value: '41' } })
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' }), { target: { value: '7' } })
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Без ограничений: просмотр вакансий' }))
+  fireEvent.click(screen.getAllByRole('checkbox', { name: /Без ограничений:/ })[1])
+  expect(screen.getByRole('spinbutton', { name: 'Лимит просмотра вакансий' })).toBeDisabled()
+  expect(screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' })).toBeDisabled()
+  fireEvent.change(screen.getByRole('textbox', { name: 'Описание желаемой вакансии' }), { target: { value: 'Удалённо; не продажи' } })
+  ;['4', '2', '1', '3', '4'].forEach((value, index) => fireEvent.change(screen.getAllByRole('slider')[index], { target: { value } }))
+  await waitFor(() => expect(JSON.parse(localStorage.getItem('job-orchestrator.session-draft') || '{}')).toMatchObject({ adapter: 'hirehi', viewedLimit: '41', applicationLimit: '7', unlimitedViewed: true, unlimitedApplications: true, desiredJobDescription: 'Удалённо; не продажи' }))
+  first.unmount(); mount()
+  await screen.findByRole('option', { name: 'HireHi' })
+  expect(await screen.findByRole('combobox', { name: 'Сайт' })).toHaveValue('hirehi')
+  expect(screen.getByRole('spinbutton', { name: 'Лимит просмотра вакансий' })).toHaveValue(41)
+  expect(screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' })).toHaveValue(7)
+  expect(screen.getByRole('checkbox', { name: 'Без ограничений: просмотр вакансий' })).toBeChecked()
+  expect(screen.getAllByRole('checkbox', { name: /Без ограничений:/ })[1]).toBeChecked()
+  expect(screen.getByRole('textbox', { name: 'Описание желаемой вакансии' })).toHaveValue('Удалённо; не продажи')
+  expect(screen.getAllByRole('slider').map((slider) => slider.getAttribute('aria-valuetext'))).toEqual(['Максимальный', 'Высокий', 'Низкий', 'Высокий', 'Максимальный'])
+  localStorage.clear()
+})
 
 test('configures influence sliders, accessible hints, and minimum score payload', async () => {
   const requests: Array<{ url: string; method?: string; body?: string }> = []
@@ -19,13 +54,24 @@ test('configures influence sliders, accessible hints, and minimum score payload'
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
   expect(await screen.findByRole('heading', { name: 'Влияние факторов на вакансии' })).toBeInTheDocument()
+  const influenceSection = screen.getByRole('region', { name: 'Влияние факторов на вакансии' })
+  expect(influenceSection).not.toHaveTextContent('Особые требования')
+  expect(influenceSection).not.toHaveTextContent('Условия труда')
+  expect(screen.queryByText('Фиксированный проходной порог: 1 первичный балл.')).not.toBeInTheDocument()
+  expect(screen.queryByText('Проходной порог не задаётся.')).not.toBeInTheDocument()
   const sliders = await screen.findAllByRole('slider')
-  expect(sliders).toHaveLength(3)
-  expect(sliders.every((slider) => slider.getAttribute('aria-valuetext') === 'Средний')).toBe(true)
-  expect(screen.getAllByText('Низкий')).toHaveLength(3)
-  expect(screen.getAllByText('Средний')).toHaveLength(3)
-  expect(screen.getAllByText('Высокий')).toHaveLength(3)
-  expect(screen.getByRole('button', { name: 'Подсказка: Задачи' })).toHaveAttribute('data-tooltip', expect.stringContaining('обязанностей'))
+  expect(sliders).toHaveLength(5)
+  expect(sliders.map((slider) => slider.getAttribute('max'))).toEqual(['4', '2', '4', '4', '4'])
+  expect(sliders[0].getAttribute('aria-valuetext')).toBe('Средний')
+  expect(sliders[1].getAttribute('aria-valuetext')).toBe('Низкий')
+  expect(screen.getAllByText('Максимальный')).toHaveLength(4)
+  expect(screen.getByRole('button', { name: 'Подсказка: Задачи' })).toHaveAttribute('data-tooltip', 'ИИ оценивает сходство задач и обязанностей из вакансии с вашим резюме. Чем выше фактор — тем выше должно быть сходство, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит')
+  expect(screen.getByRole('button', { name: 'Подсказка: Сфера' })).toHaveAttribute('data-tooltip', 'ИИ оценивает сходство вакансии и ваших прошлых мест работы по сфере. Чем выше фактор — тем выше должно быть сходство, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит')
+  expect(screen.getByRole('button', { name: 'Подсказка: Навыки' })).toHaveAttribute('data-tooltip', 'ИИ оценивает насколько ваш набор навыков соответствует требованиям вакансии. Чем выше фактор — тем выше должно быть сходство, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит')
+  expect(screen.getAllByRole('tooltip')).toHaveLength(5)
+  expect(screen.getAllByRole('tooltip').map((tooltip) => tooltip.querySelector('em')?.textContent)).toEqual(
+    Array(5).fill('* — ИИ на вакансию отклик не отправит'),
+  )
   fireEvent.focus(screen.getByRole('button', { name: 'Подсказка: Навыки' }))
   fireEvent.change(sliders[0], { target: { value: '1' } })
   fireEvent.change(sliders[2], { target: { value: '3' } })
@@ -34,8 +80,38 @@ test('configures influence sliders, accessible hints, and minimum score payload'
   const launch = await screen.findByRole('button', { name: 'Создать и запустить' }); await waitFor(() => expect(launch).toBeEnabled()); fireEvent.click(launch)
   await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/77/start'))).toBe(true))
   const payload = JSON.parse(requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))?.body ?? '{}')
-  expect(payload.minimum_scores).toEqual({ tasks: 1, industry: 2, skills: 3 })
+  expect(payload.minimum_scores).toEqual({ tasks: 1, skills: 1, experience_depth: 3, role_match: 2, industry: 2, special_requirements: 1 })
+  expect(payload.minimum_scores).not.toHaveProperty('work_conditions')
   expect(JSON.stringify(payload)).not.toMatch(/secondary|общий|вторичн|threshold|проходн|балл/i)
+})
+
+test('captures only the user job description with a 2000-character limit', async () => {
+  const requests: Array<{ url: string; method?: string; body?: string }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 78, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
+    if (url.endsWith('/api/sessions/78/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+
+  const field = await screen.findByRole('textbox', { name: 'Описание желаемой вакансии' })
+  expect(field).toHaveAttribute('maxLength', '2000')
+  expect(await screen.findByText('0 / 2000 символов')).toBeInTheDocument()
+  fireEvent.change(field, { target: { value: '  GameDev, удалённая работа; не продажи  ' } })
+  expect(screen.getByText('41 / 2000 символов')).toBeInTheDocument()
+  expect(screen.queryByText(/Green|Red|flag|confidence/i)).not.toBeInTheDocument()
+  const launch = await screen.findByRole('button', { name: 'Создать и запустить' })
+  await waitFor(() => expect(launch).toBeEnabled())
+  fireEvent.click(launch)
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/78/start'))).toBe(true))
+  const payload = JSON.parse(requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))?.body ?? '{}')
+  expect(payload.desired_job_description).toBe('GameDev, удалённая работа; не продажи')
+  expect(payload).not.toHaveProperty('green_flags')
+  expect(payload).not.toHaveProperty('red_flags')
 })
 
 test('configures a new cloud model key and clears it after saving', async () => {
@@ -96,6 +172,19 @@ test('renders the Russian dashboard', async () => {
   expect(screen.queryByText(/Сначала фильтры/)).not.toBeInTheDocument()
 })
 
+test('renders connected sites on overview and removes sites navigation', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    if (String(input).endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru', allowed_domains: ['hh.ru'] }, { site_id: 'hirehi', display_name: 'HireHi', allowed_domains: ['hirehi.ru'] }] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(screen.queryByRole('link', { name: 'Сайты' })).not.toBeInTheDocument()
+  expect(await screen.findByRole('heading', { name: 'Адаптеры без скрытых API', level: 2 })).toBeInTheDocument()
+  expect(await screen.findByText('HH.ru')).toBeInTheDocument()
+  expect(await screen.findByText('HireHi')).toBeInTheDocument()
+  expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+})
+
 test('places notifications before API in the topbar actions', () => {
   const { container } = render(<QueryClientProvider client={new QueryClient({defaultOptions:{queries:{retry:false}}})}><MemoryRouter><App /></MemoryRouter></QueryClientProvider>)
   const actions = container.querySelector('.topbar-actions')
@@ -126,6 +215,38 @@ test('shows notifications, marks one read, navigates, and reads all', async () =
   fireEvent.click(bell)
   fireEvent.click(screen.getByRole('button', { name: 'Прочитать все' }))
   await waitFor(() => expect(requests).toContainEqual({ url: '/api/notifications/read-all', method: 'POST' }))
+})
+
+test('shows a vacancy notification, marks it read, and navigates to vacancies', async () => {
+  const requests: Array<{ url: string; method: string }> = []
+  const notification = {
+    id: 21,
+    kind: 'vacancy_error',
+    title: 'Вакансия: Backend-разработчик',
+    message: 'Вакансия «Backend-разработчик» — Example: статус ERROR',
+    source_type: 'vacancy',
+    source_id: '91',
+    target_path: '/vacancies',
+    read_at: null,
+    created_at: '2026-08-24T10:00:00Z',
+  }
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    requests.push({ url, method: init?.method ?? 'GET' })
+    if (url.endsWith('/api/notifications')) return Promise.resolve({ ok: true, json: async () => [notification] })
+    if (url.endsWith('/api/vacancies')) return Promise.resolve({ ok: true, json: async () => [] })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
+    return Promise.resolve({ ok: true, json: async () => ({}) })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+
+  const bell = await screen.findByRole('button', { name: 'Уведомления' })
+  fireEvent.click(bell)
+  expect(await screen.findByText(notification.title)).toBeInTheDocument()
+  expect(screen.getByText(notification.message)).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: new RegExp(notification.title) }))
+  await waitFor(() => expect(requests).toContainEqual({ url: '/api/notifications/21/read', method: 'PATCH' }))
+  await waitFor(() => expect(screen.getByRole('link', { name: 'Вакансии' })).toHaveClass('active'))
 })
 
 test('signals only for newly arrived notification IDs', async () => {
@@ -228,7 +349,6 @@ test('exposes every primary route through keyboard-accessible navigation', () =>
   const expected = [
     ['Обзор', '/'],
     ['Профиль', '/profile'],
-    ['Сайты', '/sites'],
     ['Сессия', '/session'],
     ['Вакансии', '/vacancies'],
     ['Модель', '/model'],
@@ -596,17 +716,17 @@ test('shows resume relevance breakdown without policy UI', async () => {
 
   expect(await screen.findByText('Недостаточная релевантность по резюме')).toBeInTheDocument()
   expect(screen.getByText('РЕЛЕВАНТНОСТЬ ПО РЕЗЮМЕ')).toBeInTheDocument()
-  expect(screen.getByText('Название должности')).toBeInTheDocument()
+  expect(screen.getByText('Роль')).toBeInTheDocument()
   expect(screen.queryByText('Уровень позиции')).not.toBeInTheDocument()
-  expect(screen.getByText('Название должности')).toBeInTheDocument()
-  expect(screen.getByText('5 / 5')).toBeInTheDocument()
+  expect(screen.getByText('Особые требования')).toBeInTheDocument()
+  expect(screen.getAllByText('0 / 10').length).toBeGreaterThan(0)
   expect(screen.queryByText('Отклонено политическим фильтром')).not.toBeInTheDocument()
   expect(screen.queryByText('Принятые Green flags')).not.toBeInTheDocument()
   expect(screen.queryByText('Сработавшие Red flags')).not.toBeInTheDocument()
   expect(screen.queryByText('Сработал фильтр политики')).not.toBeInTheDocument()
 })
 
-test('converts legacy vacancy 2071 scores to weighted contributions', async () => {
+test('converts legacy vacancy 2071 scores to six weighted contributions', async () => {
   const scoreBreakdown = [
     ['title', 'Название должности', 2, 5],
     ['tasks', 'Задачи', 14, 30],
@@ -630,13 +750,14 @@ test('converts legacy vacancy 2071 scores to weighted contributions', async () =
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
 
   expect(await screen.findByText('Тест')).toBeInTheDocument()
-  for (const value of ['3 / 5', '10 / 30', '13 / 25', '10 / 20', '10 / 10', '7 / 10']) {
+  for (const value of ['18 / 35', '10 / 20', '11 / 15', '10 / 10']) {
     expect(screen.getByText(value)).toBeInTheDocument()
   }
-  expect(screen.queryByText('Уровень позиции')).not.toBeInTheDocument()
+  expect(screen.getAllByText('5 / 10')).toHaveLength(2)
+  expect(screen.queryByText('Условия труда')).not.toBeInTheDocument()
 })
 
-test('shows six discrete relevance criteria and configured minimum failures', async () => {
+test('renders legacy six-row relevance payload as six named criteria', async () => {
   const scoreBreakdown = [
     ['title', 'Название должности', 2, 2],
     ['tasks', 'Задачи', 2, 3],
@@ -676,17 +797,40 @@ test('shows six discrete relevance criteria and configured minimum failures', as
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
 
   expect(await screen.findByText('Не пройден минимум по навыкам')).toBeInTheDocument()
-  for (const title of ['Название должности', 'Задачи', 'Сфера', 'Годы опыта', 'Языки', 'Навыки']) {
+  for (const title of ['Задачи', 'Навыки', 'Годы опыта', 'Роль', 'Сфера', 'Особые требования']) {
     expect(screen.getByText(title)).toBeInTheDocument()
   }
-  expect(screen.getByText('5 / 5')).toBeInTheDocument()
-  expect(screen.getByText('20 / 30')).toBeInTheDocument()
-  expect(screen.getByText('19 / 25')).toBeInTheDocument()
-  expect(screen.getByText('10 / 20')).toBeInTheDocument()
-  expect(screen.getByText('10 / 10')).toBeInTheDocument()
-  expect(screen.getByText('3 / 10')).toBeInTheDocument()
+  expect(screen.queryByText('Условия труда')).not.toBeInTheDocument()
+  expect(screen.getByText('23 / 35')).toBeInTheDocument()
+  expect(screen.getByText('8 / 10')).toBeInTheDocument()
+  expect(screen.getByText('8 / 15')).toBeInTheDocument()
+  expect(screen.getAllByText('10 / 10')).toHaveLength(2)
+  expect(screen.getByText('7 / 20')).toBeInTheDocument()
   expect(screen.getByText('Минимум: 2 — не выполнен')).toBeInTheDocument()
   expect(screen.getAllByText(/^Минимум:/)).toHaveLength(1)
+})
+
+test('renders native payload without work conditions and preserves stored overall score', async () => {
+  const scoreBreakdown = [
+    ['tasks', 'Задачи', 3, 4, 35], ['skills', 'Навыки', 1, 2, 20],
+    ['experience_depth', 'Годы опыта', 4, 4, 15], ['role_match', 'Роль', 2, 4, 10],
+    ['work_conditions', 'Условия труда', 1, 2, 10], ['industry', 'Сфера', 3, 4, 10],
+    ['special_requirements', 'Особые требования', 1, 2, 10],
+  ].map(([key, title, rawPoints, rawMaxPoints, maxPoints]) => ({
+    key, title, description: '', points: Number(rawPoints), max_points: Number(maxPoints),
+    raw_points: Number(rawPoints), raw_max_points: Number(rawMaxPoints), explanation: '', evidence: [],
+  }))
+  const vacancy = { id: 94, title: 'Product Manager', company: 'Example', url: 'https://example.test/vacancy/94', state: 'COMPLETED', data: {}, evaluation: { decision: 'accept', score: 88, confidence: 0.9, category: 'product', reason: 'Тест', score_breakdown: scoreBreakdown } }
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/api/vacancies')
+    ? Promise.resolve({ ok: true, json: async () => [vacancy] })
+    : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByText('Тест')).toBeInTheDocument()
+  expect(screen.getByText('88')).toBeInTheDocument()
+  for (const value of ['26 / 35', '10 / 20', '15 / 15']) expect(screen.getByText(value)).toBeInTheDocument()
+  expect(screen.getAllByText('5 / 10')).toHaveLength(2)
+  expect(screen.getByText('8 / 10')).toBeInTheDocument()
+  expect(screen.queryByText('Условия труда')).not.toBeInTheDocument()
 })
 
 test('does not show low-confidence red flag or work-format match as rejection', async () => {

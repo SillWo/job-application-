@@ -21,9 +21,12 @@ def deterministic_category(resume: dict) -> HireHiCategoryChoice:
         return HireHiCategoryChoice(category="менеджмент", reason="Совпадение с управленческим названием резюме")
     return HireHiCategoryChoice(category="все вакансии", reason="Без однозначного совпадения")
 
-async def choose_hirehi_category(gateway, resume: dict) -> HireHiCategoryChoice:
+async def choose_hirehi_category(gateway, resume: dict, preference_policy=None) -> HireHiCategoryChoice:
     try:
-        choice = await gateway.structured("hirehi_category", {"resume": resume, "allowed_categories": list(CATEGORIES)}, HireHiCategoryChoice)
+        payload = {"resume": resume, "allowed_categories": list(CATEGORIES)}
+        if preference_policy:
+            payload["preference_policy"] = preference_policy.model_dump(mode="json") if hasattr(preference_policy, "model_dump") else preference_policy
+        choice = await gateway.structured("hirehi_category", payload, HireHiCategoryChoice)
         if choice.category in CATEGORIES:
             return choice
     except Exception:

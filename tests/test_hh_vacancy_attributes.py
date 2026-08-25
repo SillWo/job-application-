@@ -101,6 +101,19 @@ async def test_visible_job_refs_preserves_page_order_and_deduplicates():
 
 
 @pytest.mark.asyncio
+async def test_personal_recommendations_allow_200_refs_but_search_pages_default_to_100():
+    links = LinkLocator([Link(f"/vacancy/{index}", "vacancy") for index in range(250)])
+    page = type("Page", (), {"url": "https://hh.ru/", "locator": lambda _, __: links})()
+    adapter = HHAdapter()
+
+    personal_refs = await adapter.collect_job_refs(page)
+    search_page_refs = await adapter._visible_job_refs(page, timeout=100)
+
+    assert len(personal_refs) == 200
+    assert len(search_page_refs) == 100
+
+
+@pytest.mark.asyncio
 async def test_extract_job_reads_hh_structured_attributes():
     values = {
         locators.VACANCY_TITLE: "IT Project Manager",
@@ -148,8 +161,12 @@ class RecordingGateway:
         def assessment():
             return MatchAssessment(score=2, confidence=1, evidence=["Вакансия: Опыт работы: 1–3 года"])
         return ResumeAnalysis(
-            title=assessment(), tasks=assessment(), industry=assessment(),
-            required_years=assessment(), languages=assessment(), skills=assessment(),
+            tasks=assessment(),
+            skills=[],
+            experience_depth=assessment(),
+            role_match=assessment(),
+            industry=assessment(),
+            special_requirements=assessment(),
         )
 
 
@@ -163,10 +180,11 @@ async def test_evaluate_passes_structured_attributes_to_resume_analyst():
     )
     gateway = RecordingGateway()
     result = await evaluate(job, {}, [], gateway)
-    assert result.score == 74
+    assert result.score == 45
     assert gateway.payload["job"]["required_experience"] == "Опыт работы: 1–3 года"
     for key in ("payment_frequency", "employment_type", "hiring_format", "work_schedule", "working_hours", "work_format"):
         assert gateway.payload["job"][key] is not None
     assert gateway.payload["job"]["required_experience"] in gateway.payload["job"].values()
-    assert result.score_breakdown[3].raw_points == 2
-    assert result.score_breakdown[3].evidence == ["Вакансия: Опыт работы: 1–3 года"]
+    experience_row = next(row for row in result.score_breakdown if row.key == "experience_depth")
+    assert experience_row.raw_points == 2
+    assert experience_row.evidence == ["Вакансия: Опыт работы: 1–3 года"]

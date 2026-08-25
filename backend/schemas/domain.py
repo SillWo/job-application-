@@ -140,33 +140,100 @@ class MatchAssessment(BaseModel):
         return value
 
 
+class SkillAssessment(BaseModel):
+    """Assessment of one vacancy skill; the model never computes totals."""
+    skill: str = Field(min_length=1)
+    importance: Literal["required", "preferred"]
+    score: int = Field(ge=0, le=2)
+    evidence: list[str]
+    explanation: str
+    model_config = ConfigDict(extra="forbid")
+
+class PreferenceFlag(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(default="", max_length=80)
+    text: str = Field(min_length=1, max_length=500)
+    category: Literal["desired_industry", "desired_task", "desired_salary", "other"]
+
+class SalaryPreference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    minimum_monthly_amount: int = Field(gt=0)
+    currency: str = "RUB"
+
+class DesiredJobPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    green_flags: list[PreferenceFlag] = Field(default_factory=list)
+    red_flags: list[PreferenceFlag] = Field(default_factory=list)
+    desired_salary: SalaryPreference | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_compiler_shape(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        aliases = {"desired_industry": "desired_industry", "desired_industries": "desired_industry", "desired_task": "desired_task", "desired_tasks": "desired_task", "tasks": "desired_task", "desired_salary": "desired_salary", "salary": "desired_salary", "other": "other"}
+        def flags(raw: Any) -> list[dict[str, Any]]:
+            groups = raw.items() if isinstance(raw, dict) else [(None, raw)]
+            result = []
+            for category, items in groups:
+                category = aliases.get(str(category), "other") if category is not None else None
+                if not isinstance(items, list): items = [items]
+                for item in items:
+                    if hasattr(item, "model_dump"):
+                        item = item.model_dump()
+                    item_category = aliases.get(str(item.get("category")), "other") if isinstance(item, dict) and category is None else category or "other"
+                    if isinstance(item, dict) and category is None and item.get("category") in aliases:
+                        item_category = aliases[item["category"]]
+                    if isinstance(item, str): result.append({"id": "", "text": item, "category": item_category})
+                    elif isinstance(item, dict) and isinstance(item.get("text"), str): result.append({"id": str(item.get("id", "")), "text": item["text"], "category": item_category})
+            return result[:100]
+        output = {"green_flags": flags(value.get("green_flags", [])), "red_flags": flags(value.get("red_flags", [])), "desired_salary": value.get("desired_salary")}
+        salary = output["desired_salary"]
+        if isinstance(salary, dict):
+            amount = salary.get("minimum_monthly_amount", salary.get("minimum", salary.get("amount")))
+            output["desired_salary"] = {"minimum_monthly_amount": amount, "currency": salary.get("currency", "RUB")} if isinstance(amount, int) and not isinstance(amount, bool) and amount > 0 else None
+        return output
+
+class FlagMatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    flag_id: str
+    matched: bool = False
+    confidence: float = Field(default=0, ge=0, le=1)
+    evidence: list[str] = Field(default_factory=list)
+    explanation: str = ""
+
+
 class ResumeAnalysis(BaseModel):
-    title: MatchAssessment
+    model_config = ConfigDict(extra="forbid")
     tasks: MatchAssessment
+    skills: list[SkillAssessment]
+    experience_depth: MatchAssessment
+    role_match: MatchAssessment
     industry: MatchAssessment
-    required_years: MatchAssessment
-    languages: MatchAssessment
-    skills: MatchAssessment
+    special_requirements: MatchAssessment
     category: str = ""
     reason: str = ""
+    flag_matches: list[FlagMatch] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_discrete_scores(self) -> ResumeAnalysis:
-        maxima = {"title": 2, "tasks": 3, "industry": 4, "required_years": 2, "languages": 2, "skills": 3}
+        maxima = {"tasks": 4, "industry": 4, "experience_depth": 4, "role_match": 4,
+                  "special_requirements": 2}
         for key, maximum in maxima.items():
-            if getattr(self, key).score > maximum:
+            value = getattr(self, key)
+            if value is not None and value.score > maximum:
                 raise ValueError(f"{key}.score must be between 0 and {maximum}")
         return self
 
 
 def default_scoring_criteria() -> list[ScoringCriterion]:
     return [
-        ScoringCriterion(key="title", title="Название должности", description="Совпадение фактического названия должности с желаемой должностью в резюме.", max_points=5),
-        ScoringCriterion(key="tasks", title="Задачи", description="Соответствие задач вакансии задачам из опыта пользователя.", max_points=30),
-        ScoringCriterion(key="industry", title="Сфера", description="Соответствие сферы вакансии сфере предыдущего опыта.", max_points=25),
-        ScoringCriterion(key="required_years", title="Годы опыта", description="Соответствие требуемых лет опыта опыту пользователя.", max_points=20),
-        ScoringCriterion(key="languages", title="Языки", description="Соответствие требуемого уровня языка уровню языка пользователя.", max_points=10),
-        ScoringCriterion(key="skills", title="Навыки", description="Совпадение требуемых навыков с навыками пользователя.", max_points=10),
+        ScoringCriterion(key="tasks", title="Задачи", description="Соответствие задач вакансии задачам из опыта пользователя.", max_points=35),
+        ScoringCriterion(key="skills", title="Навыки", description="Hard skills и инструменты.", max_points=20),
+        ScoringCriterion(key="experience_depth", title="Годы опыта", description="Уровень и глубина ответственности.", max_points=15),
+        ScoringCriterion(key="role_match", title="Роль", description="Соответствие роли по фактическим обязанностям.", max_points=10),
+        ScoringCriterion(key="industry", title="Сфера", description="Соответствие домена/индустрии.", max_points=10),
+        ScoringCriterion(key="special_requirements", title="Особые требования", description="Образование и дополнительные требования.", max_points=10),
     ]
 
 
@@ -239,6 +306,7 @@ class JobEvaluation(BaseModel):
     positive_evidence: list[Evidence] = Field(default_factory=list)
     negative_evidence: list[Evidence] = Field(default_factory=list)
     missing_requirements: list[str] = Field(default_factory=list)
+    flag_matches: list[FlagMatch] = Field(default_factory=list)
     has_test_assignment: bool = False
     requires_manual_review: bool = False
     reason: str

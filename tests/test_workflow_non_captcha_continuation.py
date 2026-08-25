@@ -18,7 +18,7 @@ from backend.adapters.base.protocol import (
 from backend.api.router import pause_session
 from backend.orchestrator import workflow
 from backend.persistence.database import Base
-from backend.persistence.models import CandidateProfile, JobSession, Resume, Vacancy
+from backend.persistence.models import CandidateProfile, JobSession, Notification, Resume, Vacancy
 from backend.schemas.domain import JobEvaluation, JobPosting, SessionStatus
 
 
@@ -279,9 +279,15 @@ async def test_pre_submit_non_captcha_blocker_continues(runtime, monkeypatch, ki
         runtime, monkeypatch, FakeAdapter(refs, submit_blockers={"bad": kind}), apply_all
     )
     with sessions() as db:
-        vacancies = {v.external_id: v.state for v in db.scalars(select(Vacancy))}
+        rows = {v.external_id: v for v in db.scalars(select(Vacancy))}
+        vacancies = {external_id: vacancy.state for external_id, vacancy in rows.items()}
         assert db.get(JobSession, session_id).status == SessionStatus.COMPLETED
         assert vacancies == {"bad": state, "next": "SUBMITTED"}
+        notifications = list(db.scalars(select(Notification).where(Notification.source_type == "vacancy")))
+        assert len(notifications) == 1
+        assert notifications[0].source_id == str(rows["bad"].id)
+        assert notifications[0].kind == f"vacancy_{state.lower()}"
+        assert notifications[0].target_path == "/vacancies"
 
 
 @pytest.mark.asyncio

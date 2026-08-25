@@ -51,12 +51,11 @@ async def test_model_gateway_instances_can_enter_api_concurrently(monkeypatch):
             if len(entered) == 2:
                 gate.set()
             await release.wait()
-            return Response('{"title":{"score":0,"confidence":0,"evidence":[]},'
-                            '"tasks":{"score":0,"confidence":0,"evidence":[]},'
-                            '"industry":{"score":0,"confidence":0,"evidence":[]},'
-                            '"required_years":{"score":0,"confidence":0,"evidence":[]},'
-                            '"languages":{"score":0,"confidence":0,"evidence":[]},'
-                            '"skills":{"score":0,"confidence":0,"evidence":[]}}')
+            assessment = '{"score":0,"confidence":0,"evidence":[],"explanation":"нет"}'
+            return Response('{"tasks":' + assessment + ',"skills":[],'
+                            '"experience_depth":' + assessment + ',"role_match":' + assessment + ','
+                            '"industry":' + assessment + ','
+                            '"special_requirements":' + assessment + '}')
 
     class FakeOpenAI:
         def __init__(self, **kwargs):

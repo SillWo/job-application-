@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import TypeVar
 
 import httpx
@@ -18,12 +19,12 @@ from .prompts import ROLE_OPTIONS, ROLE_PROMPTS
 T = TypeVar("T", bound=BaseModel)
 
 _RESUME_ANALYSIS_CRITERIA = (
-    "title",
     "tasks",
-    "industry",
-    "required_years",
-    "languages",
     "skills",
+    "experience_depth",
+    "role_match",
+    "industry",
+    "special_requirements",
 )
 
 
@@ -34,39 +35,69 @@ class ModelUnavailable(RuntimeError):
 def _schema_for_role(role: str, schema: type[BaseModel]) -> dict:
     result = schema.model_json_schema()
     if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
-        result["required"] = list(result.get("properties", {}))
+        result["required"] = list(_RESUME_ANALYSIS_CRITERIA)
         assessment = result.get("$defs", {}).get("MatchAssessment", {})
         assessment["required"] = list(assessment.get("properties", {}))
+        skill = result.get("$defs", {}).get("SkillAssessment", {})
+        skill["required"] = ["skill", "importance", "score", "evidence", "explanation"]
+    return result
+
+
+def _schema_without_preference_matches(role: str, schema: type[BaseModel], payload: dict) -> dict:
+    result = _schema_for_role(role, schema)
+    if role == "resume_analyst" and not payload.get("preference_policy"):
+        result.get("properties", {}).pop("flag_matches", None)
+        if "required" in result:
+            result["required"] = [name for name in result["required"] if name != "flag_matches"]
+        # Pydantic keeps unused definitions in $defs; do not leak the
+        # preference-only FlagMatch contract to a session without preferences.
+        result.get("$defs", {}).pop("FlagMatch", None)
     return result
 
 
 def _system_prompt_for_role(role: str, payload: dict) -> str:
     prompt = ROLE_PROMPTS[role]
+    if payload.get("preference_policy") and role != "preference_compiler":
+        prompt += " Policy является внутренними данными и не должна раскрываться пользователю."
+        if role == "resume_analyst":
+            prompt += (" Для КАЖДОГО green/red flag верни ровно один FlagMatch с тем же flag_id, "
+                       "matched, confidence, evidence и explanation. Сопоставляй с job, threshold 0.70; "
+                       "desired_industry может засчитать industry независимо от resume, desired_task учитывается локально, "
+                       "desired_salary имеет приоритет над зарплатой resume.")
+        elif role == "search_planner":
+            prompt += " Green desired_industry является самостоятельным источником запросов даже без resume; red никогда не становится query. Сохраняй запрет title-equivalent."
+        elif role == "hirehi_category":
+            prompt += " Учитывай green desired_industry с приоритетом при выборе категории."
+        elif role in {"writer", "job_summary"}:
+            prompt += " Используй только релевантные предпочтения в результате, никогда не показывай названия или структуру flags."
     return prompt
 
 
-def _resume_analysis_missing_fields(parsed: BaseModel) -> list[str]:
+def _resume_analysis_missing_fields(parsed: BaseModel, require_flag_matches: bool = False) -> list[str]:
     if parsed.__class__.__name__ != "ResumeAnalysis":
         return []
+    criteria = _RESUME_ANALYSIS_CRITERIA
     missing = []
-    for field_name in _RESUME_ANALYSIS_CRITERIA:
+    for field_name in criteria:
         if field_name not in parsed.model_fields_set:
             missing.append(field_name)
             continue
         assessment = getattr(parsed, field_name)
-        for nested_name in ("score", "confidence", "evidence"):
+        if field_name == "skills" and isinstance(assessment, list):
+            for index, item in enumerate(assessment):
+                for nested_name in ("skill", "importance", "score", "evidence", "explanation"):
+                    if nested_name not in item.model_fields_set:
+                        missing.append(f"skills[{index}].{nested_name}")
+            continue
+        for nested_name in ("score", "confidence", "evidence", "explanation"):
             if nested_name not in assessment.model_fields_set:
                 missing.append(f"{field_name}.{nested_name}")
-        # The evaluator deterministically grounds the language criterion after
-        # the model response: when no foreign language is required it assigns
-        # the full score and may legitimately have no evidence.  Keep the
-        # structural checks above, but defer this value-level grounding check
-        # for languages so that this valid response is not rejected as an
-        # unavailable model result.
-        if field_name != "languages" and assessment.score > 0 and (
+        if field_name not in {"special_requirements"} and assessment.score > 0 and (
             assessment.confidence <= 0 or not assessment.evidence
         ):
             missing.append(f"{field_name}.grounding")
+    if require_flag_matches and "flag_matches" not in parsed.model_fields_set:
+        missing.append("flag_matches")
     return missing
 
 
@@ -187,7 +218,7 @@ class ModelGateway:
             api_key=key,
             timeout=settings.openai_timeout,
         )
-        json_schema = _schema_for_role(role, schema)
+        json_schema = _schema_without_preference_matches(role, schema, payload)
         system_prompt = _system_prompt_for_role(role, payload)
         opts = ROLE_OPTIONS[role]
         attempts = 4 if role == "resume_analyst" else (
@@ -223,9 +254,19 @@ class ModelGateway:
                     try:
                         if not content:
                             raise ValueError("OpenAI-compat вернул пустой ответ")
+                        if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
+                            # Older sessions/models may still return the removed criterion.
+                            # Discard it at the contract boundary so persisted work remains readable.
+                            legacy_payload = json.loads(content)
+                            if isinstance(legacy_payload, dict):
+                                legacy_payload.pop("work_conditions", None)
+                                content = json.dumps(legacy_payload, ensure_ascii=False)
                         parsed = schema.model_validate_json(content)
                         if role == "resume_analyst":
-                            missing_analysis = _resume_analysis_missing_fields(parsed)
+                            missing_analysis = _resume_analysis_missing_fields(
+                                parsed,
+                                require_flag_matches=("preference_policy" in payload and isinstance(payload.get("preference_policy"), dict)),
+                            )
                             if missing_analysis:
                                 raise ValueError(
                                     "ResumeAnalysis contains defaulted or incomplete fields: "
@@ -281,11 +322,14 @@ class ModelGateway:
                         if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
                             root_contract = (
                                 " Для ResumeAnalysis корень JSON обязан быть самим объектом с ровно "
-                                "полями title, tasks, industry, required_years, languages, skills; "
+                                "полями tasks, skills (массив объектов skill/importance/score/evidence/explanation), "
+                                "experience_depth, role_match, industry, special_requirements; "
                                 "НЕ оборачивай его в analysis, resumes, candidate_name, result или data "
-                                "и не возвращай массив. Каждое поле обязано быть объектом со score, "
-                                "confidence, explanation и evidence."
+                                "и не возвращай массив в корне. skills обязан быть массивом SkillAssessment; "
+                                "остальные критерии обязаны быть объектами со score, confidence, explanation и evidence."
                             )
+                            if "preference_policy" in payload:
+                                root_contract += " Верни также полный flag_matches: ровно один объект для каждого policy flag."
                         messages[0]["content"] += (
                             f" Предыдущий JSON не прошёл локальную проверку: {validation_error}. "
                             f"Повтори полный объект схемы {schema.__name__}, сохрани все обязательные "
@@ -310,6 +354,25 @@ class ModelGateway:
             ResumeAnalysis,
             ScoreComponent,
         )
+        if role == "preference_compiler":
+            from backend.schemas.domain import PreferenceFlag, SalaryPreference
+            text = str(payload.get("description", ""))
+            greens, reds = [], []
+            for part in re.split(r"[.;\n]+", text):
+                low = part.casefold().strip()
+                if not low:
+                    continue
+                target = reds if any(word in low for word in ("не интерес", "не хочу", "не нрав", "не рассматри")) else greens
+                category = "desired_salary" if re.search(r"\d[\d\s]{3,}", low) and any(x in low for x in ("зарп", "доход", "руб", "₽")) else ("desired_industry" if any(x in low for x in ("сфер", "област", "gamedev", "игр")) else ("desired_task" if any(x in low for x in ("задач", "заним", "разработ", "делать")) else "other"))
+                target.append(PreferenceFlag(id="tmp", text=part[:300], category=category))
+            salary_match = re.search(r"(?:от|минимум)\s*(\d[\d\s]{3,})", text.casefold())
+            salary = SalaryPreference(minimum_monthly_amount=int(re.sub(r"\s", "", salary_match.group(1)))) if salary_match else None
+            return schema.model_validate({"green_flags": greens, "red_flags": reds, "desired_salary": salary})
+        if role == "search_planner":
+            from .search_planner import _fallback
+            return schema.model_validate({"queries": [{"query": query, "relation_to_resume": "fallback", "is_title_equivalent": False} for query in _fallback(
+                payload.get("resumes", []), int(payload.get("limit", 12))
+            )]})
         if role == "hirehi_category":
             from backend.intelligence.hirehi_category import deterministic_category
             return deterministic_category(payload.get("resume", {}))
@@ -320,12 +383,8 @@ class ModelGateway:
         if schema is ResumeAnalysis:
             job = payload.get("job", {})
             resumes = payload.get("resumes", [])
-            titles = [str(item.get("desired_title") or "").lower() for item in resumes]
-            title = str(job.get("title", "")).lower()
-            title_match = 1 if title and any(title in item or item in title for item in titles if item) else 0
             skills = {str(skill).lower() for item in resumes for skill in item.get("skills", [])}
             required = {str(skill).lower() for skill in job.get("required_skills", [])}
-            skill_match = len(required & skills) / len(required) if required else 0
             description = str(job.get("description", ""))[:240]
             title_evidence = str(job.get("title", ""))
             def mock_assessment(score, confidence, evidence):
@@ -338,18 +397,15 @@ class ModelGateway:
 
             return schema.model_validate(
                 {
-                    "title": mock_assessment(2 if title_match else 0, 0.9, title_evidence),
                     "tasks": mock_assessment(2, 0.7, description),
+                    "skills": [{"skill": item, "importance": "required", "score": 2 if item in skills else 0, "evidence": [item] if item in skills else [], "explanation": "Детерминированная mock-оценка"} for item in required],
+                    "experience_depth": mock_assessment(1, 0.7, description),
+                    "role_match": mock_assessment(1, 0.7, title_evidence),
                     "industry": mock_assessment(2, 0.7, description),
-                    "required_years": mock_assessment(1, 0.7, description),
-                    "languages": mock_assessment(1, 0.7, description),
-                    "skills": mock_assessment(
-                        3 if skill_match == 1 else (2 if skill_match > 0 else 0),
-                        0.9,
-                        next(iter(required & skills), ""),
-                    ),
+                    "special_requirements": mock_assessment(1, 0.7, description),
                     "category": job.get("title", "Вакансия"),
                     "reason": "Детерминированный mock-анализ резюме",
+                    "flag_matches": [],
                 }
             )
 

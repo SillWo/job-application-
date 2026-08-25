@@ -84,21 +84,44 @@ class HHAdapter:
         )
 
     async def open_search(self, page, filters: dict) -> None:
-        query = self.normalize_search_query(filters.get("query", ""))
-        params = {
-            "text": query,
-            "search_field": "name",
-            "only_with_salary": str(not filters.get("include_unspecified_salary", True)).lower(),
-        }
-        if filters.get("salary_min"):
-            params["salary"] = filters["salary_min"]
-        self._fallback_search_url = f"https://hh.ru/search/vacancy?{urlencode(params)}"
+        raw_queries = filters.get("queries", [])
+        if isinstance(raw_queries, str):
+            raw_queries = [raw_queries]
+        queries = []
+        query_keys = set()
+        for value in raw_queries:
+            query = self.normalize_search_query(str(value))
+            query_key = query.casefold()
+            if query and query_key not in query_keys:
+                queries.append(query)
+                query_keys.add(query_key)
+        self._search_queries = queries
+        self._fallback_search_urls = []
+        for query in queries:
+            params = {
+                "text": query,
+                "search_field": "name",
+                "only_with_salary": str(
+                    not filters.get("include_unspecified_salary", True)
+                ).lower(),
+            }
+            if filters.get("salary_min"):
+                params["salary"] = filters["salary_min"]
+            self._fallback_search_urls.append(
+                f"https://hh.ru/search/vacancy?{urlencode(params)}"
+            )
+        self._fallback_search_url = (
+            self._fallback_search_urls[0] if self._fallback_search_urls else None
+        )
+        self._search_query_index = 0
+        self.current_search_query: str | None = None
         self._search_page_number = 0
         self._search_seen_ids: set[str] = set()
         self._search_exhausted = False
         self._last_search_page_signature: tuple[str, ...] | None = None
         self._repeated_search_pages = 0
         self.current_result_page: int | None = None
+        self._search_navigation_count = 0
 
         # The authenticated home page contains HH's personalized "Для вас"
         # recommendations. Prefer that ranking over a brittle text query.
@@ -122,13 +145,18 @@ class HHAdapter:
             await page.wait_for_timeout(1_500)
 
     async def collect_job_refs(self, page) -> list[JobRef]:
-        recommended_refs = await self._visible_job_refs(page, timeout=6_000)
+        # Personalized recommendations are a larger initial snapshot than a
+        # single text-search page. Keep the latter capped by the helper's
+        # default limit of 100.
+        recommended_refs = await self._visible_job_refs(page, timeout=6_000, limit=200)
         self._search_page_number = 0
         self._search_seen_ids = {ref.external_id for ref in recommended_refs}
         self._search_exhausted = False
         self._last_search_page_signature = None
         self._repeated_search_pages = 0
         self.current_result_page = None
+        self._search_query_index = 0
+        self.current_search_query = None
         return recommended_refs
 
     async def collect_more_job_refs(self, page) -> list[JobRef]:
@@ -142,23 +170,32 @@ class HHAdapter:
         """
         if self._search_exhausted:
             return []
-        fallback_url = getattr(self, "_fallback_search_url", None)
-        if not fallback_url:
+        search_urls = getattr(self, "_fallback_search_urls", [])
+        if not search_urls:
             self._search_exhausted = True
             return []
 
-        while self._search_page_number < 100:
+        while self._search_navigation_count < 100 and self._search_query_index < len(search_urls):
+            fallback_url = search_urls[self._search_query_index]
+            self.current_search_query = self._search_queries[self._search_query_index]
             page_number = self._search_page_number
             self._search_page_number += 1
+            self._search_navigation_count += 1
             page_refs = await self._collect_search_page(page, fallback_url, page_number)
             if not page_refs:
                 # _collect_search_page already retried this page three times;
                 # only now is an empty listing considered confirmed exhaustion.
-                self._search_exhausted = True
-                return []
+                self._search_query_index += 1
+                self._search_page_number = 0
+                self._last_search_page_signature = None
+                self._repeated_search_pages = 0
+                continue
             if self._repeated_search_pages >= 3:
-                self._search_exhausted = True
-                return []
+                self._search_query_index += 1
+                self._search_page_number = 0
+                self._last_search_page_signature = None
+                self._repeated_search_pages = 0
+                continue
 
             new_refs = []
             for ref in page_refs:
@@ -206,14 +243,14 @@ class HHAdapter:
         query["page"] = str(page_number)
         return urlunparse(parsed._replace(query=urlencode(query)))
 
-    async def _visible_job_refs(self, page, timeout: int) -> list[JobRef]:
+    async def _visible_job_refs(self, page, timeout: int, limit: int = 100) -> list[JobRef]:
         links = page.locator(locators.VACANCY_LINK)
         try:
             await links.first.wait_for(state="attached", timeout=timeout)
         except Exception:
             return []
         refs: list[JobRef] = []
-        for i in range(min(await links.count(), 100)):
+        for i in range(min(await links.count(), limit)):
             link = links.nth(i)
             is_visible = getattr(link, "is_visible", None)
             if is_visible is not None and not await is_visible():

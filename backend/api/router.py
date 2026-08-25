@@ -33,6 +33,7 @@ from backend.browser.sessions import (
 from backend.config import settings
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
 from backend.intelligence.model_config import validate_base_url
+from backend.intelligence.preference_policy import compile_preference_policy
 from backend.orchestrator.workflow import workflow_manager
 from backend.persistence.crypto import decrypt_secret, encrypt_secret
 from backend.persistence.database import get_db
@@ -207,9 +208,13 @@ def notification_dict(item: Notification) -> dict:
 
 
 @router.get("/notifications")
-def notifications(limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db)) -> list[dict]:
+def notifications(
+    limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db)
+) -> list[dict]:
     items = db.scalars(
-        select(Notification).order_by(Notification.created_at.desc(), Notification.id.desc()).limit(limit)
+        select(Notification)
+        .order_by(Notification.created_at.desc(), Notification.id.desc())
+        .limit(limit)
     ).all()
     return [notification_dict(item) for item in items]
 
@@ -233,7 +238,9 @@ def mark_notification_read_legacy(notification_id: int, db: Session = Depends(ge
 @router.post("/notifications/read-all")
 def mark_all_notifications_read(db: Session = Depends(get_db)) -> dict:
     result = db.execute(
-        update(Notification).where(Notification.read_at.is_(None)).values(read_at=datetime.now(timezone.utc))
+        update(Notification)
+        .where(Notification.read_at.is_(None))
+        .values(read_at=datetime.now(timezone.utc))
     )
     db.commit()
     return {"updated": result.rowcount}
@@ -244,6 +251,7 @@ class SessionCreate(BaseModel):
     # losing launch settings such as unlimited limits.
     model_config = ConfigDict(extra="forbid")
     profile_id: int
+    desired_job_description: str = Field(default="", max_length=2000)
     minimum_scores: dict[str, int | bool] | None = None
     adapter_id: str
     viewed_limit: int | None = Field(default=30, ge=1)
@@ -252,27 +260,32 @@ class SessionCreate(BaseModel):
     @classmethod
     def _minimum_limits(cls) -> dict[str, int]:
         return {
-            "title": 2,
-            "tasks": 3,
+            "tasks": 4,
+            "skills": 2,
+            "experience_depth": 4,
+            "role_match": 4,
             "industry": 4,
-            "required_years": 2,
-            "languages": 2,
-            "skills": 3,
+            "special_requirements": 2,
         }
 
     @model_validator(mode="after")
     def validate_minimum_scores(self) -> SessionCreate:
-        # Store a complete gate map so old clients and the UI have one stable
-        # contract.  tasks/industry/skills are the only configurable values;
-        # title, years and languages are fixed by the relevance policy.
-        defaults = {"title": 0, "tasks": 2, "industry": 2, "skills": 2,
-                    "required_years": 1, "languages": 1}
+        # Store one canonical primary-score gate map for the workflow.
+        # Special requirements are fixed at 1.
+        defaults = {"tasks": 2, "skills": 1, "experience_depth": 1, "role_match": 1,
+                    "industry": 2, "special_requirements": 1}
         supplied = dict(self.minimum_scores or {})
-        for key in ("tasks", "industry", "skills"):
-            if key in supplied and (isinstance(supplied[key], bool) or supplied[key] not in (1, 2, 3)):
-                raise ValueError(f"Минимум {key} должен быть 1, 2 или 3")
+        forbidden = {"work_conditions", "special_requirements", "title", "required_years", "languages"} & set(supplied)
+        unknown_forbidden = forbidden - {"special_requirements"}
+        if unknown_forbidden:
+            raise ValueError(f"Неизвестный критерий минимального балла: {sorted(unknown_forbidden)[0]}")
+        if "special_requirements" in supplied and supplied["special_requirements"] != 1:
+            raise ValueError("Минимум special_requirements всегда равен 1")
+        for key in ("tasks", "industry", "skills", "experience_depth", "role_match"):
+            maximum = 2 if key == "skills" else 4
+            if key in supplied and (isinstance(supplied[key], bool) or supplied[key] not in range(1, maximum + 1)):
+                raise ValueError(f"Минимум {key} должен быть от 1 до {maximum}")
         supplied = {**defaults, **supplied}
-        supplied.update({"title": 0, "required_years": 1, "languages": 1})
         self.minimum_scores = supplied
         for key, value in (self.minimum_scores or {}).items():
             maximum = self._minimum_limits().get(key)
@@ -387,7 +400,12 @@ def _merge_personal_profile(item: CandidateProfile, data: CandidateProfileData) 
 
 
 def _matching_resumes(profile_id: int, db: Session) -> list[dict]:
-    return [serialize_resume(item) for item in db.scalars(select(Resume).where(Resume.profile_id == profile_id).order_by(Resume.id))]
+    return [
+        serialize_resume(item)
+        for item in db.scalars(
+            select(Resume).where(Resume.profile_id == profile_id).order_by(Resume.id)
+        )
+    ]
 
 
 def serialize_resume(item: Resume) -> dict:
@@ -420,7 +438,10 @@ def serialize_profile(item: CandidateProfile, db: Session | None = None) -> dict
 
 @router.get("/profiles")
 def profiles(db: Session = Depends(get_db)) -> list[dict]:
-    return [serialize_profile(item, db) for item in db.scalars(select(CandidateProfile).order_by(CandidateProfile.id.desc()))]
+    return [
+        serialize_profile(item, db)
+        for item in db.scalars(select(CandidateProfile).order_by(CandidateProfile.id.desc()))
+    ]
 
 
 @router.post("/profiles")
@@ -450,9 +471,12 @@ def get_profile(profile_id: int, db: Session = Depends(get_db)) -> dict:
 
 
 @router.patch("/profiles/{profile_id}")
-def patch_profile(profile_id: int, data: CandidateProfileData, db: Session = Depends(get_db)) -> dict:
+def patch_profile(
+    profile_id: int, data: CandidateProfileData, db: Session = Depends(get_db)
+) -> dict:
     item = db.get(CandidateProfile, profile_id)
-    if not item: raise HTTPException(404, "Профиль не найден")
+    if not item:
+        raise HTTPException(404, "Профиль не найден")
     item.full_name = data.full_name
     item.residence = data.residence
     item.job_search_locations = data.job_search_locations
@@ -460,7 +484,8 @@ def patch_profile(profile_id: int, data: CandidateProfileData, db: Session = Dep
     item.education = [entry.model_dump() for entry in data.education]
     item.languages = [entry.model_dump() for entry in data.languages]
     item.driver_license = data.driver_license
-    db.commit(); db.refresh(item)
+    db.commit()
+    db.refresh(item)
     return serialize_profile(item, db)
 
 
@@ -483,7 +508,9 @@ def create_resume(profile_id: int, data: ResumeData, db: Session = Depends(get_d
     if not db.get(CandidateProfile, profile_id):
         raise HTTPException(404, "Профиль не найден")
     item = Resume(profile_id=profile_id, **data.model_dump())
-    db.add(item); db.commit(); db.refresh(item)
+    db.add(item)
+    db.commit()
+    db.refresh(item)
     return serialize_resume(item)
 
 
@@ -493,11 +520,14 @@ def get_resume(profile_id: int, resume_id: int, db: Session = Depends(get_db)) -
 
 
 @router.patch("/profiles/{profile_id}/resumes/{resume_id}")
-def patch_resume(profile_id: int, resume_id: int, data: ResumeData, db: Session = Depends(get_db)) -> dict:
+def patch_resume(
+    profile_id: int, resume_id: int, data: ResumeData, db: Session = Depends(get_db)
+) -> dict:
     item = _get_resume_or_404(profile_id, resume_id, db)
     for key, value in data.model_dump().items():
         setattr(item, key, value)
-    db.commit(); db.refresh(item)
+    db.commit()
+    db.refresh(item)
     return serialize_resume(item)
 
 
@@ -505,8 +535,13 @@ def patch_resume(profile_id: int, resume_id: int, data: ResumeData, db: Session 
 def delete_resume(profile_id: int, resume_id: int, db: Session = Depends(get_db)) -> dict:
     item = _get_resume_or_404(profile_id, resume_id, db)
     source_path = Path(item.original_path).resolve() if item.original_path else None
-    db.delete(item); db.commit()
-    if source_path and source_path.is_file() and Path("data/resumes").resolve() in source_path.parents:
+    db.delete(item)
+    db.commit()
+    if (
+        source_path
+        and source_path.is_file()
+        and Path("data/resumes").resolve() in source_path.parents
+    ):
         source_path.unlink(missing_ok=True)
     return {"ok": True}
 
@@ -534,6 +569,7 @@ def session_dict(item: JobSession) -> dict:
     return {
         "id": item.id,
         "profile_id": item.profile_id,
+        "desired_job_description": getattr(item, "desired_job_description", ""),
         "minimum_scores": item.minimum_scores or None,
         "adapter_id": item.adapter_id,
         "viewed_limit": item.viewed_limit,
@@ -556,6 +592,7 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         raise HTTPException(400, str(exc)) from exc
     item = JobSession(
         profile_id=payload.profile_id,
+        desired_job_description=payload.desired_job_description,
         minimum_scores=payload.minimum_scores or None,
         adapter_id=payload.adapter_id,
         viewed_limit=payload.viewed_limit,
@@ -577,9 +614,22 @@ def sessions(db: Session = Depends(get_db)) -> list[dict]:
 @router.post("/sessions/{session_id}/start")
 async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
-    if not item: raise HTTPException(404, "Сессия не найдена")
+    if not item:
+        raise HTTPException(404, "Сессия не найдена")
     if item.status != SessionStatus.CREATED:
         raise HTTPException(409, "Запустить можно только новую сессию")
+    if item.preference_policy is None:
+        try:
+            if item.desired_job_description.strip():
+                policy = await compile_preference_policy(
+                    ModelGateway(), item.desired_job_description
+                )
+            else:
+                policy = None
+        except ModelUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+        item.preference_policy = policy.model_dump(mode="json") if policy else None
+        db.commit()
     if workflow_manager.launch(session_id) is False:
         raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
     return {"ok": True}
@@ -587,26 +637,35 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
 
 @router.post("/sessions/{session_id}/pause")
 def pause_session(session_id: int, db: Session = Depends(get_db)) -> dict:
-    raise HTTPException(409, "Ручная пауза отключена; сессию можно приостановить только при CAPTCHA")
+    raise HTTPException(
+        409, "Ручная пауза отключена; сессию можно приостановить только при CAPTCHA"
+    )
 
 
 @router.post("/sessions/{session_id}/resume")
 async def resume_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
-    if not item: raise HTTPException(404, "Сессия не найдена")
+    if not item:
+        raise HTTPException(404, "Сессия не найдена")
     if item.status not in {SessionStatus.PAUSED, SessionStatus.WAITING_FOR_LOGIN}:
         raise HTTPException(409, "Продолжить можно только приостановленную сессию")
     if workflow_manager.launch(session_id) is False:
         raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
-    item.status = SessionStatus.RUNNING; item.stop_reason = None; db.commit()
+    item.status = SessionStatus.RUNNING
+    item.stop_reason = None
+    db.commit()
     return session_dict(item)
 
 
 @router.post("/sessions/{session_id}/stop")
 async def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
-    if not item: raise HTTPException(404, "Сессия не найдена")
-    item.status = SessionStatus.STOPPED; item.stop_reason = "Остановлено пользователем"; item.finished_at = datetime.now(timezone.utc); db.commit()
+    if not item:
+        raise HTTPException(404, "Сессия не найдена")
+    item.status = SessionStatus.STOPPED
+    item.stop_reason = "Остановлено пользователем"
+    item.finished_at = datetime.now(timezone.utc)
+    db.commit()
     await close_browser(session_id)
     if item.adapter_id == "hirehi":
         workflow_manager.write_hirehi_report(session_id)
@@ -656,7 +715,10 @@ async def check_session_browser(session_id: int, db: Session = Depends(get_db)) 
         raise HTTPException(404, "Сессия не найдена")
     executor = get_browser(session_id)
     if not executor:
-        raise HTTPException(400, f"Сначала откройте Chromium для {getattr(adapter_registry.get(item.adapter_id), 'display_name', item.adapter_id)}")
+        raise HTTPException(
+            400,
+            f"Сначала откройте Chromium для {getattr(adapter_registry.get(item.adapter_id), 'display_name', item.adapter_id)}",
+        )
     adapter = adapter_registry.get(item.adapter_id)
     login = await adapter.get_login_state(executor.page)
     if not login.authenticated:
@@ -666,39 +728,74 @@ async def check_session_browser(session_id: int, db: Session = Depends(get_db)) 
     item.status = SessionStatus.RUNNING
     item.stop_reason = None
     db.commit()
-    return {"ok": True, "message": f"Вход в {getattr(adapter, 'display_name', item.adapter_id)} подтверждён, сессия продолжена"}
+    return {
+        "ok": True,
+        "message": f"Вход в {getattr(adapter, 'display_name', item.adapter_id)} подтверждён, сессия продолжена",
+    }
 
 
 @router.get("/sessions/{session_id}")
 def get_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
-    if not item: raise HTTPException(404, "Сессия не найдена")
+    if not item:
+        raise HTTPException(404, "Сессия не найдена")
     return session_dict(item)
 
 
 @router.get("/sessions/{session_id}/report")
 def session_report_status(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
-    if not item: raise HTTPException(404, "Сессия не найдена")
-    if item.adapter_id != "hirehi": raise HTTPException(400, "PDF-отчёт доступен только для HireHi")
+    if not item:
+        raise HTTPException(404, "Сессия не найдена")
+    if item.adapter_id != "hirehi":
+        raise HTTPException(400, "PDF-отчёт доступен только для HireHi")
     path = Path("output/pdf") / f"hirehi-session-{session_id}.pdf"
-    return {"ready": path.is_file(), "pdf_url": f"/api/sessions/{session_id}/report/pdf" if path.is_file() else None}
+    return {
+        "ready": path.is_file(),
+        "pdf_url": f"/api/sessions/{session_id}/report/pdf" if path.is_file() else None,
+    }
 
 
 @router.get("/sessions/{session_id}/report/pdf")
 def session_report_pdf(session_id: int, db: Session = Depends(get_db)) -> FileResponse:
     item = db.get(JobSession, session_id)
-    if not item: raise HTTPException(404, "Сессия не найдена")
-    if item.adapter_id != "hirehi": raise HTTPException(400, "PDF-отчёт доступен только для HireHi")
+    if not item:
+        raise HTTPException(404, "Сессия не найдена")
+    if item.adapter_id != "hirehi":
+        raise HTTPException(400, "PDF-отчёт доступен только для HireHi")
     path = Path("output/pdf") / f"hirehi-session-{session_id}.pdf"
-    if not path.is_file(): raise HTTPException(404, "PDF-отчёт ещё не готов")
-    return FileResponse(path, media_type="application/pdf", filename=f"hirehi-session-{session_id}.pdf")
+    if not path.is_file():
+        raise HTTPException(404, "PDF-отчёт ещё не готов")
+    return FileResponse(
+        path, media_type="application/pdf", filename=f"hirehi-session-{session_id}.pdf"
+    )
 
 
 @router.get("/sessions/{session_id}/events")
 def events(session_id: int, after: int = 0, db: Session = Depends(get_db)) -> list[dict]:
-    rows = db.scalars(select(BrowserEvent).where(BrowserEvent.session_id == session_id, BrowserEvent.id > after).order_by(BrowserEvent.id))
-    return [{"id": e.id, "type": e.event_type, "message": e.message, "data": e.data, "created_at": e.created_at.isoformat()} for e in rows]
+    rows = db.scalars(
+        select(BrowserEvent)
+        .where(BrowserEvent.session_id == session_id, BrowserEvent.id > after)
+        .order_by(BrowserEvent.id)
+    )
+    return [
+        {
+            "id": e.id,
+            "type": e.event_type,
+            "message": e.message,
+            "data": e.data,
+            "created_at": e.created_at.isoformat(),
+        }
+        for e in rows
+    ]
+
+
+def public_evaluation(data: dict | None) -> dict | None:
+    if data is None:
+        return None
+    result = dict(data)
+    result.pop("flag_matches", None)
+    return result
 
 
 @router.get("/vacancies")
@@ -710,7 +807,9 @@ def vacancies(
 ) -> dict:
     total = db.scalar(select(func.count()).select_from(Vacancy)) or 0
     rows = []
-    for vacancy in db.scalars(select(Vacancy).order_by(Vacancy.id.desc()).offset(offset).limit(limit)):
+    for vacancy in db.scalars(
+        select(Vacancy).order_by(Vacancy.id.desc()).offset(offset).limit(limit)
+    ):
         evaluation = db.scalar(select(Evaluation).where(Evaluation.vacancy_id == vacancy.id))
         rows.append(
             {
@@ -720,23 +819,44 @@ def vacancies(
                 "company": vacancy.company,
                 "url": vacancy.url,
                 "state": vacancy.state,
-                "evaluation": evaluation.data if evaluation else None,
+                "evaluation": public_evaluation(evaluation.data) if evaluation else None,
             }
         )
         if include_data:
             rows[-1]["data"] = vacancy.data
-    return {"items": rows, "total": total, "limit": limit, "offset": offset, "has_more": offset + len(rows) < total}
+    return {
+        "items": rows,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(rows) < total,
+    }
 
 
 async def session_socket(websocket: WebSocket, session_id: int) -> None:
-    await websocket.accept(); after = 0
+    await websocket.accept()
+    after = 0
     try:
         while True:
             from backend.persistence.database import SessionLocal
+
             with SessionLocal() as db:
-                batch = list(db.scalars(select(BrowserEvent).where(BrowserEvent.session_id == session_id, BrowserEvent.id > after).order_by(BrowserEvent.id)))
+                batch = list(
+                    db.scalars(
+                        select(BrowserEvent)
+                        .where(BrowserEvent.session_id == session_id, BrowserEvent.id > after)
+                        .order_by(BrowserEvent.id)
+                    )
+                )
                 for event in batch:
-                    await websocket.send_json({"id": event.id, "type": event.event_type, "message": event.message, "data": event.data})
+                    await websocket.send_json(
+                        {
+                            "id": event.id,
+                            "type": event.event_type,
+                            "message": event.message,
+                            "data": event.data,
+                        }
+                    )
                     after = event.id
             await asyncio.sleep(0.5)
     except WebSocketDisconnect:

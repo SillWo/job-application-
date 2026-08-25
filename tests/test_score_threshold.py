@@ -8,21 +8,68 @@ from backend.persistence.models import JobSession
 def payload(**overrides: object) -> dict[str, object]:
     return {"profile_id": 1, "adapter_id": "hh", **overrides}
 
+
 def test_session_has_canonical_gate_map() -> None:
-    assert SessionCreate.model_validate(payload()).minimum_scores == {"title": 0, "tasks": 2, "industry": 2, "skills": 2, "required_years": 1, "languages": 1}
+    assert SessionCreate.model_validate(payload()).minimum_scores == {
+        "tasks": 2,
+        "skills": 1,
+        "experience_depth": 1,
+        "role_match": 1,
+        "industry": 2,
+        "special_requirements": 1,
+    }
 
-def test_fixed_gates_cannot_be_overridden() -> None:
-    result = SessionCreate.model_validate(payload(minimum_scores={"tasks": 3, "title": 2, "required_years": 0}))
-    assert result.minimum_scores["title"] == 0 and result.minimum_scores["required_years"] == 1 and result.minimum_scores["languages"] == 1
 
-@pytest.mark.parametrize("value", [0, 4, True, False])
-def test_configurable_gate_values_are_strict(value: object) -> None:
+def test_all_configurable_gates_are_preserved() -> None:
+    result = SessionCreate.model_validate(payload(minimum_scores={
+        "tasks": 4,
+        "skills": 2,
+        "experience_depth": 3,
+        "role_match": 4,
+        "industry": 1,
+        "special_requirements": 1,
+    }))
+    assert result.minimum_scores == {
+        "tasks": 4,
+        "skills": 2,
+        "experience_depth": 3,
+        "role_match": 4,
+        "industry": 1,
+        "special_requirements": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("tasks", 0),
+        ("tasks", 5),
+        ("skills", 0),
+        ("skills", 3),
+        ("role_match", True),
+        ("industry", False),
+        ("special_requirements", 2),
+    ],
+)
+def test_gate_values_are_strict(key: str, value: object) -> None:
     with pytest.raises(ValidationError):
-        SessionCreate.model_validate(payload(minimum_scores={"tasks": value}))
+        SessionCreate.model_validate(payload(minimum_scores={key: value}))
 
-def test_unknown_gate_is_rejected() -> None:
+
+@pytest.mark.parametrize(
+    "key", ["title", "required_years", "languages", "unknown"]
+)
+def test_unknown_or_non_configurable_gate_is_rejected(key: str) -> None:
     with pytest.raises(ValidationError):
-        SessionCreate.model_validate(payload(minimum_scores={"unknown": 1}))
+        SessionCreate.model_validate(payload(minimum_scores={key: 1}))
+
+
+def test_removed_work_conditions_is_named_when_special_requirements_is_valid() -> None:
+    with pytest.raises(ValidationError, match="work_conditions"):
+        SessionCreate.model_validate(payload(minimum_scores={
+            "special_requirements": 1,
+            "work_conditions": 1,
+        }))
 
 
 def test_aggregate_threshold_is_rejected_and_absent_from_sessions() -> None:

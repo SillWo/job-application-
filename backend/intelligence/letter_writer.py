@@ -46,15 +46,14 @@ async def write_cover_letter(
     profile: Any,
     resumes: Sequence[Any],
     gateway,
+    preference_policy=None,
 ) -> str:
     profile_payload = _payload(profile)
     resume_payloads = [_payload(resume) for resume in resumes]
     if not resume_payloads:
         raise ValueError("Для сопроводительного письма не выбрано ни одного резюме")
 
-    draft = await gateway.structured(
-        "writer",
-        {
+    ai_payload = {
             "vacancy": {
                 "title": job.title,
                 "company": job.company,
@@ -70,7 +69,12 @@ async def write_cover_letter(
                 "фразу с мессенджерами — она будет добавлена автоматически. Если называешь кандидата, используй "
                 "только profile.full_name. Верни только поле text."
             ),
-        },
+        }
+    if preference_policy:
+        ai_payload["preference_policy"] = preference_policy.model_dump(mode="json") if hasattr(preference_policy, "model_dump") else preference_policy
+    draft = await gateway.structured(
+        "writer",
+        ai_payload,
         CoverLetterDraft,
     )
     return _finish_cover_letter(draft.text, profile_payload)
