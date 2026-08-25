@@ -254,7 +254,6 @@ class SessionCreate(BaseModel):
     desired_job_description: str = Field(default="", max_length=2000)
     minimum_scores: dict[str, int | bool] | None = None
     adapter_id: str
-    viewed_limit: int | None = Field(default=30, ge=1)
     application_limit: int | None = Field(default=5, ge=1)
 
     @classmethod
@@ -572,7 +571,6 @@ def session_dict(item: JobSession) -> dict:
         "desired_job_description": getattr(item, "desired_job_description", ""),
         "minimum_scores": item.minimum_scores or None,
         "adapter_id": item.adapter_id,
-        "viewed_limit": item.viewed_limit,
         "application_limit": item.application_limit,
         "status": item.status,
         "counters": item.counters or {},
@@ -595,7 +593,6 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         desired_job_description=payload.desired_job_description,
         minimum_scores=payload.minimum_scores or None,
         adapter_id=payload.adapter_id,
-        viewed_limit=payload.viewed_limit,
         application_limit=payload.application_limit,
         status=SessionStatus.CREATED,
         counters={},
@@ -618,6 +615,15 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(404, "Сессия не найдена")
     if item.status != SessionStatus.CREATED:
         raise HTTPException(409, "Запустить можно только новую сессию")
+    try:
+        model_status = await ModelGateway().status()
+        if (
+            model_status.get("connected") is not True
+            or model_status.get("model_available") is not True
+        ):
+            raise RuntimeError("model unavailable")
+    except Exception as exc:
+        raise HTTPException(503, "API модели не доступен") from exc
     if item.preference_policy is None:
         try:
             if item.desired_job_description.strip():
@@ -627,7 +633,7 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
             else:
                 policy = None
         except ModelUnavailable as exc:
-            raise HTTPException(503, str(exc)) from exc
+            raise HTTPException(503, "API модели не доступен") from exc
         item.preference_policy = policy.model_dump(mode="json") if policy else None
         db.commit()
     if workflow_manager.launch(session_id) is False:

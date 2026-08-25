@@ -7,38 +7,49 @@ import { Notifications } from './App'
 beforeEach(() => { localStorage.clear(); vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] })) })
 afterEach(() => vi.unstubAllGlobals())
 
+async function chooseOption(label: string, option: string) {
+  fireEvent.click(await screen.findByRole('combobox', { name: label }))
+  const item = await screen.findByRole('option', { name: option })
+  fireEvent.pointerDown(item, { pointerType: 'mouse', button: 0 })
+  fireEvent.mouseUp(item)
+  fireEvent.click(item, { detail: 1 })
+}
+
 test('persists every new-session parameter across remounts', async () => {
   localStorage.clear()
+  localStorage.setItem('job-orchestrator.session-draft', JSON.stringify({ viewedLimit: '41', unlimitedViewed: true }))
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
     if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru', allowed_domains: ['hh.ru'] }, { site_id: 'hirehi', display_name: 'HireHi', allowed_domains: ['hirehi.ru'] }] })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   const mount = () => render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
   const first = mount()
   expect(await screen.findByRole('heading', { name: 'Влияние факторов на вакансии' })).toBeInTheDocument()
-  await screen.findByRole('option', { name: 'HireHi' })
-  fireEvent.change(screen.getByRole('combobox', { name: 'Сайт' }), { target: { value: 'hirehi' } })
-  fireEvent.change(screen.getByRole('spinbutton', { name: 'Лимит просмотра вакансий' }), { target: { value: '41' } })
+  const siteTrigger = screen.getByRole('combobox', { name: 'Сайт' })
+  const limitInput = screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' })
+  expect(siteTrigger.closest('.row')).toContainElement(limitInput)
+  expect(screen.getByRole('textbox', { name: 'Описание желаемой вакансии' }).closest('.row')).toBeNull()
+  expect(screen.queryByRole('spinbutton', { name: /просмотра вакансий/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('checkbox', { name: /просмотр вакансий/i })).not.toBeInTheDocument()
+  await chooseOption('Сайт', 'HireHi')
   fireEvent.change(screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' }), { target: { value: '7' } })
-  fireEvent.click(screen.getByRole('checkbox', { name: 'Без ограничений: просмотр вакансий' }))
-  fireEvent.click(screen.getAllByRole('checkbox', { name: /Без ограничений:/ })[1])
-  expect(screen.getByRole('spinbutton', { name: 'Лимит просмотра вакансий' })).toBeDisabled()
+  fireEvent.click(screen.getByRole('checkbox', { name: /Без ограничений:/ }))
   expect(screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' })).toBeDisabled()
   fireEvent.change(screen.getByRole('textbox', { name: 'Описание желаемой вакансии' }), { target: { value: 'Удалённо; не продажи' } })
   ;['4', '2', '1', '3', '4'].forEach((value, index) => fireEvent.change(screen.getAllByRole('slider')[index], { target: { value } }))
-  await waitFor(() => expect(JSON.parse(localStorage.getItem('job-orchestrator.session-draft') || '{}')).toMatchObject({ adapter: 'hirehi', viewedLimit: '41', applicationLimit: '7', unlimitedViewed: true, unlimitedApplications: true, desiredJobDescription: 'Удалённо; не продажи' }))
   first.unmount(); mount()
-  await screen.findByRole('option', { name: 'HireHi' })
-  expect(await screen.findByRole('combobox', { name: 'Сайт' })).toHaveValue('hirehi')
-  expect(screen.getByRole('spinbutton', { name: 'Лимит просмотра вакансий' })).toHaveValue(41)
+  expect(await screen.findByRole('combobox', { name: 'Сайт' })).toHaveTextContent('hirehi')
   expect(screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' })).toHaveValue(7)
-  expect(screen.getByRole('checkbox', { name: 'Без ограничений: просмотр вакансий' })).toBeChecked()
-  expect(screen.getAllByRole('checkbox', { name: /Без ограничений:/ })[1]).toBeChecked()
+  expect(screen.getByRole('checkbox', { name: /Без ограничений:/ })).toBeChecked()
   expect(screen.getByRole('textbox', { name: 'Описание желаемой вакансии' })).toHaveValue('Удалённо; не продажи')
   expect(screen.getAllByRole('slider').map((slider) => slider.getAttribute('aria-valuetext'))).toEqual(['Максимальный', 'Высокий', 'Низкий', 'Высокий', 'Максимальный'])
+  const savedDraft = JSON.parse(localStorage.getItem('job-orchestrator.session-draft') || '{}')
+  expect(savedDraft).not.toHaveProperty('viewedLimit')
+  expect(savedDraft).not.toHaveProperty('unlimitedViewed')
   localStorage.clear()
 })
 
@@ -49,6 +60,7 @@ test('configures influence sliders, accessible hints, and minimum score payload'
     if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 77, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/sessions/77/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
@@ -93,6 +105,7 @@ test('captures only the user job description with a 2000-character limit', async
     if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 78, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/sessions/78/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
@@ -114,6 +127,46 @@ test('captures only the user job description with a 2000-character limit', async
   expect(payload).not.toHaveProperty('red_flags')
 })
 
+test.each([
+  ['unavailable', { connected: false, model_available: false }],
+  ['http failure', null],
+] as const)('blocks session creation when model preflight is %s', async (_name, status) => {
+  const requests: Array<{ url: string; method?: string }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push({ url, method: init?.method })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/model/status')) return status ? Promise.resolve({ ok: true, json: async () => status }) : Promise.resolve({ ok: false, statusText: 'down', json: async () => ({}) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  const launch = await screen.findByRole('button', { name: 'Создать и запустить' })
+  await waitFor(() => expect(launch).toBeEnabled())
+  fireEvent.click(launch)
+  expect(await screen.findByRole('alert')).toHaveTextContent('API модели не доступен')
+  await waitFor(() => expect(document.querySelector('[data-sonner-toast][data-type="error"]')).toHaveTextContent('API модели не доступен'))
+  expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))).toBe(false)
+  expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/start'))).toBe(false)
+})
+
+test('runs model preflight before creating and starting a session', async () => {
+  const requests: string[] = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push(`${init?.method ?? 'GET'} ${url}`)
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true }) })
+    if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 99, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
+    if (url.endsWith('/api/sessions/99/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  const launch = await screen.findByRole('button', { name: 'Создать и запустить' }); await waitFor(() => expect(launch).toBeEnabled()); fireEvent.click(launch)
+  await waitFor(() => expect(requests).toContain('POST /api/sessions/99/start'))
+  expect(requests.indexOf('GET /api/model/status')).toBeLessThan(requests.indexOf('POST /api/sessions'))
+  expect(requests.indexOf('POST /api/sessions')).toBeLessThan(requests.indexOf('POST /api/sessions/99/start'))
+})
+
 test('configures a new cloud model key and clears it after saving', async () => {
   const requests: Array<{ url: string; init?: RequestInit }> = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -128,8 +181,7 @@ test('configures a new cloud model key and clears it after saving', async () => 
   fireEvent.change(screen.getByLabelText(/Base URL/), { target: { value: 'https://api.example.test/v1' } })
   fireEvent.change(key, { target: { value: 'secret-value' } })
   fireEvent.click(screen.getByRole('button', { name: 'Загрузить модели' }))
-  await screen.findByRole('option', { name: 'cloud-a' })
-  fireEvent.change(screen.getByLabelText('Модель'), { target: { value: 'cloud-b' } })
+  await chooseOption('Модель', 'cloud-b')
   fireEvent.click(screen.getByRole('button', { name: 'Сохранить изменения' }))
   await screen.findByText('Настройки сохранены')
   expect(key).toHaveValue('')
@@ -164,24 +216,45 @@ test('does not send a masked saved key back to the API', async () => {
 
 test('renders the Russian dashboard', async () => {
   render(<QueryClientProvider client={new QueryClient({defaultOptions:{queries:{retry:false}}})}><MemoryRouter><App /></MemoryRouter></QueryClientProvider>)
-  expect(screen.getByText('Ваш поиск работы — под контролем')).toBeInTheDocument()
+  expect(screen.getByRole('heading', { level: 1, name: /Меньше шума.*Больше подходящих вакансий/i })).toBeInTheDocument()
   expect(screen.queryByText('Приватность под контролем')).not.toBeInTheDocument()
   expect(screen.queryByText('Облачная модель недоступна')).not.toBeInTheDocument()
   expect(screen.getByRole('link', { name: 'API' })).toBeInTheDocument()
-  expect(screen.getByText(/Ваш запрос на естественном языке учитывается/)).toBeInTheDocument()
+  expect(screen.getByText(/критериям и лимитам/)).toBeInTheDocument()
+  expect(screen.getAllByRole('link', { name: /Настроить профиль/ })[0]).toHaveAttribute('href', '/profile')
+  expect(screen.getAllByRole('link', { name: 'Добавить API модели' })[0]).toHaveAttribute('href', '/model')
+  const statusStrip = screen.getByLabelText('Готовность к поиску')
+  const statusTexts = Array.from(statusStrip.querySelectorAll('span')).map((node) => node.textContent)
+  expect(statusTexts[0]).toMatch(/API модели (добавлен|не добавлен)/)
+  expect(statusTexts[1]).toMatch(/Профиль/)
+  expect(screen.getAllByText(/API модели/).length).toBeGreaterThanOrEqual(1)
   expect(screen.queryByText(/Сначала фильтры/)).not.toBeInTheDocument()
 })
 
-test('renders connected sites on overview and removes sites navigation', async () => {
-  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
-    if (String(input).endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru', allowed_domains: ['hh.ru'] }, { site_id: 'hirehi', display_name: 'HireHi', allowed_domains: ['hirehi.ru'] }] })
+test('overview shows an unconfigured model as the first readiness status', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockImplementation((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: false, model_available: false }) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/']}><App /></MemoryRouter></QueryClientProvider>)
+  const strip = await screen.findByLabelText('Готовность к поиску')
+  const cells = Array.from(strip.querySelectorAll('span')).map((node) => node.textContent)
+  expect(cells[0]).toContain('API модели не добавлен')
+  expect(cells[1]).toContain('Профиль')
+})
+
+test('renders only the hero workflow on overview', async () => {
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/']}><App /></MemoryRouter></QueryClientProvider>)
   expect(screen.queryByRole('link', { name: 'Сайты' })).not.toBeInTheDocument()
-  expect(await screen.findByRole('heading', { name: 'Адаптеры без скрытых API', level: 2 })).toBeInTheDocument()
-  expect(await screen.findByText('HH.ru')).toBeInTheDocument()
-  expect(await screen.findByText('HireHi')).toBeInTheDocument()
+  expect(await screen.findByRole('heading', { level: 1, name: /Меньше шума.*Больше подходящих вакансий/i })).toBeInTheDocument()
+  expect(screen.getByLabelText('Статус рабочего процесса')).toBeInTheDocument()
+  expect(screen.getByLabelText('Готовность к поиску')).toBeInTheDocument()
+  expect(screen.getByRole('link', { name: /Настроить профиль/ })).toHaveAttribute('href', '/profile')
+  expect(screen.getByRole('link', { name: 'Добавить API модели' })).toHaveAttribute('href', '/model')
+  for (const text of ['Один понятный маршрут от профиля к решению.', 'Разные площадки — разные границы работы.', 'Автоматизация остаётся наблюдаемой.', 'Без заполнения форм и внешних откликов']) {
+    expect(screen.queryByText(text)).not.toBeInTheDocument()
+  }
   expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
 })
 
@@ -279,15 +352,14 @@ test('RUNNING HH does not block launching HireHi', async () => {
     if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru' }, { site_id: 'hirehi', display_name: 'HireHi' }] })
     if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 22, profile_id: 1, adapter_id: 'hirehi', status: 'CREATED', counters: {} }) })
     if (url.endsWith('/api/sessions/22/start')) return Promise.resolve({ ok: true, json: async () => ({ ok: true }) })
     if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [{ id: 11, profile_id: 1, adapter_id: 'hh', status: 'RUNNING', counters: {} }] })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
-  const select = await screen.findByRole('combobox', { name: 'Сайт' })
-  await screen.findByRole('option', { name: 'HireHi' })
-  fireEvent.change(select, { target: { value: 'hirehi' } })
+  await chooseOption('Сайт', 'HireHi')
   const launch = screen.getByRole('button', { name: 'Создать и запустить' })
   await waitFor(() => expect(launch).toBeEnabled())
   fireEvent.click(launch)
@@ -322,6 +394,7 @@ test('HH launch has no per-session resume controls', async () => {
     requests.push({ url, body: init?.body ? String(init.body) : undefined })
     if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 2, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
     if (url.endsWith('/api/sessions/2/start')) return Promise.resolve({ ok: true, json: async () => ({ ok: true }) })
     return Promise.resolve({ ok: true, json: async () => [] })
@@ -411,17 +484,16 @@ test('HireHi launch hides per-session resume controls', async () => {
     if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru', allowed_domains: ['hh.ru'] }, { site_id: 'hirehi', display_name: 'HireHi', allowed_domains: ['hirehi.ru'] }] })
     if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {}, created_at: '2026-08-13T00:00:00Z' }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, profile_id: 1, name: 'Resume', selected_for_matching: true, skills: [], experiences: [] }] })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 3, profile_id: 1, adapter_id: 'hirehi', status: 'CREATED', counters: {} }) })
     if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
     if (url.endsWith('/api/sessions/3/start')) return Promise.resolve({ ok: true, json: async () => ({ ok: true }) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  await chooseOption('Сайт', 'HireHi')
   const select = await screen.findByRole('combobox', { name: 'Сайт' })
-  await within(select).findByRole('option', { name: 'HireHi' })
-  expect(within(select).getAllByRole('option', { name: 'HH.ru' })).toHaveLength(1)
-  fireEvent.change(select, { target: { value: 'hirehi' } })
-  await waitFor(() => expect(select).toHaveValue('hirehi'))
+  await waitFor(() => expect(select).toHaveTextContent('HireHi'))
   expect(screen.queryByLabelText('Публичная ссылка на резюме (необязательно)')).not.toBeInTheDocument()
   expect(screen.queryByLabelText('Загрузить резюме при запуске')).not.toBeInTheDocument()
   const launch = screen.getByRole('button', { name: 'Создать и запустить' })
@@ -525,7 +597,7 @@ test('renders structured personal profile and makes selected resumes explicit', 
 
   fireEvent.click(screen.getByRole('button', { name: '+ Образование' }))
   expect(screen.getByLabelText('Тип образования 1')).toBeInTheDocument()
-  fireEvent.change(screen.getByLabelText('Тип образования 1'), { target: { value: 'school' } })
+  await chooseOption('Тип образования 1', 'Школьное')
   expect(screen.getByText('Учебное заведение')).toBeInTheDocument()
   expect(screen.getByLabelText('Тип образования 1').closest('.profile-remove-row')).toBeTruthy()
   expect(screen.getByLabelText('Учебное заведение').closest('.profile-full-field')).toBeTruthy()
@@ -550,6 +622,7 @@ test('renders structured personal profile and makes selected resumes explicit', 
 
   fireEvent.click(screen.getByRole('button', { name: 'Сохранить резюме' }))
   await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith('/api/profiles/1/resumes/4') && init?.method === 'PATCH')).toBe(true))
+  expect(screen.getByRole('status')).toHaveClass('notice-success')
   const editResumeCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/api/profiles/1/resumes/4') && init?.method === 'PATCH')
   expect(JSON.parse(String(editResumeCall?.[1]?.body))).toMatchObject({ work_formats: ['remote', 'hybrid'], about: 'Одно два три' })
 
@@ -568,6 +641,20 @@ test('renders structured personal profile and makes selected resumes explicit', 
   await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith('/api/profiles/1/resumes/4') && init?.method === 'PATCH')).toBe(true))
   const resumeCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/api/profiles/1/resumes/4') && init?.method === 'PATCH' && String(init.body).includes('"selected_for_matching":false'))
   expect(JSON.parse(String(resumeCall?.[1]?.body))).toMatchObject({ work_formats: ['remote'], selected_for_matching: false })
+})
+
+test('profile resume toggle failure is surfaced as danger notice', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: 'Кандидат', contacts: { messengers: [] }, education: [], languages: [], job_search_locations: [] } }] })
+    if (url.endsWith('/api/profiles/1/resumes') && !init?.method) return Promise.resolve({ ok: true, json: async () => [{ id: 4, profile_id: 1, name: 'Резюме', selected_for_matching: true, employment_types: [], work_formats: [], experiences: [], skills: [], about: '' }] })
+    if (url.includes('/resumes/4') && init?.method === 'PATCH') return Promise.resolve({ ok: false, status: 500, text: async () => 'Не удалось сохранить', json: async () => ({ detail: 'Не удалось сохранить' }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/profile']}><App /></MemoryRouter></QueryClientProvider>)
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Передавать модели' }))
+  await waitFor(() => expect(screen.getByRole('alert')).toHaveClass('notice-danger'))
+  expect(screen.getByRole('alert')).toHaveTextContent('Не удалось сохранить')
 })
 
 test('allows creating an HH session after a stopped session', async () => {
@@ -605,8 +692,7 @@ test('allows creating an HH session after a stopped session', async () => {
 
   const createButton = await screen.findByRole('button', { name: 'Создать и запустить' })
   await waitFor(() => expect(createButton).toBeEnabled())
-  fireEvent.click(screen.getByRole('checkbox', { name: 'Без ограничений: просмотр вакансий' }))
-  fireEvent.click(screen.getByRole('checkbox', { name: 'Без ограничений: отправка откликов' }))
+  fireEvent.click(screen.getByRole('checkbox', { name: /Без ограничений:/ }))
   fireEvent.click(createButton)
 
   expect(await screen.findByText(/Сессия #2 запущена/)).toBeInTheDocument()
@@ -615,7 +701,6 @@ test('allows creating an HH session after a stopped session', async () => {
     expect.objectContaining({ method: 'POST' }),
   )
   const createCall = fetchMock.mock.calls.find(([url, init]) => String(url).endsWith('/api/sessions') && init?.method === 'POST')
-  expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({ viewed_limit: null, application_limit: null })
   expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({ profile_id: 1, adapter_id: 'hh' })
   expect(JSON.parse(String(createCall?.[1]?.body))).not.toHaveProperty('mode')
   expect(JSON.parse(String(createCall?.[1]?.body))).not.toHaveProperty('policy_id')
@@ -672,7 +757,6 @@ test('displays legacy defaults while an older backend omits session limits', asy
     return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
-  expect(await screen.findByText(/Лимиты сессии: просмотр — 30; отправка — 5/)).toBeInTheDocument()
 })
 
 test('hides policy navigation, route UI, and API access', async () => {
@@ -715,11 +799,12 @@ test('shows resume relevance breakdown without policy UI', async () => {
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
 
   expect(await screen.findByText('Недостаточная релевантность по резюме')).toBeInTheDocument()
-  expect(screen.getByText('РЕЛЕВАНТНОСТЬ ПО РЕЗЮМЕ')).toBeInTheDocument()
+  expect(screen.getByText('КРАТКОЕ РЕЗЮМЕ')).toBeInTheDocument()
+  expect(screen.queryByText('Почему вакансия подходит и что с откликом')).not.toBeInTheDocument()
+  expect(screen.queryByText('Короткое объяснение по каждому критерию')).not.toBeInTheDocument()
   expect(screen.getByText('Роль')).toBeInTheDocument()
   expect(screen.queryByText('Уровень позиции')).not.toBeInTheDocument()
   expect(screen.getByText('Особые требования')).toBeInTheDocument()
-  expect(screen.getAllByText('0 / 10').length).toBeGreaterThan(0)
   expect(screen.queryByText('Отклонено политическим фильтром')).not.toBeInTheDocument()
   expect(screen.queryByText('Принятые Green flags')).not.toBeInTheDocument()
   expect(screen.queryByText('Сработавшие Red flags')).not.toBeInTheDocument()
@@ -750,10 +835,8 @@ test('converts legacy vacancy 2071 scores to six weighted contributions', async 
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
 
   expect(await screen.findByText('Тест')).toBeInTheDocument()
-  for (const value of ['18 / 35', '10 / 20', '11 / 15', '10 / 10']) {
-    expect(screen.getByText(value)).toBeInTheDocument()
-  }
-  expect(screen.getAllByText('5 / 10')).toHaveLength(2)
+  expect(screen.getByText('18 / 35')).toBeInTheDocument()
+  expect(screen.queryByText('Минимум:')).not.toBeInTheDocument()
   expect(screen.queryByText('Условия труда')).not.toBeInTheDocument()
 })
 
@@ -796,18 +879,14 @@ test('renders legacy six-row relevance payload as six named criteria', async () 
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
 
-  expect(await screen.findByText('Не пройден минимум по навыкам')).toBeInTheDocument()
+  expect((await screen.findAllByText(/Задачи: пояснение/)).length).toBeGreaterThan(0)
+  expect(screen.queryByText('Не пройден минимум по навыкам')).not.toBeInTheDocument()
   for (const title of ['Задачи', 'Навыки', 'Годы опыта', 'Роль', 'Сфера', 'Особые требования']) {
     expect(screen.getByText(title)).toBeInTheDocument()
   }
   expect(screen.queryByText('Условия труда')).not.toBeInTheDocument()
   expect(screen.getByText('23 / 35')).toBeInTheDocument()
-  expect(screen.getByText('8 / 10')).toBeInTheDocument()
-  expect(screen.getByText('8 / 15')).toBeInTheDocument()
-  expect(screen.getAllByText('10 / 10')).toHaveLength(2)
-  expect(screen.getByText('7 / 20')).toBeInTheDocument()
-  expect(screen.getByText('Минимум: 2 — не выполнен')).toBeInTheDocument()
-  expect(screen.getAllByText(/^Минимум:/)).toHaveLength(1)
+  expect(screen.queryByText('Минимум: 2 — не выполнен')).not.toBeInTheDocument()
 })
 
 test('renders native payload without work conditions and preserves stored overall score', async () => {
@@ -827,9 +906,8 @@ test('renders native payload without work conditions and preserves stored overal
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
   expect(await screen.findByText('Тест')).toBeInTheDocument()
   expect(screen.getByText('88')).toBeInTheDocument()
-  for (const value of ['26 / 35', '10 / 20', '15 / 15']) expect(screen.getByText(value)).toBeInTheDocument()
+  expect(screen.getByText('26 / 35')).toBeInTheDocument()
   expect(screen.getAllByText('5 / 10')).toHaveLength(2)
-  expect(screen.getByText('8 / 10')).toBeInTheDocument()
   expect(screen.queryByText('Условия труда')).not.toBeInTheDocument()
 })
 
@@ -862,4 +940,146 @@ test('does not show low-confidence red flag or work-format match as rejection', 
   expect(screen.queryByText('Отклонено политическим фильтром')).not.toBeInTheDocument()
   expect(screen.queryByText('Формат работы не подходит')).not.toBeInTheDocument()
   expect(screen.queryByText('Сработавшие Red flags')).not.toBeInTheDocument()
+})
+
+test('renders vacancy disclosure with localized status and accessible toggle controls', async () => {
+  const vacancy = (id: number, state: string, evaluation = true) => ({ id, title: `Тестовая роль ${id}`, company: 'Компания', url: `https://example.test/${id}`, state, data: {}, evaluation: evaluation ? { decision: 'skip', score: 31, confidence: 0.9, category: 'test', reason: 'Оценка вакансии на основе резюме.', score_breakdown: [
+    { key: 'tasks', title: 'Задачи', description: '', points: 35, max_points: 35, raw_points: 4, raw_max_points: 4, minimum_points: 2, explanation: 'Вакансия предполагает управление проектами. Второе предложение задач остаётся только в разборе критерия. Evidence не прошло локальную лексическую проверку...', evidence: ['СЕКРЕТНАЯ ЦИТАТА'] },
+    { key: 'industry', title: 'Сфера', description: '', points: 0, max_points: 10, raw_points: 0, raw_max_points: 4, explanation: 'Опыт кандидата относится к другой сфере. Второе предложение сферы остаётся только в разборе критерия.', evidence: [] },
+  ] } : null })
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/api/vacancies')
+    ? Promise.resolve({ ok: true, json: async () => [vacancy(501, 'SUBMITTED'), vacancy(502, 'ALREADY_APPLIED'), vacancy(503, 'REJECTED_BY_MODEL'), vacancy(504, 'ERROR', false)] })
+    : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  const localizedStatus = await screen.findAllByText('Отклик отправлен')
+  expect(localizedStatus).toHaveLength(2)
+  expect(localizedStatus[0]).toHaveClass('status-success')
+  expect(localizedStatus[1]).toHaveClass('status-success')
+  expect(localizedStatus.map((item) => item.getAttribute('data-status'))).toEqual(['SUBMITTED', 'ALREADY_APPLIED'])
+  expect(screen.queryByText('Отклик уже был отправлен')).not.toBeInTheDocument()
+  const summary = screen.getAllByRole('group')[0].querySelector('summary') as HTMLElement
+  expect(summary).toHaveAttribute('aria-expanded', 'false')
+  expect(within(summary).getByText('Показать подробности вакансии')).toBeInTheDocument()
+  expect(within(summary).queryByText('Разбор')).not.toBeInTheDocument()
+  expect(within(summary).queryByText('Скрыть')).not.toBeInTheDocument()
+  fireEvent.click(summary)
+  await waitFor(() => expect(summary).toHaveAttribute('aria-expanded', 'true'))
+  expect(within(summary).getByText('Скрыть подробности вакансии')).toBeInTheDocument()
+  expect(screen.getByText('Отклик действительно отправлен после положительной оценки вакансии.')).toBeInTheDocument()
+  const submittedSummary = screen.getAllByRole('group')[0].querySelector('.score-details > p')
+  expect(submittedSummary).toHaveTextContent('Вакансия предполагает управление проектами. Опыт кандидата относится к другой сфере.')
+  expect(submittedSummary).not.toHaveTextContent('Второе предложение задач')
+  expect(submittedSummary).not.toHaveTextContent('Второе предложение сферы')
+  expect(screen.queryByText('Оценка вакансии на основе резюме.')).not.toBeInTheDocument()
+  const secondSummary = screen.getAllByRole('group')[1].querySelector('summary') as HTMLElement
+  fireEvent.click(secondSummary)
+  expect(await screen.findByText('Новый отклик не отправлялся: вы уже откликались на эту вакансию.')).toBeInTheDocument()
+  const rejectedSummary = screen.getAllByRole('group')[2].querySelector('summary') as HTMLElement
+  fireEvent.click(rejectedSummary)
+  expect(await screen.findByText('Модель отклонила вакансию из-за недостаточной релевантности, поэтому отклик не отправлен.')).toBeInTheDocument()
+  const rejectedCard = within(screen.getAllByRole('group')[2])
+  expect(rejectedCard.getByRole('progressbar', { name: 'Релевантность: Задачи' })).toBeInTheDocument()
+  expect(rejectedCard.getAllByText(/Вакансия предполагает управление проектами/).length).toBeGreaterThan(0)
+  expect(screen.queryByText('СЕКРЕТНАЯ ЦИТАТА')).not.toBeInTheDocument()
+  expect(screen.queryByText(/Evidence не прошло/)).not.toBeInTheDocument()
+  expect(screen.queryByText(/Минимум/)).not.toBeInTheDocument()
+  const errorSummary = screen.getAllByRole('group')[3].querySelector('summary') as HTMLElement
+  fireEvent.click(errorSummary)
+  expect(await screen.findByText('Отклик не отправлен из-за ошибки обработки вакансии.')).toBeInTheDocument()
+})
+
+test('renders reported vacancy as a successful status', async () => {
+  const vacancy = { id: 505, title: 'Вакансия в отчёте', company: 'Компания', url: 'https://example.test/505', state: 'REPORTED', data: {}, evaluation: null }
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/api/vacancies')
+    ? Promise.resolve({ ok: true, json: async () => [vacancy] })
+    : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  const status = await screen.findByText('В отчёте')
+  expect(status).toHaveClass('status-success')
+  expect(status).toHaveAttribute('data-status', 'REPORTED')
+})
+
+test('deletes the selected dynamic profile row while preserving its neighbor', async () => {
+  const originalMatchMedia = window.matchMedia
+  window.matchMedia = ((query: string) => ({ matches: query.includes('prefers-reduced-motion'), media: query, onchange: null, addListener: () => undefined, removeListener: () => undefined, addEventListener: () => undefined, removeEventListener: () => undefined, dispatchEvent: () => false })) as typeof window.matchMedia
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: 'Кандидат', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: ['Первый', 'Второй'] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [] })
+    return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
+  }))
+  try {
+    render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/profile']}><App /></MemoryRouter></QueryClientProvider>)
+    const first = await screen.findByDisplayValue('Первый')
+    expect(screen.getByDisplayValue('Второй')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Удалить мессенджер 1' }))
+    await waitFor(() => expect(screen.queryByDisplayValue('Первый')).not.toBeInTheDocument())
+    expect(screen.getByDisplayValue('Второй')).toBeInTheDocument()
+    expect(first.closest('.animated-repeat-item')).toHaveClass('animated-repeat-item')
+  } finally { window.matchMedia = originalMatchMedia }
+})
+
+test('MultiSelect popover closes on Escape', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: '', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, profile_id: 1, name: 'Резюме', desired_title: '', desired_salary: null, employment_types: [], work_formats: [], business_trips: null, experiences: [], skills: [], about: '', selected_for_matching: false }] })
+    return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/profile']}><App /></MemoryRouter></QueryClientProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Редактировать' }))
+  const trigger = await screen.findByRole('button', { name: 'Желаемый тип занятости' })
+  fireEvent.click(trigger)
+  expect(await screen.findByText('Постоянная работа')).toBeVisible()
+  fireEvent.keyDown(document, { key: 'Escape' })
+  await waitFor(() => expect(screen.queryByText('Постоянная работа')).not.toBeInTheDocument())
+})
+
+test('SingleSelect opens, selects an option, and closes on Escape', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru' }, { site_id: 'hirehi', display_name: 'HireHi' }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  const trigger = await screen.findByRole('combobox', { name: 'Сайт' })
+  fireEvent.click(trigger)
+  expect(await screen.findByRole('option', { name: 'HireHi' })).toBeVisible()
+  const hireHiOption = screen.getByRole('option', { name: 'HireHi' })
+  fireEvent.pointerDown(hireHiOption, { pointerType: 'mouse', button: 0 })
+  fireEvent.mouseUp(hireHiOption)
+  fireEvent.click(hireHiOption, { detail: 1 })
+  expect(trigger).toHaveTextContent('HireHi')
+  fireEvent.click(trigger)
+  expect(await screen.findByRole('option', { name: 'HH.ru' })).toBeVisible()
+  fireEvent.keyDown(document, { key: 'Escape' })
+  await waitFor(() => expect(screen.queryByRole('option', { name: 'HH.ru' })).not.toBeInTheDocument())
+})
+
+test.each([
+  ['connected', true, 'Соединение есть', 'success', 'CONNECTED'],
+  ['disconnected', false, 'Нет соединения', 'danger', 'DISCONNECTED'],
+] as const)('model status exposes %s semantic tone and data status', async (_name, connected, label, tone, dataStatus) => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected, model_available: connected, model: connected ? 'cloud-a' : '', provider: 'test' }) })
+    if (url.endsWith('/api/model/settings')) return Promise.resolve({ ok: true, json: async () => ({ base_url: '', model: '', has_api_key: false, masked_key: '' }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/model']}><App /></MemoryRouter></QueryClientProvider>)
+  const status = await screen.findByText(label)
+  expect(status).toHaveClass(`status-${tone}`)
+  expect(status).toHaveAttribute('data-status', dataStatus)
+})
+
+test('empty profile state reuses Empty component and icon controls expose SVGs', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/api/profiles')
+    ? Promise.resolve({ ok: true, json: async () => [] })
+    : Promise.resolve({ ok: true, json: async () => [] })))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/profile']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByText('Создайте личный профиль')).toBeInTheDocument()
+  const create = screen.getByRole('button', { name: 'Создать профиль' })
+  expect(create.closest('.empty')).toBeInTheDocument()
+  expect(screen.queryByText('×')).not.toBeInTheDocument()
 })

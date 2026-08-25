@@ -81,6 +81,11 @@ def test_resume_analyst_prompt_contains_complete_discrete_rubric():
     assert "title 0.." not in prompt
     assert "required_years" not in prompt
     assert "languages.score" not in prompt
+    assert "2–3 коротких предложения" in prompt
+    assert "о чём вакансия" in prompt
+    assert "главное конкретное несоответствие" in prompt
+    assert "отклик отправлен" in prompt
+    assert "Не утверждай, что отклик отправлен: на этапе оценки это неизвестно." in prompt
 
 
 def test_resume_analysis_rejects_old_six_criterion_contract():
@@ -96,7 +101,7 @@ def test_resume_analysis_requires_grounding_for_positive_match():
     result.role_match = MatchAssessment(
         score=1, confidence=0, evidence=[], explanation="",
     )
-    assert _resume_analysis_missing_fields(result) == ["role_match.grounding"]
+    assert _resume_analysis_missing_fields(result) == ["reason", "skills_summary", "role_match.grounding"]
 
 
 @pytest.mark.parametrize("field_name", ["experience_depth", "industry", "role_match"])
@@ -125,7 +130,8 @@ def test_grounding_keeps_scalar_score_with_warning_when_evidence_is_invalid(job,
     assert assessment_result.score == 3
     assert assessment_result.confidence == 0.5
     assert assessment_result.evidence == []
-    assert "Evidence не прошло локальную лексическую проверку" in assessment_result.explanation
+    assert "Evidence" not in assessment_result.explanation
+    assert "score" not in assessment_result.explanation
 
 
 def test_grounding_keeps_skill_score_and_filters_invalid_evidence(job):
@@ -142,7 +148,8 @@ def test_grounding_keeps_skill_score_and_filters_invalid_evidence(job):
     grounded = evaluator._ground_resume_analysis(result, job, {}, [{"skills": ["SQL"]}])
     assert grounded.skills[0].score == 2
     assert grounded.skills[0].evidence == []
-    assert "Evidence не прошло локальную лексическую проверку" in grounded.skills[0].explanation
+    assert "Evidence" not in grounded.skills[0].explanation
+    assert "score" not in grounded.skills[0].explanation
 
 
 @pytest.mark.asyncio
@@ -288,6 +295,11 @@ async def test_minimum_score_blocks_even_when_total_passes(job):
     assert result.decision == "skip"
     assert result.minimum_score_violations == ["tasks: 2/4, минимум 3"]
     assert result.score_breakdown[0].minimum_failed is True
+    assert result.reason.endswith(
+        "Вакансия не рекомендована: по отдельным важным критериям совпадения недостаточно."
+    )
+    for technical in ("tasks", "/", "минимум", "score", "confidence", "evidence"):
+        assert technical not in result.reason
 
 
 @pytest.mark.asyncio

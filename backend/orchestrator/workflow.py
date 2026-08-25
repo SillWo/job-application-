@@ -529,13 +529,8 @@ class WorkflowManager:
                 if item.status in {SessionStatus.STOPPED, SessionStatus.FAILED}:
                     collect_more = None
                     return False
-                if _limit_reached(
-                    item.counters.get("viewed", 0), item.viewed_limit
-                ) or _limit_reached(_application_count(item, adapter_id), item.application_limit):
-                    if _limit_reached(item.counters.get("viewed", 0), item.viewed_limit):
-                        completion_reason = "Достигнут лимит просмотра вакансий"
-                    else:
-                        completion_reason = _application_limit_reason(adapter_id)
+                if _limit_reached(_application_count(item, adapter_id), item.application_limit):
+                    completion_reason = _application_limit_reason(adapter_id)
                     collect_more = None
                     return False
             next_refs = await collect_more(executor.page)
@@ -564,11 +559,7 @@ class WorkflowManager:
                 break
             with SessionLocal() as db:
                 item = db.get(JobSession, session_id)
-                viewed_limit = item.viewed_limit
                 application_limit = item.application_limit
-                if _limit_reached(item.counters.get("viewed", 0), viewed_limit):
-                    completion_reason = "Достигнут лимит просмотра вакансий"
-                    break
                 if _limit_reached(_application_count(item, adapter_id), application_limit):
                     completion_reason = _application_limit_reason(adapter_id)
                     break

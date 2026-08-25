@@ -51,6 +51,15 @@ _SPECIAL_REQUIREMENT = re.compile(
 )
 
 
+def _default_human_explanation(score: int, raw_max: int) -> str:
+    """Fallback copy for the UI; never expose the internal scoring scale."""
+    if score <= 0:
+        return "По этому критерию соответствие не подтверждено."
+    if score >= raw_max:
+        return "По этому критерию соответствие хорошее."
+    return "По этому критерию есть частичное соответствие."
+
+
 def _round_half_up(value: Decimal) -> int:
     return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
@@ -77,6 +86,7 @@ def _assessment_rows(
         if key == "skills" and isinstance(assessment, list):
             assessment = MatchAssessment(
                 score=_skill_primary_score(assessment),
+                explanation=analysis.skills_summary,
                 evidence=[evidence for item in assessment for evidence in item.evidence],
             )
         if assessment.score > raw_max:
@@ -87,7 +97,7 @@ def _assessment_rows(
             raw_points=assessment.score, raw_max_points=raw_max,
             minimum_points=(minimum_scores or {}).get(key),
             minimum_failed=(key in (minimum_scores or {}) and assessment.score < minimum_scores[key]),
-            explanation=assessment.explanation or f"Оценка по шкале: {assessment.score}/{raw_max}",
+            explanation=assessment.explanation or _default_human_explanation(assessment.score, raw_max),
             evidence=list(assessment.evidence),
         ))
     return rows
@@ -208,15 +218,12 @@ def _ground_resume_analysis(
     )
     combined_source = f"{job_source} {resume_source}"
     fields = ("tasks", "experience_depth", "role_match", "industry", "special_requirements")
-    grounding_warning = (
-        "Evidence не прошло локальную лексическую проверку; исходный балл сохранён "
-        "с пониженной уверенностью."
-    )
-
-    def warning_explanation(explanation: str) -> str:
-        if grounding_warning in explanation:
-            return explanation
-        return f"{explanation.rstrip()} {grounding_warning}".strip()
+    def human_fallback(score: int, maximum: int) -> str:
+        if score <= 0:
+            return "Соответствие по этому критерию не подтверждено."
+        if score >= maximum:
+            return "По этому критерию соответствие хорошее."
+        return "По этому критерию есть частичное соответствие."
 
     for field_name in fields:
         assessment = getattr(analysis, field_name)
@@ -236,7 +243,7 @@ def _ground_resume_analysis(
         assessment.evidence = grounded_evidence
         if assessment.score > 0 and not grounded_evidence:
             assessment.confidence = min(assessment.confidence, 0.5)
-            assessment.explanation = warning_explanation(assessment.explanation)
+            assessment.explanation = assessment.explanation.strip() or human_fallback(assessment.score, CRITERIA[field_name][0])
     for item in analysis.skills:
         grounded_evidence = [
             quote for quote in item.evidence
@@ -244,7 +251,7 @@ def _ground_resume_analysis(
         ]
         item.evidence = grounded_evidence
         if item.score > 0 and not grounded_evidence:
-            item.explanation = warning_explanation(item.explanation)
+            item.explanation = item.explanation.strip() or human_fallback(item.score, 2)
     if not _has_explicit_special_requirements(job):
         analysis.special_requirements = MatchAssessment(
             score=2,
@@ -345,11 +352,19 @@ async def evaluate(
         if actual < minimum:
             minimum_score_violations.append(f"{key}: {actual}/{raw_max}, минимум {minimum}")
     blocked = bool(minimum_score_violations or red_hit or salary_hit)
+    # Keep the detailed violations in their dedicated internal fields, while the
+    # reason shown in the vacancies UI stays short and understandable.
     if blocked:
-        reasons = list(minimum_score_violations)
-        if red_hit: reasons.append("обнаружен нежелательный фактор")
-        if salary_hit: reasons.append("зарплата ниже желаемой на 25% или более")
-        reason = f"{reason} Ограничения: {'; '.join(reasons)}"
+        blockers = []
+        if minimum_score_violations:
+            blockers.append("по отдельным важным критериям совпадения недостаточно")
+        if red_hit:
+            blockers.append("вакансия не соответствует описанию желаемой работы")
+        if salary_hit:
+            blockers.append("условия оплаты не соответствуют ожиданиям")
+        reason = f"{reason.rstrip('.')} Вакансия не рекомендована: {', '.join(blockers)}."
+    else:
+        reason = f"{reason.rstrip('.')} Вакансия подходит для отклика."
 
     return JobEvaluation(
         decision="apply" if not blocked else "skip",

@@ -8,6 +8,8 @@ from backend.schemas.domain import CoverLetterDraft, JobPosting
 _CONTACT_CLOSING = (
     "Буду рад продолжить общение с вами в этом чате или в мессенджерах -"
 )
+_GREETING = "Здравствуйте!"
+_COVER_LETTER_WORD_LIMIT = 110
 
 
 def _messenger_links(profile_payload: Any) -> list[str]:
@@ -21,10 +23,13 @@ def _finish_cover_letter(text: str, profile_payload: Any) -> str:
     links = _messenger_links(profile_payload)
     closing = f"{_CONTACT_CLOSING} {', '.join(links)}" if links else _CONTACT_CLOSING
     # Keep the contractual closing intact even when the model exceeds its limit.
-    available = max(0, 100 - len(closing.split()))
-    body_words = text.strip().split()[:available]
+    body_text = text.strip()
+    if body_text.casefold().startswith(_GREETING.casefold()):
+        body_text = body_text[len(_GREETING):].lstrip()
+    available = max(0, _COVER_LETTER_WORD_LIMIT - len(_GREETING.split()) - len(closing.split()))
+    body_words = body_text.split()[:available]
     body = " ".join(body_words).rstrip(" ,;:")
-    return f"{body}\n\n{closing}" if body else closing
+    return f"{_GREETING}\n\n{body}\n\n{closing}" if body else f"{_GREETING}\n\n{closing}"
 
 
 def _payload(value: Any) -> Any:
@@ -62,7 +67,7 @@ async def write_cover_letter(
             "profile": profile_payload,
             "resumes": resume_payloads,
             "requirements": (
-                "Напиши основной текст готового сопроводительного письма на русском языке от первого лица, не более 70 слов. "
+                "Напиши основной текст готового сопроводительного письма на русском языке от первого лица, не более 80 слов, без приветствия. "
                 "В нём обязательно должны быть три коротких смысловых блока: почему понравилась вакансия, почему понравилась "
                 "компания и каковы преимущества кандидата для этой вакансии. Используй официальный, но живой стиль. Опирайся только на описание вакансии, "
                 "profile и resumes; не выдумывай опыт, контакты, навыки, цифры или достижения. Не добавляй финальную "

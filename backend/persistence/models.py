@@ -66,11 +66,7 @@ class JobSession(Base):
     desired_job_description: Mapped[str] = mapped_column(Text, default="")
     preference_policy: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     adapter_id: Mapped[str] = mapped_column(String(50))
-    # These values are a snapshot of the launch configuration.  ``None`` means
-    # that the corresponding limit is disabled for this session.
-    # API defaults are applied by SessionCreate.  Do not add ORM defaults:
-    # SQLAlchemy substitutes them for an explicit None and breaks "unlimited".
-    viewed_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Application limit is a snapshot of the launch configuration.
     application_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(40), default="CREATED")
     counters: Mapped[dict] = mapped_column(JSON, default=dict)

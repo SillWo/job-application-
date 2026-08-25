@@ -33,6 +33,14 @@ def test_session_model_has_preference_columns():
     assert "preference_policy" in JobSession.__table__.c
 
 
+def test_viewed_limit_is_removed_from_session_contract():
+    with pytest.raises(ValidationError):
+        SessionCreate.model_validate(_payload(viewed_limit=100))
+    assert "viewed_limit" not in JobSession.__table__.c
+    item = JobSession(profile_id=1, adapter_id="hh")
+    assert "viewed_limit" not in session_dict(item)
+
+
 @pytest.fixture
 def db():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -48,6 +56,7 @@ async def test_start_compiles_before_launch_and_saves_policy(monkeypatch, db):
     db.commit()
     order = []
     policy = DesiredJobPolicy()
+    monkeypatch.setattr(api.ModelGateway, "status", _available_status)
 
     async def compile_policy(*args):
         order.append("compile")
@@ -68,6 +77,7 @@ async def test_start_compile_failure_does_not_launch(monkeypatch, db):
     async def compile_policy(*args):
         raise api.ModelUnavailable("offline")
     launched = []
+    monkeypatch.setattr(api.ModelGateway, "status", _available_status)
     monkeypatch.setattr(api, "compile_preference_policy", compile_policy)
     monkeypatch.setattr(api.workflow_manager, "launch", lambda _: launched.append(True))
     with pytest.raises(api.HTTPException) as error:
@@ -83,10 +93,58 @@ async def test_empty_description_skips_compiler(monkeypatch, db):
     db.commit()
     async def compile_policy(*args):
         raise AssertionError("compiler must not run")
+    monkeypatch.setattr(api.ModelGateway, "status", _available_status)
     monkeypatch.setattr(api, "compile_preference_policy", compile_policy)
     monkeypatch.setattr(api.workflow_manager, "launch", lambda _: True)
     await api.start_session(item.id, db)
     assert db.get(JobSession, item.id).preference_policy is None
+
+
+async def _available_status(self):
+    return {"connected": True, "model_available": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("description", ["", "GameDev"])
+async def test_start_unavailable_model_keeps_created_and_skips_compiler_and_launch(monkeypatch, db, description):
+    item = JobSession(profile_id=1, adapter_id="hh", desired_job_description=description, status=SessionStatus.CREATED)
+    db.add(item)
+    db.commit()
+    called = []
+
+    async def unavailable(self):
+        return {"connected": False, "model_available": False}
+
+    async def compile_policy(*args):
+        called.append("compile")
+
+    monkeypatch.setattr(api.ModelGateway, "status", unavailable)
+    monkeypatch.setattr(api, "compile_preference_policy", compile_policy)
+    monkeypatch.setattr(api.workflow_manager, "launch", lambda _: called.append("launch"))
+    with pytest.raises(api.HTTPException) as error:
+        await api.start_session(item.id, db)
+    assert error.value.status_code == 503
+    assert error.value.detail == "API модели не доступен"
+    assert called == []
+    assert db.get(JobSession, item.id).status == SessionStatus.CREATED
+
+
+@pytest.mark.asyncio
+async def test_start_model_status_exception_keeps_created_and_skips_launch(monkeypatch, db):
+    item = JobSession(profile_id=1, adapter_id="hh", desired_job_description="GameDev", status=SessionStatus.CREATED)
+    db.add(item)
+    db.commit()
+    monkeypatch.setattr(api.ModelGateway, "status", _status_error)
+    monkeypatch.setattr(api.workflow_manager, "launch", lambda _: pytest.fail("must not launch"))
+    with pytest.raises(api.HTTPException) as error:
+        await api.start_session(item.id, db)
+    assert error.value.status_code == 503
+    assert error.value.detail == "API модели не доступен"
+    assert db.get(JobSession, item.id).status == SessionStatus.CREATED
+
+
+async def _status_error(self):
+    raise RuntimeError("probe failed")
 
 
 def test_public_vacancies_hide_flag_matches(monkeypatch):

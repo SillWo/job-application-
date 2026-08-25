@@ -1,6 +1,9 @@
 import { ReactNode, useEffect, useId, useRef, useState } from "react";
 import { NavLink, Route, Routes, useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Toaster, toast } from "sonner";
+import { Popover } from "@base-ui/react/popover";
+import { Select } from "@base-ui/react/select";
 import { api } from "./api";
 import type {
   Adapter,
@@ -32,10 +35,8 @@ const RELEVANCE_CRITERIA: ReadonlyArray<{ key: string; title: string; maxPoints:
 const SESSION_DRAFT_STORAGE_KEY = "job-orchestrator.session-draft";
 type SessionDraft = {
   adapter: string;
-  viewedLimit: string;
   applicationLimit: string;
   desiredJobDescription: string;
-  unlimitedViewed: boolean;
   unlimitedApplications: boolean;
   influence: Record<string, InfluenceLevel>;
 };
@@ -49,10 +50,10 @@ function readSessionDraft(): Partial<SessionDraft> {
     const candidate = value as Record<string, unknown>;
     const draft: Partial<SessionDraft> = {};
     if (candidate.adapter === "hh" || candidate.adapter === "hirehi") draft.adapter = candidate.adapter;
-    for (const key of ["viewedLimit", "applicationLimit", "desiredJobDescription"] as const) {
+    for (const key of ["applicationLimit", "desiredJobDescription"] as const) {
       if (typeof candidate[key] === "string") draft[key] = candidate[key];
     }
-    for (const key of ["unlimitedViewed", "unlimitedApplications"] as const) {
+    for (const key of ["unlimitedApplications"] as const) {
       if (typeof candidate[key] === "boolean") draft[key] = candidate[key];
     }
     if (candidate.influence && typeof candidate.influence === "object") {
@@ -102,13 +103,54 @@ function presentationBreakdown(rows: ScoreComponent[]): ScoreComponent[] {
   });
 }
 
-const nav = [
-  ["/", "Обзор"],
-  ["/profile", "Профиль"],
-  ["/session", "Сессия"],
-  ["/vacancies", "Вакансии"],
-  ["/model", "Модель"],
-];
+const nav = [["/", "Обзор", "M4 12h16M12 4l8 8-8 8"], ["/profile", "Профиль", "M20 21a8 8 0 0 0-16 0M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8"], ["/session", "Сессия", "M4 6h16M4 12h16M4 18h16"], ["/vacancies", "Вакансии", "M6 3h9l3 3v15H6zM9 12h6M9 16h6"], ["/model", "Модель", "M4 6h16M4 12h16M4 18h16M8 4v4m8 2v4m-5 4v4"]] as const;
+const STATUS_META: Record<string, { label: string; tone: string }> = {
+  CREATED: { label: "Создана", tone: "neutral" }, RUNNING: { label: "В работе", tone: "success" }, EVALUATING: { label: "Оценка вакансии", tone: "info" }, WAITING_FOR_LOGIN: { label: "Ожидает входа", tone: "warning" }, PAUSED: { label: "Приостановлена", tone: "warning" }, STOPPED: { label: "Остановлена", tone: "neutral" }, COMPLETED: { label: "Завершена", tone: "success" }, FAILED: { label: "Ошибка", tone: "danger" }, UNKNOWN: { label: "Ошибка", tone: "danger" }, UNKNOWN_RESULT: { label: "Ошибка", tone: "danger" }, REJECTED_BY_MODEL: { label: "Отклонена моделью", tone: "danger" }, FILTERED_OUT: { label: "Отклонена моделью", tone: "danger" }, ERROR: { label: "Ошибка", tone: "danger" }, SUBMITTED: { label: "Отклик отправлен", tone: "success" }, REPORTED: { label: "В отчёте", tone: "success" }, ALREADY_APPLIED: { label: "Отклик отправлен", tone: "success" }, CONNECTED: { label: "Соединение есть", tone: "success" }, DISCONNECTED: { label: "Нет соединения", tone: "danger" },
+};
+function humanStatus(value: string) { return STATUS_META[value]?.label ?? value.replaceAll("_", " ").toLowerCase(); }
+function vacancyOutcome(value: string) {
+  if (value === "SUBMITTED") return "Отклик действительно отправлен после положительной оценки вакансии.";
+  if (value === "ALREADY_APPLIED") return "Новый отклик не отправлялся: вы уже откликались на эту вакансию.";
+  if (value === "REJECTED_BY_MODEL" || value === "FILTERED_OUT") return "Модель отклонила вакансию из-за недостаточной релевантности, поэтому отклик не отправлен.";
+  if (["ERROR", "FAILED", "UNKNOWN", "UNKNOWN_RESULT"].includes(value)) return "Отклик не отправлен из-за ошибки обработки вакансии.";
+  if (value === "REPORTED") return "Вакансия добавлена в отчёт, внешний отклик не отправлялся.";
+  return "Обработка вакансии ещё идёт.";
+}
+function humanRelevanceReason(reason: string, state: string) {
+  const cleaned = reason.replace(/\s*(?:Ограничения|Restrictions)\s*:.*/is, "").replace(/\s*(?:Evidence не прошло локальную лексическую проверку|grounding warning).*/i, "").trim();
+  const legacyGeneric = cleaned === "Оценка вакансии на основе резюме.";
+  if (!cleaned || legacyGeneric || /(?:минимум|minimum|score|confidence|evidence|threshold|flag|raw[_ ]?points|raw[_ ]?fields|grounding|локальную лексическую проверку)/i.test(cleaned) || /\d+\s*\/\s*\d+/.test(cleaned)) {
+    if (["SUBMITTED", "ALREADY_APPLIED", "REPORTED"].includes(state)) return "Вакансия в целом соответствует вашему профилю.";
+    if (["ERROR", "FAILED"].includes(state)) return "Вакансия оценена по резюме, но обработка не завершилась.";
+    return ["REJECTED_BY_MODEL", "FILTERED_OUT"].includes(state) ? "Вакансия недостаточно релевантна вашему профилю." : "Вакансия оценена по вашему резюме.";
+  }
+  return cleaned;
+}
+function humanCriterionExplanation(explanation: string) {
+  const cleaned = explanation.replace(/\s*(?:Evidence не прошло локальную лексическую проверку|grounding warning).*/i, "").trim();
+  return !cleaned || /(?:минимум|minimum|score|confidence|evidence|threshold|flag|raw[_ ]?points|raw[_ ]?fields|grounding)/i.test(cleaned) || /\d+\s*\/\s*\d+/.test(cleaned) ? "По этому критерию дополнительных пояснений нет." : cleaned;
+}
+function humanModelSummary(reason: string, state: string, rows: ScoreComponent[]) {
+  const cleanedReason = humanRelevanceReason(reason, state);
+  const legacy = reason.trim() === "Оценка вакансии на основе резюме." || cleanedReason === "Вакансия оценена по вашему резюме." || cleanedReason === "Вакансия недостаточно релевантна вашему профилю.";
+  if (!legacy) return cleanedReason;
+  const meaningful = rows
+    .filter((row) => ["tasks", "skills", "experience_depth", "required_years", "role_match", "industry", "languages", "special_requirements"].includes(row.key))
+    .map((row) => ({ row, text: humanCriterionExplanation(row.explanation) }))
+    .filter(({ text }) => text !== "По этому критерию дополнительных пояснений нет.")
+    .sort((a, b) => {
+      const ratio = (item: typeof a) => (typeof item.row.raw_points === "number" && typeof item.row.raw_max_points === "number") ? item.row.raw_points / (item.row.raw_max_points || 1) : item.row.points / (item.row.max_points || 1);
+      return ratio(a) - ratio(b);
+    });
+  const firstSentence = (text: string) => {
+    const sentence = text.match(/^.*?(?:[.!?](?=\s+[А-ЯЁA-Z]|$))/u)?.[0]?.trim() ?? text.trim();
+    return sentence ? (/[.!?]$/u.test(sentence) ? sentence : `${sentence}.`) : "";
+  };
+  const tasks = meaningful.find(({ row }) => row.key === "tasks");
+  const selected = tasks ? [tasks, ...meaningful.filter(({ row }) => row.key !== "tasks").slice(0, 1)] : meaningful.slice(0, 2);
+  const sentences = selected.map(({ text }) => firstSentence(text)).filter(Boolean);
+  return sentences.length ? sentences.join(" ") : cleanedReason;
+}
 
 function Shell({ children }: { children: ReactNode }) {
   return (
@@ -122,8 +164,9 @@ function Shell({ children }: { children: ReactNode }) {
           </div>
         </div>
         <nav className="topbar-nav" aria-label="Основная навигация">
-          {nav.map(([to, label]) => (
+          {nav.map(([to, label, path]) => (
             <NavLink key={to} to={to} end={to === "/"}>
+              <svg className="topbar-nav-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d={path} /></svg>
               {label}
             </NavLink>
           ))}
@@ -131,6 +174,7 @@ function Shell({ children }: { children: ReactNode }) {
         <div className="topbar-actions"><Notifications /><a href="/docs" target="_blank">API</a></div></div></header>
       <main>{children}
       </main>
+      <Toaster position="bottom-right" richColors closeButton className="app-toaster" />
     </div>
   );
 }
@@ -152,20 +196,43 @@ function Title({
     </div>
   );
 }
-function Empty({ children }: { children: ReactNode }) {
+function ChevronIcon({ className = "" }: { className?: string }) {
+  return <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m6 9 6 6 6-6" /></svg>;
+}
+function CloseIcon() {
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true" focusable="false"><path d="m6 6 12 12M18 6 6 18" /></svg>;
+}
+function Empty({ title = "Пока пусто", children, action, className = "" }: { title?: string; children: ReactNode; action?: ReactNode; className?: string }) {
   return (
-    <div className="empty">
-      <b>Пока пусто</b>
+    <div className={`empty ${className}`}>
+      <b>{title}</b>
       <p>{children}</p>
+      {action}
     </div>
   );
 }
+function Notice({ children, tone = "neutral", role }: { children: ReactNode; tone?: "neutral" | "success" | "warning" | "danger" | "info"; role?: "status" | "alert" }) {
+  return <p className={`notice notice-${tone}`} role={role ?? (tone === "danger" ? "alert" : "status")}>{children}</p>;
+}
 function Status({ value }: { value: string }) {
+  const meta = STATUS_META[value];
   return (
-    <span className={`status s-${value.toLowerCase()}`}>
-      {value.replaceAll("_", " ")}
+    <span className={`status status-${meta?.tone ?? "neutral"} s-${value.toLowerCase()}`} data-status={value}>
+      {humanStatus(value)}
     </span>
   );
+}
+
+type OverviewIconName = "arrow" | "check" | "scan" | "fileCheck" | "sliders";
+function OverviewIcon({ name }: { name: OverviewIconName }) {
+  const paths: Record<OverviewIconName, string> = {
+    arrow: "M5 12h14m-6-6 6 6-6 6",
+    check: "m5 12 4 4L19 6",
+    scan: "M3 7V5a2 2 0 0 1 2-2h2m10 0h2a2 2 0 0 1 2 2v2m0 10v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2m6-5a3 3 0 1 0 6 0 3 3 0 0 0-6 0m5 3 3 3",
+    fileCheck: "M6 3h9l3 3v15H6zM9 14l2 2 4-5",
+    sliders: "M4 6h16M4 12h16M4 18h16M8 4v4m8 2v4m-5 4v4",
+  };
+  return <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d={paths[name]} /></svg>;
 }
 
 function Dashboard() {
@@ -183,35 +250,58 @@ function Dashboard() {
     queryKey: ["sessions"],
     queryFn: () => api<JobSession[]>("/sessions"),
   });
-  const adapters = useQuery({
-    queryKey: ["adapters"],
-    queryFn: () => api<Adapter[]>("/adapters"),
+  const modelStatus = useQuery({
+    queryKey: ["model-status"],
+    queryFn: () => api<{ connected: boolean; model_available: boolean; model: string }>("/model/status"),
+    retry: false,
   });
   const active = sessions.data?.[0];
   const hasProfile = Boolean(profiles.data?.length);
   const hasResume = Boolean(dashboardResumes.data?.some((resume) => resume.selected_for_matching));
-  const activeStatus = active?.status?.replaceAll("_", " ") ?? "Нет активной сессии";
-  return (
-    <section className="page overview-page">
-      <div className="overview-hero">
+  const activeStatus = active ? humanStatus(active.status) : "Нет сессии";
+  const primaryHref = hasResume ? "/session" : "/profile";
+  const primaryLabel = hasResume ? "Запустить сессию" : "Настроить профиль";
+  const secondaryHref = "/model";
+  const secondaryLabel = "Добавить API модели";
+  const sessionReady = Boolean(active && ["RUNNING", "EVALUATING", "CREATED"].includes(active.status));
+  return <div className="overview-page">
+    <section className="overview-hero-section" aria-labelledby="overview-title">
+      <div className="overview-container overview-hero">
         <div className="overview-copy">
-          <span className="eyebrow">JOB ORCHESTRATOR · ЦЕНТР ПОИСКА</span>
-          <h1>Меньше шума.<br /><em>Больше подходящих вакансий.</em></h1>
-          <p>Соберите профиль один раз, а затем поручите ИИ найти и разобрать вакансии по вашим критериям. Вы всегда решаете, что делать дальше.</p>
-          <div className="overview-actions"><NavLink className="button-link overview-primary" to="/profile">Настроить профиль <span aria-hidden="true">→</span></NavLink><NavLink className="overview-text-link" to="/session">Открыть сессию</NavLink></div>
+          <span className="overview-eyebrow">JOB ORCHESTRATOR · ЦЕНТР ПОИСКА</span>
+          <h1 id="overview-title">Меньше шума.<br />Больше <em>подходящих</em> вакансий.</h1>
+          <p>Соберите профиль один раз, а затем поручите ИИ найти и разобрать вакансии по заданным критериям и лимитам. Вы наблюдаете за процессом и управляете условиями поиска.</p>
+          <div className="overview-actions">
+            <NavLink className="button-link overview-primary overview-quiet-control" to={primaryHref}>{primaryLabel} <OverviewIcon name="arrow" /></NavLink>
+            <NavLink className="overview-text-link overview-quiet-link" to={secondaryHref}>{secondaryLabel}</NavLink>
+          </div>
+          <div className="overview-status-strip" aria-label="Готовность к поиску">
+            <span className={modelStatus.data?.connected && modelStatus.data.model_available ? "is-done" : ""}><OverviewIcon name="check" />API модели {modelStatus.data?.connected && modelStatus.data.model_available ? "добавлен" : "не добавлен"}</span>
+            <span className={hasProfile ? "is-done" : ""}><OverviewIcon name="check" />Профиль {hasProfile ? "заполнен" : "не настроен"}</span>
+            <span className={hasResume ? "is-done" : ""}><OverviewIcon name="check" />Резюме {hasResume ? "выбрано" : "не выбрано"}</span>
+            <span><i key={`status-pulse-strip-${active?.status ?? "none"}`} className={sessionReady ? "overview-status-pulse" : ""} />Сессия {activeStatus.toLowerCase()}</span>
+          </div>
         </div>
         <div className="overview-preview" aria-label="Статус рабочего процесса">
-          <div className="preview-top"><span className="preview-dot" /> Рабочий процесс <span className="preview-live">{activeStatus}</span></div>
-          <div className="preview-job"><span className="preview-logo">J</span><div><strong>Подходящие вакансии</strong><small>Оценка по вашему профилю и запросу</small></div><b>{active ? "В работе" : "Готово"}</b></div>
-          <div className="preview-line"><i className={hasProfile ? "is-done" : ""}>✓</i><span>Профиль и резюме</span><small>{hasResume ? "Резюме выбрано" : "Нужно настроить"}</small></div>
-          <div className="preview-line"><i className={active ? "is-done" : ""}>✓</i><span>Поиск и оценка</span><small>{active ? activeStatus : "Запустите сессию"}</small></div>
-          <div className="preview-line"><i>3</i><span>Ваше решение</span><small>Проверить результат</small></div>
+          <div className="preview-top"><span key={`status-pulse-preview-${active?.status ?? "none"}`} className={`preview-dot${sessionReady ? " overview-status-pulse" : ""}`} />Рабочий процесс <span className="preview-live">{activeStatus}</span></div>
+          <div className="preview-job"><span className="preview-logo">J</span><div><strong>Подходящие вакансии</strong><small>Оценка по профилю и условиям сессии</small></div><b>{sessionReady ? "Оценивает" : active ? activeStatus : hasResume ? "Готово к запуску" : "Нужно настроить"}</b></div>
+          <div className="preview-lines">
+            <div className="preview-line"><i className={hasProfile ? "is-done" : ""}>{hasProfile ? "✓" : "1"}</i><span>Личный профиль</span><small>{hasProfile ? "Заполнен" : "Нужно настроить"}</small></div>
+            <div className="preview-line"><i className={hasResume ? "is-done" : ""}>{hasResume ? "✓" : "2"}</i><span>Выбранное резюме</span><small>{hasResume ? "Готово к оценке" : "Выберите резюме"}</small></div>
+            <div className="preview-line"><i className={sessionReady ? "is-done" : ""}>{sessionReady ? "✓" : "3"}</i><span>Наблюдение за сессией</span><small>{active ? activeStatus : "Настройте критерии и лимиты"}</small></div>
+          </div>
+          <div className="preview-proof">
+            <div className="preview-proof-head"><div><span>Вакансия на проверке</span><h2>Продуктовая роль</h2><p>Сопоставление с выбранным резюме</p></div><b>Разбор</b></div>
+            <div className="preview-proof-list">
+              <div><OverviewIcon name="fileCheck" /><p><strong>Опыт и задачи</strong><span>ИИ ищет подтверждение требований в опыте кандидата.</span></p></div>
+              <div><OverviewIcon name="sliders" /><p><strong>Критерии сессии</strong><span>Формат, роль и ограничения учитываются при оценке.</span></p></div>
+              <div><OverviewIcon name="scan" /><p><strong>Результат для просмотра</strong><span>Причины соответствия остаются видимыми пользователю.</span></p></div>
+            </div>
+          </div>
         </div>
       </div>
-      <div className="overview-benefits"><article><strong>01</strong><h2>Один профиль</h2><p>Опыт, навыки и пожелания — в одном месте.</p></article><article><strong>02</strong><h2>Умная оценка</h2><p>ИИ сравнивает вакансию с вашим реальным опытом.</p></article><article><strong>03</strong><h2>Два сценария</h2><p>HH.ru — работа с откликами. HireHi — сбор вакансий в PDF.</p></article></div>
-      <div className="overview-footer"><span>Ваши данные остаются под вашим контролем</span><span>Профиль → Сессия → Вакансии</span></div>
     </section>
-  );
+  </div>;
 }
 
 const blankPersonal: Omit<PersonalProfileData, "resumes"> = {
@@ -242,6 +332,21 @@ const educationOptions: Array<[EducationType, string]> = [
   ["secondary_vocational", "Среднее специальное"],
   ["school", "Школьное"],
 ];
+
+function SingleSelect({ options, value, onValueChange, label, placeholder, className, disabled }: { options: ReadonlyArray<readonly [string, string]>; value: string; onValueChange: (value: string) => void; label: string; placeholder?: string; className?: string; disabled?: boolean }) {
+  return <div className={`single-select ${className ?? ""}`}>
+    <span className="single-select-label">{label}</span>
+    <Select.Root items={options.map(([optionValue, optionLabel]) => ({ value: optionValue, label: optionLabel }))} value={value || null} onValueChange={(next) => onValueChange(next ?? "")} disabled={disabled}>
+      <Select.Trigger className="single-select-trigger" aria-label={label}>
+        <Select.Value className="single-select-value" placeholder={placeholder} />
+        <ChevronIcon className="single-select-chevron" />
+      </Select.Trigger>
+      <Select.Portal><Select.Positioner className="single-select-positioner" alignItemWithTrigger={false} sideOffset={6}><Select.Popup className="single-select-popup"><Select.List className="single-select-list">
+        {options.map(([optionValue, optionLabel]) => <Select.Item className="single-select-option" key={optionValue} value={optionValue}><Select.ItemText className="single-select-option-copy">{optionLabel}</Select.ItemText><Select.ItemIndicator className="single-select-indicator">✓</Select.ItemIndicator></Select.Item>)}
+      </Select.List></Select.Popup></Select.Positioner></Select.Portal>
+    </Select.Root>
+  </div>;
+}
 
 function newEducation(type: EducationType = "higher"): Education {
   return { type, institution: "", faculty: "", specialty: "", start_date: "", end_date: "", degree: null };
@@ -303,19 +408,19 @@ function PersonalEditor({
         <div className="section-heading"><div><h3>Контакты</h3><small>Телефон, email и список мессенджеров.</small></div><button type="button" className="secondary" onClick={() => change("contacts", { ...value.contacts, messengers: [...value.contacts.messengers, ""] })}>+ Мессенджер</button></div>
         <div className="repeat-list">
           <div className="profile-pair-row"><label className="profile-field">Телефон<input aria-label="Телефон" value={value.contacts.phone ?? ""} onChange={(e) => change("contacts", { ...value.contacts, phone: e.target.value })} /></label><label className="profile-field">Email<input aria-label="Email" value={value.contacts.email ?? ""} onChange={(e) => change("contacts", { ...value.contacts, email: e.target.value })} /></label></div>
-          {value.contacts.messengers.map((messenger, index) => <div className="profile-remove-row" key={index}><input className="profile-field" aria-label={`Мессенджер ${index + 1}`} value={messenger} onChange={(e) => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.map((item, itemIndex) => itemIndex === index ? e.target.value : item) })} placeholder="Telegram, WhatsApp или другой мессенджер" /><button type="button" className="icon-button" aria-label={`Удалить мессенджер ${index + 1}`} onClick={() => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div>)}
+          {value.contacts.messengers.map((messenger, index) => <div className="profile-remove-row animated-repeat-item" key={index}><input className="profile-field" aria-label={`Мессенджер ${index + 1}`} value={messenger} onChange={(e) => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.map((item, itemIndex) => itemIndex === index ? e.target.value : item) })} placeholder="Telegram, WhatsApp или другой мессенджер" /><button type="button" className="icon-button" aria-label={`Удалить мессенджер ${index + 1}`} onClick={(event) => delayedRemove(event, (currentIndex) => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.filter((_, itemIndex) => itemIndex !== currentIndex) }))}><CloseIcon /></button></div>)}
         </div>
       </div>
       <div className="subsection form-rail">
         <div className="section-heading"><div><h3>Образование</h3><small>Выберите тип для каждого учебного заведения.</small></div><button type="button" className="secondary" onClick={() => change("education", [...value.education, newEducation()])}>+ Образование</button></div>
         <div className="repeat-list">
-          {value.education.map((item, index) => <div className="nested-card education-card" key={index}>
-            <div className="profile-remove-row profile-education-header"><select className="profile-field" aria-label={`Тип образования ${index + 1}`} value={item.type} onChange={(e) => changeEducation(index, { type: e.target.value as EducationType })}>{educationOptions.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select><button type="button" className="icon-button" aria-label={`Удалить образование ${index + 1}`} onClick={() => change("education", value.education.filter((_, itemIndex) => itemIndex !== index))}>×</button></div>
+          {value.education.map((item, index) => <div className="nested-card education-card animated-repeat-item" key={index}>
+            <div className="profile-remove-row profile-education-header"><SingleSelect label={`Тип образования ${index + 1}`} options={educationOptions} value={item.type} onValueChange={(next) => changeEducation(index, { type: next as EducationType })} /><button type="button" className="icon-button" aria-label={`Удалить образование ${index + 1}`} onClick={(event) => delayedRemove(event, (currentIndex) => change("education", value.education.filter((_, itemIndex) => itemIndex !== currentIndex)))}><CloseIcon /></button></div>
             <div className={item.type === "school" ? "profile-full-field" : "profile-pair-row"}>
               <label className="profile-field">{item.type === "higher" ? "Университет" : "Учебное заведение"}<input value={item.institution} onChange={(e) => changeEducation(index, { institution: e.target.value })} /></label>
               {item.type !== "school" && <label className="profile-field">Факультет<input value={item.faculty ?? ""} onChange={(e) => changeEducation(index, { faculty: e.target.value })} /></label>}
             </div>
-            {item.type === "higher" && <label className="profile-full-field">Степень<select value={item.degree ?? ""} onChange={(e) => changeEducation(index, { degree: (e.target.value || null) as Degree | null })}><option value="">Выберите степень</option><option value="bachelor">Бакалавр</option><option value="master">Магистр</option><option value="specialist">Специалист</option><option value="postgraduate">Аспирант</option></select></label>}
+            {item.type === "higher" && <SingleSelect label="Степень" placeholder="Выберите степень" options={[["bachelor", "Бакалавр"], ["master", "Магистр"], ["specialist", "Специалист"], ["postgraduate", "Аспирант"]]} value={item.degree ?? ""} onValueChange={(next) => changeEducation(index, { degree: (next || null) as Degree | null })} />}
             {item.type !== "school" && <label className="profile-full-field">Специальность<input value={item.specialty ?? ""} onChange={(e) => changeEducation(index, { specialty: e.target.value })} /></label>}
             <div className="profile-pair-row"><label className="profile-field">Дата начала обучения<input type="month" value={item.start_date ?? ""} onChange={(e) => changeEducation(index, { start_date: e.target.value || null })} /></label><label className="profile-field">Дата окончания обучения<input type="month" value={item.end_date ?? ""} onChange={(e) => changeEducation(index, { end_date: e.target.value || null })} /></label></div>
           </div>)}
@@ -323,10 +428,10 @@ function PersonalEditor({
       </div>
       <div className="subsection form-rail">
         <div className="section-heading"><div><h3>Языки</h3><small>Язык и уровень владения.</small></div><button type="button" className="secondary" onClick={() => change("languages", [...value.languages, { language: "", proficiency: "" }])}>+ Язык</button></div>
-        <div className="repeat-list">{value.languages.map((language, index) => <div className="profile-pair-remove-row" key={index}><input className="profile-field" aria-label={`Язык ${index + 1}`} value={language.language} onChange={(e) => changeLanguage(index, { language: e.target.value })} placeholder="Например, английский" /><input className="profile-field" aria-label={`Уровень языка ${index + 1}`} value={language.proficiency} onChange={(e) => changeLanguage(index, { proficiency: e.target.value })} placeholder="Например, B2" /><button type="button" className="icon-button" aria-label={`Удалить язык ${index + 1}`} onClick={() => change("languages", value.languages.filter((_, itemIndex) => itemIndex !== index))}>×</button></div>)}</div>
+          <div className="repeat-list">{value.languages.map((language, index) => <div className="profile-pair-remove-row animated-repeat-item" key={index}><input className="profile-field" aria-label={`Язык ${index + 1}`} value={language.language} onChange={(e) => changeLanguage(index, { language: e.target.value })} placeholder="Например, английский" /><input className="profile-field" aria-label={`Уровень языка ${index + 1}`} value={language.proficiency} onChange={(e) => changeLanguage(index, { proficiency: e.target.value })} placeholder="Например, B2" /><button type="button" className="icon-button" aria-label={`Удалить язык ${index + 1}`} onClick={(event) => delayedRemove(event, (currentIndex) => change("languages", value.languages.filter((_, itemIndex) => itemIndex !== currentIndex)))}><CloseIcon /></button></div>)}</div>
       </div>
       <label className="checkline"><input type="checkbox" checked={value.driver_license ?? false} onChange={(e) => change("driver_license", e.target.checked)} /> Есть водительские права</label>
-      <div className="actions"><button type="button" onClick={onSave} disabled={saving}>{saving ? "Сохраняю…" : "Сохранить личный профиль"}</button></div>
+      <div className="actions sticky-actions profile-save-bar"><button type="button" className="primary" onClick={onSave} disabled={saving}>{saving ? "Сохраняю…" : "Сохранить личный профиль"}</button></div>
       </div>
     </article>
   );
@@ -348,13 +453,14 @@ function MultiSelect({
   const [open, setOpen] = useState(false);
   const listId = useId();
   const selectedLabels = options.filter(([value]) => values.includes(value)).map(([, optionLabel]) => optionLabel);
-  return <div className="multi-select field-wide">
-    <button type="button" className="multi-select-trigger" aria-label={label} aria-expanded={open} aria-controls={listId} onClick={() => setOpen((current) => !current)}>
+  return <Popover.Root open={open} onOpenChange={setOpen}>
+  <div className="multi-select field-wide">
+    <Popover.Trigger render={<button type="button" className="multi-select-trigger" aria-label={label} aria-controls={listId} />}>
       <span className="multi-select-trigger-copy"><span className="multi-select-label">{label}</span><span className="multi-select-value">{selectedLabels.join(", ") || "Выберите варианты"}</span></span>
-      <span className={`multi-select-chevron${open ? " is-open" : ""}`} aria-hidden="true">⌄</span>
-    </button>
+      <ChevronIcon className={`multi-select-chevron${open ? " is-open" : ""}`} />
+    </Popover.Trigger>
     {hint && <small className="multi-select-hint">{hint}</small>}
-    {open && <div className="multi-select-popover" id={listId}>
+    <Popover.Portal><Popover.Positioner className="multi-select-positioner"><Popover.Popup className="multi-select-popover" id={listId}>
       <div className="multi-select-options">
         {options.map(([value, optionLabel]) => <label className={`multi-select-option${values.includes(value) ? " is-selected" : ""}`} key={value}>
           <input type="checkbox" checked={values.includes(value)} onChange={() => onToggle(value)} />
@@ -362,8 +468,8 @@ function MultiSelect({
         </label>)}
       </div>
       <button type="button" className="multi-select-confirm" onClick={() => setOpen(false)}>Выбрать</button>
-    </div>}
-  </div>;
+    </Popover.Popup></Popover.Positioner></Popover.Portal>
+  </div></Popover.Root>;
 }
 
 export function Notifications() {
@@ -406,18 +512,30 @@ export function Notifications() {
     }
   };
   const readAll = async () => { if (unread) { await api("/notifications/read-all", { method: "POST" }); await query.refetch(); } };
-  return <div className="notifications" onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setOpen(false); }}>
-    <button type="button" className="notification-trigger" aria-label="Уведомления" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+  return <Popover.Root open={open} onOpenChange={setOpen}><div className="notifications">
+    <Popover.Trigger render={<button type="button" className="notification-trigger" aria-label="Уведомления" />}>
       <svg className="notification-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
         <path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
         <path d="M10 21h4" />
       </svg>{unread > 0 && <i role="status" className="notification-badge" aria-label={`${unread} непрочитанных`} />}
-    </button>
-    {open && <div className="notification-popover" role="dialog" aria-label="Уведомления">
+    </Popover.Trigger>
+    <Popover.Portal><Popover.Positioner className="notification-positioner"><Popover.Popup className="notification-popover" role="dialog" aria-label="Уведомления">
       <div className="notification-head"><strong>Уведомления</strong><button type="button" onClick={() => void readAll()} disabled={!unread}>Прочитать все</button></div>
       {query.isLoading ? <p className="notification-empty">Загрузка…</p> : notifications.length === 0 ? <p className="notification-empty">Новых уведомлений нет</p> : <div className="notification-list">{notifications.map((item) => <button type="button" className={`notification-item${item.read_at ? "" : " unread"}`} key={item.id} onClick={() => void markRead(item)}><strong>{item.title}</strong><span>{item.message}</span><time dateTime={item.created_at}>{new Date(item.created_at).toLocaleString("ru-RU")}</time></button>)}</div>}
-    </div>}
-  </div>;
+    </Popover.Popup></Popover.Positioner></Popover.Portal>
+  </div></Popover.Root>;
+}
+function delayedRemove(event: React.MouseEvent<HTMLButtonElement>, remove: (currentIndex: number) => void) {
+  const button = event.currentTarget;
+  const item = button.closest<HTMLElement>(".animated-repeat-item");
+  if (!item || item.dataset.removing === "true") return;
+  const getCurrentIndex = () => {
+    const parent = item.parentElement;
+    return parent ? Array.from(parent.children).filter((child) => child.classList.contains("animated-repeat-item")).indexOf(item) : -1;
+  };
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) { remove(getCurrentIndex()); return; }
+  item.dataset.removing = "true"; item.classList.add("is-removing"); button.disabled = true;
+  window.setTimeout(() => remove(getCurrentIndex()), 120);
 }
 
 function ResumeEditor({ value, onSave, onCancel, saving }: { value: Resume; onSave: (value: Resume) => void; onCancel: () => void; saving: boolean }) {
@@ -429,18 +547,18 @@ function ResumeEditor({ value, onSave, onCancel, saving }: { value: Resume; onSa
   const toggleEmployment = (type: EmploymentType) => update({ employment_types: draft.employment_types.includes(type) ? draft.employment_types.filter((item) => item !== type) : [...draft.employment_types, type] });
   const updateExperience = (index: number, next: Partial<WorkExperience>) => update({ experiences: draft.experiences.map((item, itemIndex) => itemIndex === index ? { ...item, ...next } : item) });
   return <article className="panel form resume-editor">
-    <div className="panelhead"><div><span className="eyebrow">БЛОК 2</span><h2>{draft.id ? "Редактирование резюме" : "Новое резюме"}</h2></div><button type="button" className="icon-button" onClick={onCancel} aria-label="Закрыть редактор резюме">×</button></div>
+    <div className="panelhead"><div><span className="eyebrow">БЛОК 2</span><h2>{draft.id ? "Редактирование резюме" : "Новое резюме"}</h2></div><button type="button" className="icon-button" onClick={onCancel} aria-label="Закрыть редактор резюме"><CloseIcon /></button></div>
     <div className="form-content">
     <label className="field-medium">Название резюме<input value={draft.name} onChange={(e) => update({ name: e.target.value })} placeholder="Например, Product Manager" /></label>
     <div className="row form-row"><label className="field-medium">Предполагаемая должность<input value={draft.desired_title ?? ""} onChange={(e) => update({ desired_title: e.target.value })} /></label><label className="field-compact">Желаемый доход<input value={draft.desired_salary ?? ""} onChange={(e) => update({ desired_salary: e.target.value })} placeholder="Например, 180 000 ₽" /></label></div>
     <MultiSelect label="Желаемый тип занятости" options={employmentOptions} values={draft.employment_types} onToggle={(type) => toggleEmployment(type as EmploymentType)} />
     <MultiSelect label="Формат работы" hint="Можно выбрать несколько вариантов." options={formatOptions} values={draft.work_formats} onToggle={(format) => update({ work_formats: draft.work_formats.includes(format) ? draft.work_formats.filter((item) => item !== format) : [...draft.work_formats, format] })} />
-    <label className="field-compact">Командировки<select value={draft.business_trips === null || draft.business_trips === undefined ? "" : draft.business_trips ? "can" : "cannot"} onChange={(e) => update({ business_trips: e.target.value === "" ? null : e.target.value === "can" })}><option value="">Выберите вариант</option><option value="can">Могу</option><option value="cannot">Не могу</option></select></label>
-    <div className="subsection form-rail"><div className="section-heading"><div><h3>Опыт работы</h3><small>Добавьте должности и обязанности.</small></div><button type="button" className="secondary" onClick={() => update({ experiences: [...draft.experiences, newExperience()] })}>+ Опыт</button></div><div className="repeat-list">{draft.experiences.map((experience, index) => <div className="nested-card experience-card" key={index}><div className="repeat-row"><strong>Опыт #{index + 1}</strong><button type="button" className="icon-button" aria-label={`Удалить опыт ${index + 1}`} onClick={() => update({ experiences: draft.experiences.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div><div className="row form-row"><label className="field-medium">Компания<input value={experience.company} onChange={(e) => updateExperience(index, { company: e.target.value })} /></label><label className="field-medium">Должность<input value={experience.position} onChange={(e) => updateExperience(index, { position: e.target.value })} /></label></div><div className="row form-row"><label className="field-compact">Начало работы<input type="month" value={experience.start_date ?? ""} onChange={(e) => updateExperience(index, { start_date: e.target.value || null })} /></label><label className="field-compact">Конец работы<input type="month" value={experience.end_date ?? ""} onChange={(e) => updateExperience(index, { end_date: e.target.value || null })} placeholder="Оставьте пустым, если работаете сейчас" /></label></div><label className="field-prose">Описание обязанностей<textarea value={experience.duties} onChange={(e) => updateExperience(index, { duties: e.target.value })} /></label></div>)}</div></div>
+    <SingleSelect className="field-compact" label="Командировки" placeholder="Выберите вариант" options={[["can", "Могу"], ["cannot", "Не могу"]]} value={draft.business_trips === null || draft.business_trips === undefined ? "" : draft.business_trips ? "can" : "cannot"} onValueChange={(next) => update({ business_trips: next === "" ? null : next === "can" })} />
+    <div className="subsection form-rail"><div className="section-heading"><div><h3>Опыт работы</h3><small>Добавьте должности и обязанности.</small></div><button type="button" className="secondary" onClick={() => update({ experiences: [...draft.experiences, newExperience()] })}>+ Опыт</button></div><div className="repeat-list">{draft.experiences.map((experience, index) => <div className="nested-card experience-card animated-repeat-item" key={index}><div className="repeat-row"><strong>Опыт #{index + 1}</strong><button type="button" className="icon-button" aria-label={`Удалить опыт ${index + 1}`} onClick={(event) => delayedRemove(event, (currentIndex) => update({ experiences: draft.experiences.filter((_, itemIndex) => itemIndex !== currentIndex) }))}><CloseIcon /></button></div><div className="row form-row"><label className="field-medium">Компания<input value={experience.company} onChange={(e) => updateExperience(index, { company: e.target.value })} /></label><label className="field-medium">Должность<input value={experience.position} onChange={(e) => updateExperience(index, { position: e.target.value })} /></label></div><div className="row form-row"><label className="field-compact">Начало работы<input type="month" value={experience.start_date ?? ""} onChange={(e) => updateExperience(index, { start_date: e.target.value || null })} /></label><label className="field-compact">Конец работы<input type="month" value={experience.end_date ?? ""} onChange={(e) => updateExperience(index, { end_date: e.target.value || null })} placeholder="Оставьте пустым, если работаете сейчас" /></label></div><label className="field-prose">Описание обязанностей<textarea className="experience-duties" aria-label={`Описание обязанностей ${index + 1}`} value={experience.duties} onChange={(e) => updateExperience(index, { duties: e.target.value })} /></label></div>)}</div></div>
     <label className="field-wide">Навыки<small>Введите навыки через запятую — каждый станет отдельным тегом.</small><input value={skillsText} onChange={(e) => setSkillsText(e.target.value)} placeholder="CustDev, Scrum, аналитика" /></label>
     <div className="tag-list field-wide" aria-label="Навыки">{skillsText.split(",").map((skill) => skill.trim()).filter(Boolean).map((skill) => <span className="tag" key={skill}>{skill}</span>)}</div>
     <label className="field-prose">О себе<textarea className="about-text" value={draft.about} onChange={(e) => { const words = e.target.value.trim() ? e.target.value.trim().split(/\s+/u) : []; if (words.length <= 500) update({ about: e.target.value }); }} /><small className={wordCount > 500 ? "word-limit" : ""}>{wordCount} / 500 слов</small></label>
-    <div className="actions form-rail"><button type="button" onClick={() => onSave({ ...draft, skills: skillsText.split(",").map((skill) => skill.trim()).filter(Boolean) })} disabled={saving}>{saving ? "Сохраняю…" : "Сохранить резюме"}</button><button type="button" className="secondary" onClick={onCancel}>Отмена</button></div>
+    <div className="actions form-rail sticky-actions"><button type="button" className="primary" onClick={() => onSave({ ...draft, skills: skillsText.split(",").map((skill) => skill.trim()).filter(Boolean) })} disabled={saving}>{saving ? "Сохраняю…" : "Сохранить резюме"}</button><button type="button" className="secondary" onClick={onCancel}>Отмена</button></div>
     </div>
   </article>;
 }
@@ -453,6 +571,7 @@ function ProfilePage() {
   const [personal, setPersonal] = useState<Omit<PersonalProfileData, "resumes">>(blankPersonal);
   const [editingResume, setEditingResume] = useState<Resume | null>(null);
   const [message, setMessage] = useState("");
+  const [messageTone, setMessageTone] = useState<"neutral" | "success" | "warning" | "danger" | "info">("neutral");
   useEffect(() => { if (current) { const data = { ...current.data }; delete data.resumes; setPersonal({ ...blankPersonal, ...data, contacts: { ...blankPersonal.contacts, ...data.contacts, messengers: data.contacts?.messengers ?? [] }, job_search_locations: data.job_search_locations ?? [], education: data.education ?? [], languages: data.languages ?? [] }); } }, [current]);
   const personalPayload = (value: Omit<PersonalProfileData, "resumes">) => ({
     full_name: value.full_name || null,
@@ -471,21 +590,21 @@ function ProfilePage() {
     driver_license: value.driver_license ?? null,
   });
   const resumePayload = (resume: Resume) => ({ name: resume.name, desired_title: resume.desired_title || null, desired_salary: resume.desired_salary || null, employment_types: resume.employment_types, work_formats: resume.work_formats, business_trips: resume.business_trips ?? null, experiences: resume.experiences.map(({ company, position, start_date, end_date, duties }) => ({ company, position, start_date: start_date || null, end_date: end_date || null, duties })), skills: resume.skills, about: resume.about, selected_for_matching: resume.selected_for_matching });
-  const savePersonal = useMutation({ mutationFn: () => current ? api<Profile>(`/profiles/${current.id}`, { method: "PATCH", body: JSON.stringify(personalPayload(personal)) }) : api<Profile>("/profiles", { method: "POST", body: JSON.stringify(personalPayload(personal)) }), onSuccess: async () => { setMessage("Личный профиль сохранён."); await qc.invalidateQueries({ queryKey: ["profiles"] }); }, onError: (e) => setMessage(e.message) });
-  const saveResume = useMutation({ mutationFn: (resume: Resume) => current ? resume.id ? api<Resume>(`/profiles/${current.id}/resumes/${resume.id}`, { method: "PATCH", body: JSON.stringify(resumePayload(resume)) }) : api<Resume>(`/profiles/${current.id}/resumes`, { method: "POST", body: JSON.stringify(resumePayload(resume)) }) : Promise.reject(new Error("Сначала создайте профиль.")), onSuccess: async () => { setEditingResume(null); setMessage("Резюме сохранено."); await qc.invalidateQueries({ queryKey: ["resumes", current?.id] }); }, onError: (e) => setMessage(e.message) });
-  const removeResume = useMutation({ mutationFn: (id: number) => current ? api(`/profiles/${current.id}/resumes/${id}`, { method: "DELETE" }) : Promise.reject(new Error("Профиль не найден.")), onSuccess: async () => { setMessage("Резюме удалено."); await qc.invalidateQueries({ queryKey: ["resumes", current?.id] }); }, onError: (e) => setMessage(e.message) });
-  const upload = useMutation({ mutationFn: async (file: File) => { if (!current) throw new Error("Сначала сохраните личный профиль."); const body = new FormData(); body.append("file", file); return api<{ profile: Profile; resume: Resume }>(`/profiles/${current.id}/resumes/import`, { method: "POST", body }); }, onMutate: (file) => setMessage(`Файл «${file.name}» принят. Заполняем профиль и отдельное резюме…`), onSuccess: async (result) => { qc.setQueryData<Profile[]>(["profiles"], (items = []) => [result.profile, ...items.filter((item) => item.id !== result.profile.id)]); qc.setQueryData<Resume[]>(["resumes", result.profile.id], (items = []) => [result.resume, ...items.filter((item) => item.id !== result.resume.id)]); setMessage(`Импорт «${result.resume.name || result.resume.original_filename || "резюме"}» завершён. Проверьте и отредактируйте поля.`); await qc.invalidateQueries({ queryKey: ["profiles"] }); }, onError: (e) => setMessage(e.message) });
-  const toggleSelected = async (resume: Resume) => { if (!current) return; try { await api<Resume>(`/profiles/${current.id}/resumes/${resume.id}`, { method: "PATCH", body: JSON.stringify(resumePayload({ ...resume, selected_for_matching: !resume.selected_for_matching })) }); await qc.invalidateQueries({ queryKey: ["resumes", current.id] }); } catch (error) { setMessage(error instanceof Error ? error.message : "Не удалось изменить выбор резюме"); } };
+  const savePersonal = useMutation({ mutationFn: () => current ? api<Profile>(`/profiles/${current.id}`, { method: "PATCH", body: JSON.stringify(personalPayload(personal)) }) : api<Profile>("/profiles", { method: "POST", body: JSON.stringify(personalPayload(personal)) }), onSuccess: async () => { setMessageTone("success"); setMessage("Личный профиль сохранён."); toast.success("Личный профиль сохранён"); await qc.invalidateQueries({ queryKey: ["profiles"] }); }, onError: (e) => { setMessageTone("danger"); setMessage(e.message); toast.error(e.message); } });
+  const saveResume = useMutation({ mutationFn: (resume: Resume) => current ? resume.id ? api<Resume>(`/profiles/${current.id}/resumes/${resume.id}`, { method: "PATCH", body: JSON.stringify(resumePayload(resume)) }) : api<Resume>(`/profiles/${current.id}/resumes`, { method: "POST", body: JSON.stringify(resumePayload(resume)) }) : Promise.reject(new Error("Сначала создайте профиль.")), onSuccess: async () => { setMessageTone("success"); setEditingResume(null); setMessage("Резюме сохранено."); toast.success("Резюме сохранено"); await qc.invalidateQueries({ queryKey: ["resumes", current?.id] }); }, onError: (e) => { setMessageTone("danger"); setMessage(e.message); toast.error(e.message); } });
+  const removeResume = useMutation({ mutationFn: (id: number) => current ? api(`/profiles/${current.id}/resumes/${id}`, { method: "DELETE" }) : Promise.reject(new Error("Профиль не найден.")), onSuccess: async () => { setMessageTone("success"); setMessage("Резюме удалено."); toast.success("Резюме удалено"); await qc.invalidateQueries({ queryKey: ["resumes", current?.id] }); }, onError: (e) => { setMessageTone("danger"); setMessage(e.message); toast.error(e.message); } });
+  const upload = useMutation({ mutationFn: async (file: File) => { if (!current) throw new Error("Сначала сохраните личный профиль."); const body = new FormData(); body.append("file", file); return api<{ profile: Profile; resume: Resume }>(`/profiles/${current.id}/resumes/import`, { method: "POST", body }); }, onMutate: (file) => { setMessageTone("info"); setMessage(`Файл «${file.name}» принят. Заполняем профиль и отдельное резюме…`); }, onSuccess: async (result) => { qc.setQueryData<Profile[]>(["profiles"], (items = []) => [result.profile, ...items.filter((item) => item.id !== result.profile.id)]); qc.setQueryData<Resume[]>(["resumes", result.profile.id], (items = []) => [result.resume, ...items.filter((item) => item.id !== result.resume.id)]); setMessageTone("success"); setMessage(`Импорт «${result.resume.name || result.resume.original_filename || "резюме"}» завершён. Проверьте и отредактируйте поля.`); toast.success("Импорт резюме завершён"); await qc.invalidateQueries({ queryKey: ["profiles"] }); }, onError: (e) => { setMessageTone("danger"); setMessage(e.message); toast.error(e.message); } });
+  const toggleSelected = async (resume: Resume) => { if (!current) return; try { await api<Resume>(`/profiles/${current.id}/resumes/${resume.id}`, { method: "PATCH", body: JSON.stringify(resumePayload({ ...resume, selected_for_matching: !resume.selected_for_matching })) }); await qc.invalidateQueries({ queryKey: ["resumes", current.id] }); } catch (error) { setMessageTone("danger"); setMessage(error instanceof Error ? error.message : "Не удалось изменить выбор резюме"); } };
   return <section className="page">
     <Title eyebrow="ПРОФИЛЬ КАНДИДАТА" note="Заполните личные данные один раз, а затем создавайте отдельные резюме под разные направления поиска. Только выбранные резюме попадут в оценку вакансий.">Профиль и резюме под вашим контролем</Title>
-    {!current && <article className="panel empty-profile"><h2>Создайте личный профиль</h2><p>Начните с личной информации. После сохранения можно импортировать PDF, DOCX или TXT и отредактировать результат.</p><button type="button" onClick={() => savePersonal.mutate()} disabled={savePersonal.isPending}>{savePersonal.isPending ? "Создаём…" : "Создать профиль"}</button></article>}
+    {!current && <Empty title="Создайте личный профиль" className="panel empty-profile" action={<button type="button" className="primary" onClick={() => savePersonal.mutate()} disabled={savePersonal.isPending}>{savePersonal.isPending ? "Создаём…" : "Создать профиль"}</button>}>Начните с личной информации. После сохранения можно импортировать PDF, DOCX или TXT и отредактировать результат.</Empty>}
     {current && <>
       <label className={`upload ${upload.isPending ? "busy" : ""}`}><input type="file" accept=".pdf,.docx,.txt" aria-label="Импортировать резюме" disabled={upload.isPending} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file) upload.mutate(file); }} /><span>{upload.isPending ? `Обрабатываем «${upload.variables?.name}»…` : "Импортировать PDF, DOCX или TXT"}</span><small>Парсер заполнит личный профиль и создаст отдельное резюме. После импорта проверьте поля.</small></label>
-      {message && <p className={`notice ${upload.isError || savePersonal.isError ? "error" : ""}`} role="status">{message}</p>}
+      {message && <Notice tone={messageTone}>{message}</Notice>}
       <PersonalEditor value={personal} onChange={setPersonal} onSave={() => savePersonal.mutate()} saving={savePersonal.isPending} />
-      <section className="resume-section"><div className="section-heading resume-section-heading"><div><span className="eyebrow">БЛОК 2</span><h2>Мои резюме</h2><p>Отметьте одно или несколько резюме, которые передавать ИИ при оценке релевантности вакансий.</p></div><button type="button" onClick={() => setEditingResume(newResume(current.id))}>+ Создать резюме</button></div>
+      <section className="resume-section"><div className="section-heading resume-section-heading"><div><span className="eyebrow">БЛОК 2</span><h2>Мои резюме</h2><p>Отметьте одно или несколько резюме, которые передавать ИИ при оценке релевантности вакансий.</p></div><button type="button" className="primary" onClick={() => setEditingResume(newResume(current.id))}>+ Создать резюме</button></div>
         {editingResume && <ResumeEditor value={editingResume} onSave={(value) => saveResume.mutate(value)} onCancel={() => setEditingResume(null)} saving={saveResume.isPending} />}
-        {resumes.data?.length ? <div className="resume-grid">{resumes.data.map((resume) => <article className={`panel resume-card ${resume.selected_for_matching ? "selected" : ""}`} key={resume.id}><div className="resume-card-top"><div><span className="eyebrow">РЕЗЮМЕ</span><h3>{resume.name || resume.desired_title || "Без названия"}</h3></div><label className="selection-control"><input type="checkbox" checked={resume.selected_for_matching} onChange={() => void toggleSelected(resume)} /> Передавать модели</label></div><div className="resume-meta"><span>{resume.desired_title || "Должность не указана"}</span><span>{resume.skills?.length ?? 0} навыков</span><span>{resume.experiences?.length ?? 0} мест опыта</span></div><p>{resume.about || "Добавьте короткое описание о себе как о работнике."}</p><div className="tag-list">{resume.skills?.slice(0, 8).map((skill) => <span className="tag" key={skill}>{skill}</span>)}</div><div className="actions"><button type="button" className="secondary" onClick={() => setEditingResume(resume)}>Редактировать</button><button type="button" className="danger" onClick={() => { if (window.confirm("Удалить это резюме?")) removeResume.mutate(resume.id); }}>Удалить</button></div></article>)}</div> : <div className="empty"><b>Резюме пока нет</b><p>Создайте резюме вручную или импортируйте файл сверху.</p></div>}
+        {resumes.data?.length ? <div className="resume-grid">{resumes.data.map((resume) => <article className={`panel resume-card ${resume.selected_for_matching ? "selected" : ""}`} key={resume.id}><div className="resume-card-top"><div><span className="eyebrow">РЕЗЮМЕ</span><h3>{resume.name || resume.desired_title || "Без названия"}</h3></div><label className="selection-control"><input type="checkbox" checked={resume.selected_for_matching} onChange={() => void toggleSelected(resume)} /> Передавать модели</label></div><div className="resume-meta"><span>{resume.desired_title || "Должность не указана"}</span><span>{resume.skills?.length ?? 0} навыков</span><span>{resume.experiences?.length ?? 0} мест опыта</span></div><p>{resume.about || "Добавьте короткое описание о себе как о работнике."}</p><div className="tag-list">{resume.skills?.slice(0, 8).map((skill) => <span className="tag" key={skill}>{skill}</span>)}</div><div className="actions"><button type="button" className="secondary" onClick={() => setEditingResume(resume)}>Редактировать</button><button type="button" className="danger" onClick={() => { if (window.confirm("Удалить это резюме?")) removeResume.mutate(resume.id); }}>Удалить</button></div></article>)}</div> : <Empty title="Резюме пока нет">Создайте резюме вручную или импортируйте файл сверху.</Empty>}
       </section>
     </>}
   </section>;
@@ -516,33 +635,38 @@ function SessionPage() {
   );
   const [adapter, setAdapter] = useState(() => readSessionDraft().adapter || "hh");
   const blockedByAdapter = (sessions.data ?? []).some((session) => session.adapter_id === adapter && !terminalStatuses.includes(session.status));
-  const [viewedLimit, setViewedLimit] = useState(() => readSessionDraft().viewedLimit || "30");
   const [applicationLimit, setApplicationLimit] = useState(() => readSessionDraft().applicationLimit || "5");
   const [desiredJobDescription, setDesiredJobDescription] = useState(() => readSessionDraft().desiredJobDescription || "");
-  const [unlimitedViewed, setUnlimitedViewed] = useState(() => readSessionDraft().unlimitedViewed || false);
   const [unlimitedApplications, setUnlimitedApplications] = useState(() => readSessionDraft().unlimitedApplications || false);
   const [influence, setInfluence] = useState<Record<string, InfluenceLevel>>(() => ({ tasks: "medium", skills: "low", experience_depth: "medium", role_match: "medium", industry: "medium", ...readSessionDraft().influence }));
   useEffect(() => {
     try {
-      window.localStorage.setItem(SESSION_DRAFT_STORAGE_KEY, JSON.stringify({ adapter, viewedLimit, applicationLimit, desiredJobDescription, unlimitedViewed, unlimitedApplications, influence }));
+      window.localStorage.setItem(SESSION_DRAFT_STORAGE_KEY, JSON.stringify({ adapter, applicationLimit, desiredJobDescription, unlimitedApplications, influence }));
     } catch {
       // Storage may be unavailable in private browsing; the form remains usable.
     }
-  }, [adapter, viewedLimit, applicationLimit, desiredJobDescription, unlimitedViewed, unlimitedApplications, influence]);
+  }, [adapter, applicationLimit, desiredJobDescription, unlimitedApplications, influence]);
   const [message, setMessage] = useState("");
+  const [messageTone, setMessageTone] = useState<"neutral" | "success" | "warning" | "danger" | "info">("neutral");
   const validLimit = (value: string, unlimited: boolean) =>
     unlimited || /^[1-9]\d*$/.test(value);
-  const limitsAreValid =
-    validLimit(viewedLimit, unlimitedViewed) &&
-    validLimit(applicationLimit, unlimitedApplications);
+  const limitsAreValid = validLimit(applicationLimit, unlimitedApplications);
   const create = useMutation({
     mutationFn: async () => {
+      let status: { connected: boolean; model_available: boolean };
+      try {
+        status = await api<{ connected: boolean; model_available: boolean }>("/model/status");
+      } catch {
+        throw new Error("API модели не доступен");
+      }
+      if (status.connected !== true || status.model_available !== true) {
+        throw new Error("API модели не доступен");
+      }
       const session = await api<JobSession>("/sessions", {
         method: "POST",
         body: JSON.stringify({
           profile_id: profiles.data?.[0]?.id,
           adapter_id: adapter,
-          viewed_limit: unlimitedViewed ? null : Number(viewedLimit),
           application_limit: unlimitedApplications ? null : Number(applicationLimit),
           desired_job_description: desiredJobDescription.trim(),
           minimum_scores: { ...Object.fromEntries(Object.entries(influence).map(([key, level]) => [key, INFLUENCE_LEVELS.indexOf(level) + 1])), special_requirements: 1 },
@@ -552,15 +676,17 @@ function SessionPage() {
       return session;
     },
     onSuccess: (session) => {
+      setMessageTone("success");
       setMessage(
         session.adapter_id === "hh"
           ? `Сессия #${session.id} запущена. Откройте браузер и войдите в HH.ru.`
           : `Сессия #${session.id} запущена.`,
       );
+      toast.success(`Сессия #${session.id} запущена`);
       void qc.invalidateQueries({ queryKey: ["sessions"] });
       void qc.invalidateQueries({ queryKey: ["session-report"] });
     },
-    onError: (error) => setMessage(error.message),
+    onError: (error) => { const message = error instanceof Error ? error.message : "Не удалось выполнить действие"; setMessageTone("danger"); setMessage(message); toast.error(message); },
   });
   const action = async (sessionId: number, name: string) => {
     try {
@@ -568,18 +694,20 @@ function SessionPage() {
         `/sessions/${sessionId}/${name}`,
         { method: "POST" },
       );
+      setMessageTone("success");
       setMessage(
         response.message ||
           (name === "start" ? "Сессия запущена." : "Состояние сессии обновлено."),
       );
+      toast.success(response.message || "Состояние сессии обновлено");
       await qc.invalidateQueries({ queryKey: ["sessions"] });
       await qc.invalidateQueries({ queryKey: ["session-report"] });
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Не удалось выполнить действие");
+      const message = error instanceof Error ? error.message : "Не удалось выполнить действие"; setMessageTone("danger"); setMessage(message); toast.error(message);
     }
   };
-  const formatSessionLimit = (limit: number | null | undefined, legacyDefault: number): string =>
-    limit === null ? "без ограничений" : String(limit ?? legacyDefault);
+  const formatSessionLimit = (limit: number | null | undefined): string =>
+    limit === null ? "без ограничений" : String(limit ?? "—");
   const visibleSessions = (sessions.data ?? []).filter((session) => !terminalStatuses.includes(session.status));
   const completedSessions = (sessions.data ?? []).filter((session) => terminalStatuses.includes(session.status));
   return (
@@ -592,16 +720,13 @@ function SessionPage() {
       </Title>
         <article className="panel form">
           <span className="eyebrow">НОВАЯ СЕССИЯ</span>
-          <div className="row">
+          <div className="row session-top-row">
+            <SingleSelect label="Сайт" options={[['hh', 'HH.ru'], ...(adapters.data ?? []).filter((item) => item.site_id !== "hh").map((item) => [item.site_id, item.display_name] as const)]} value={adapter} onValueChange={setAdapter} />
             <label>
-              Сайт
-              <select
-                value={adapter}
-                onChange={(e) => setAdapter(e.target.value)}
-              >
-                <option value="hh">HH.ru</option>
-                {(adapters.data ?? []).filter((item) => item.site_id !== "hh").map((item) => <option value={item.site_id} key={item.site_id}>{item.display_name}</option>)}
-              </select>
+              Лимит вакансий в работе
+              <input aria-label="Лимит вакансий в работе" type="number" min="1" step="1" value={applicationLimit} disabled={unlimitedApplications} onChange={(e) => setApplicationLimit(e.target.value)} />
+              <small>{adapter === "hirehi" ? "Считаются выбранные вакансии." : "Считаются отклики, подтверждённые выбранной площадкой."}</small>
+              <span className="checkline"><input aria-label={adapter === "hirehi" ? "Без ограничений: выбранные вакансии" : "Без ограничений: отправка откликов"} type="checkbox" checked={unlimitedApplications} onChange={(e) => setUnlimitedApplications(e.target.checked)} />Без ограничений</span>
             </label>
           </div>
           <label className="profile-full-field session-description-field">
@@ -616,42 +741,6 @@ function SessionPage() {
             />
             <small>{desiredJobDescription.length} / 2000 символов</small>
           </label>
-          <div className="row session-limits">
-            <label>
-              Просмотреть вакансий
-              <input
-                aria-label="Лимит просмотра вакансий"
-                type="number"
-                min="1"
-                step="1"
-                value={viewedLimit}
-                disabled={unlimitedViewed}
-                onChange={(e) => setViewedLimit(e.target.value)}
-              />
-              <small>После этого числа просмотренных вакансий сессия завершится.</small>
-              <span className="checkline">
-                <input aria-label="Без ограничений: просмотр вакансий" type="checkbox" checked={unlimitedViewed} onChange={(e) => setUnlimitedViewed(e.target.checked)} />
-                Без ограничений
-              </span>
-            </label>
-            <label>
-              Лимит вакансий в работе
-              <input
-                aria-label="Лимит вакансий в работе"
-                type="number"
-                min="1"
-                step="1"
-                value={applicationLimit}
-                disabled={unlimitedApplications}
-                onChange={(e) => setApplicationLimit(e.target.value)}
-              />
-              <small>{adapter === "hirehi" ? "Считаются выбранные вакансии." : "Считаются отклики, подтверждённые выбранной площадкой."}</small>
-              <span className="checkline">
-                <input aria-label={adapter === "hirehi" ? "Без ограничений: выбранные вакансии" : "Без ограничений: отправка откликов"} type="checkbox" checked={unlimitedApplications} onChange={(e) => setUnlimitedApplications(e.target.checked)} />
-                Без ограничений
-              </span>
-            </label>
-          </div>
           <section className="influence-section" aria-labelledby="influence-heading">
             <h3 id="influence-heading">Влияние факторов на вакансии</h3>
             {INFLUENCE_CRITERIA.map((criterion) => {
@@ -669,27 +758,23 @@ function SessionPage() {
               </div>;
             })}
           </section>
-          <button
+          <button type="button" className="primary"
             onClick={() => create.mutate()}
             disabled={!profileReady || create.isPending || !limitsAreValid || blockedByAdapter}
           >
             {create.isPending ? "Запускаем…" : "Создать и запустить"}
           </button>
-          {blockedByAdapter && <p className="notice" role="alert">Для выбранного сайта уже есть незавершённая сессия. Дождитесь её завершения.</p>}
+          {blockedByAdapter && <Notice tone="warning" role="alert">Для выбранного сайта уже есть незавершённая сессия. Дождитесь её завершения.</Notice>}
           {!limitsAreValid && (
-            <p className="notice error" role="alert">
+            <Notice tone="danger" role="alert">
               Введите целое положительное значение лимита или включите «Без ограничений».
-            </p>
+            </Notice>
           )}
           {!profileReady && (
-            <p className="notice">Сначала заполните профиль и выберите хотя бы одно резюме.</p>
+            <Notice tone="warning">Сначала заполните профиль и выберите хотя бы одно резюме.</Notice>
           )}
         </article>
-      {message && (
-        <p className={`notice ${create.isError ? "error" : ""}`} role="status">
-          {message}
-        </p>
-      )}
+      {message && <Notice tone={messageTone}>{message}</Notice>}
       {visibleSessions.map((session) => {
         return <SessionCard key={session.id} session={session} formatSessionLimit={formatSessionLimit} action={action} />;
       })}
@@ -705,7 +790,7 @@ function SessionPage() {
   );
 }
 
-function SessionCard({ session, formatSessionLimit, action }: { session: JobSession; formatSessionLimit: (limit: number | null | undefined, legacyDefault: number) => string; action: (id: number, name: string) => Promise<void> }) {
+function SessionCard({ session, formatSessionLimit, action }: { session: JobSession; formatSessionLimit: (limit: number | null | undefined) => string; action: (id: number, name: string) => Promise<void> }) {
   const report = useQuery({ queryKey: ["session-report", session.id], queryFn: () => api<{ ready: boolean; pdf_url: string | null }>(`/sessions/${session.id}/report`), enabled: session.adapter_id === "hirehi", retry: false, refetchInterval: (query) => query.state.data?.ready ? false : 2000 });
   const browserAvailable = session.adapter_id === "hh" || session.adapter_id === "hirehi";
   const counters = session.counters ?? {};
@@ -723,38 +808,38 @@ function SessionCard({ session, formatSessionLimit, action }: { session: JobSess
                   "Обработка вакансий идёт последовательно"}
               </p>
               <p className="session-limits-summary">
-                Лимиты сессии: просмотр — {formatSessionLimit(session.viewed_limit, 30)}; {session.adapter_id === "hirehi" ? "выбрано" : "отправка"} — {formatSessionLimit(session.application_limit, 5)}.
+                Лимит сессии: {session.adapter_id === "hirehi" ? "выбрано" : "отправка"} — {formatSessionLimit(session.application_limit)}.
               </p>
             </div>
             <div className="actions session-actions">
               {report.data?.ready && report.data.pdf_url && <a className="button-link session-report-button" aria-label={`Скачать PDF HireHi #${session.id}`} href={report.data.pdf_url} target="_blank" rel="noreferrer"><svg className="session-report-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 3.75h8.25L19 8.5v11.75H6z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/><path d="M14 3.75V9h5M12.5 12v6m0 0-2.5-2.5m2.5 2.5 2.5-2.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg><span>Скачать PDF-отчёт</span></a>}
               {session.status === "CREATED" && (
                 <>
-                  <button onClick={() => void action(session.id, "start")}>Запустить</button>
+                  <button type="button" className="primary" onClick={() => void action(session.id, "start")}>Запустить</button>
                   {browserAvailable && (
-                    <button className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
+                    <button type="button" className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
                   )}
                 </>
               )}
               {session.status === "WAITING_FOR_LOGIN" && (
                 <>
-                  <button className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
-                  <button className="secondary" onClick={() => void action(session.id, "browser/check")}>Проверить вход</button>
-                  <button className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
+                  <button type="button" className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
+                  <button type="button" className="secondary" onClick={() => void action(session.id, "browser/check")}>Проверить вход</button>
+                  <button type="button" className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
                 </>
               )}
               {session.status === "RUNNING" && (
                 <>
                   {browserAvailable && (
-                    <button className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
+                    <button type="button" className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
                   )}
-                  <button className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
+                  <button type="button" className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
                 </>
               )}
               {session.status === "PAUSED" && (
                 <>
-                  <button onClick={() => void action(session.id, "resume")}>Продолжить</button>
-                  <button className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
+                  <button type="button" className="primary" onClick={() => void action(session.id, "resume")}>Продолжить</button>
+                  <button type="button" className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
                 </>
               )}
             </div>
@@ -774,6 +859,28 @@ function SessionCard({ session, formatSessionLimit, action }: { session: JobSess
             ))}
           </div>
         </>;
+}
+
+function VacancyCard({ v }: { v: Vacancy }) {
+  const [open, setOpen] = useState(false);
+  return <details className="panel vacancy-score vacancy-disclosure" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <summary aria-expanded={open} aria-controls={`vacancy-details-${v.id}`}>
+      <span className="vacancy-main"><b>{v.title}</b><small>#{v.id} · {v.company || "Компания не указана"}</small></span>
+      <span className="score-total"><strong>{v.evaluation?.score ?? "—"}</strong><small>/ 100</small></span>
+      <Status value={v.state} />
+      <span className="vacancy-disclosure-control"><span className="sr-only">{open ? "Скрыть подробности вакансии" : "Показать подробности вакансии"}</span><ChevronIcon className="vacancy-chevron" /></span>
+    </summary>
+    {v.evaluation ? <div className="score-details" id={`vacancy-details-${v.id}`}>
+      <div className="resume-score-heading"><span className="eyebrow">КРАТКОЕ РЕЗЮМЕ</span></div>
+      <p>{humanModelSummary(v.evaluation.reason || "", v.state, v.evaluation.score_breakdown ?? [])}</p>
+      <p>{vacancyOutcome(v.state)}</p>
+      <div className="resume-score-heading"><span className="eyebrow">ПО КРИТЕРИЯМ</span></div>
+      {presentationBreakdown(v.evaluation.score_breakdown ?? []).map((row) => <div className="score-row" key={row.key}><div><b>{row.title}</b><span>{row.max_points > 0 ? `${row.points} / ${row.max_points}` : "не применяется"}</span></div>{row.max_points > 0 && <div className="scorebar" role="progressbar" aria-label={`Релевантность: ${row.title}`} aria-valuenow={row.points} aria-valuemin={0} aria-valuemax={row.max_points}><i style={{ width: `${Math.min(100, Math.max(0, (row.points / row.max_points) * 100))}%` }} /></div>}<small>{humanCriterionExplanation(row.explanation)}</small></div>)}
+      <a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a>
+    </div> : ["ERROR", "FAILED", "UNKNOWN", "UNKNOWN_RESULT"].includes(v.state)
+      ? <div className="score-details" id={`vacancy-details-${v.id}`}><div className="resume-score-heading"><span className="eyebrow">КРАТКОЕ РЕЗЮМЕ</span><small>Что произошло с вакансией</small></div><p>Не удалось оценить вакансию.</p><p>{vacancyOutcome(v.state)}</p><a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a></div>
+      : <p className="empty-score">Оценка ещё не завершена.</p>}
+  </details>;
 }
 
 function VacanciesPage() {
@@ -801,41 +908,7 @@ function VacanciesPage() {
       </Title>
       {allVacancies.length ? (
         <div className="vacancy-list">
-          {allVacancies.map((v) => (
-            <details className="panel vacancy-score" key={v.id}>
-              <summary>
-                <span className="vacancy-main">
-                  <b>{v.title}</b>
-                  <small>#{v.id} · {v.company || "Компания не указана"}</small>
-                </span>
-                <span className="score-total">
-                  <strong>{v.evaluation?.score ?? "—"}</strong><small>/ 100</small>
-                </span>
-                <Status value={v.state} />
-              </summary>
-              {v.evaluation ? (
-                <div className="score-details">
-                  <p>{v.evaluation.reason}</p>
-                  <div className="resume-score-heading">
-                    <span className="eyebrow">РЕЛЕВАНТНОСТЬ ПО РЕЗЮМЕ</span>
-                    <small>Итоговая оценка по выбранному резюме</small>
-                  </div>
-                  {presentationBreakdown(v.evaluation.score_breakdown ?? []).map((row) => (
-                    <div className="score-row" key={row.key}>
-                      <div><b>{row.title}</b><span>{row.max_points > 0 ? `${row.points} / ${row.max_points}` : "не применяется"}</span></div>
-                      {row.max_points > 0 && <div className="scorebar"><i style={{ width: `${Math.min(100, Math.max(0, (row.points / row.max_points) * 100))}%` }} /></div>}
-                      {typeof row.minimum_points === "number" ? (
-                        <small>{row.minimum_failed ?? ((row.raw_points ?? row.points) < row.minimum_points) ? `Минимум: ${row.minimum_points} — не выполнен` : `Минимум: ${row.minimum_points} — выполнен`}</small>
-                      ) : null}
-                      <small>{row.explanation}</small>
-                      {row.evidence?.length ? <em>{row.evidence.join(" · ")}</em> : null}
-                    </div>
-                  ))}
-                  <a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a>
-                </div>
-              ) : <p className="empty-score">Оценка ещё не завершена.</p>}
-            </details>
-          ))}
+          {allVacancies.map((v) => <VacancyCard key={v.id} v={v} />)}
           {q.data?.has_more && <button type="button" className="secondary" onClick={() => setOffset((value) => value + 30)} disabled={q.isFetching}>Показать ещё</button>}
         </div>
       ) : (
@@ -866,11 +939,12 @@ function ModelPage() {
   const [apiKey, setApiKey] = useState("");
   const [models, setModels] = useState<string[]>([]);
   const [message, setMessage] = useState("");
+  const [messageTone, setMessageTone] = useState<"neutral" | "success" | "warning" | "danger" | "info">("neutral");
   const [loadingModels, setLoadingModels] = useState(false);
   const [saving, setSaving] = useState(false);
   useEffect(() => { if (settings.data) { setBaseUrl(settings.data.base_url || ""); setModel(settings.data.model || ""); } }, [settings.data]);
-  const loadModels = async () => { setLoadingModels(true); setMessage(""); try { const result = await api<{ models: string[] }>("/model/models", { method: "POST", body: JSON.stringify({ base_url: baseUrl, ...(apiKey ? { api_key: apiKey } : {}) }) }); setModels(result.models); if (result.models.length) setModel(result.models[0]); setMessage(`Доступно моделей: ${result.models.length}`); } catch (error) { setMessage(error instanceof Error ? error.message : "Не удалось загрузить модели"); } finally { setLoadingModels(false); } };
-  const save = async () => { setSaving(true); try { await api("/model/settings", { method: "PUT", body: JSON.stringify({ base_url: baseUrl, model, ...(apiKey ? { api_key: apiKey } : {}) }) }); setApiKey(""); setMessage("Настройки сохранены"); void qc.invalidateQueries({ queryKey: ["model-settings"] }); void qc.invalidateQueries({ queryKey: ["model-status"] }); } catch (error) { setMessage(error instanceof Error ? error.message : "Не удалось сохранить настройки"); } finally { setSaving(false); } };
+  const loadModels = async () => { setLoadingModels(true); setMessageTone("neutral"); setMessage(""); try { const result = await api<{ models: string[] }>("/model/models", { method: "POST", body: JSON.stringify({ base_url: baseUrl, ...(apiKey ? { api_key: apiKey } : {}) }) }); setModels(result.models); setMessageTone("success"); if (result.models.length) setModel(result.models[0]); setMessage(`Доступно моделей: ${result.models.length}`); toast.success(`Доступно моделей: ${result.models.length}`); } catch (error) { const message = error instanceof Error ? error.message : "Не удалось загрузить модели"; setMessageTone("danger"); setMessage(message); toast.error(message); } finally { setLoadingModels(false); } };
+  const save = async () => { setSaving(true); try { await api("/model/settings", { method: "PUT", body: JSON.stringify({ base_url: baseUrl, model, ...(apiKey ? { api_key: apiKey } : {}) }) }); setApiKey(""); setMessageTone("success"); setMessage("Настройки сохранены"); toast.success("Настройки сохранены"); void qc.invalidateQueries({ queryKey: ["model-settings"] }); void qc.invalidateQueries({ queryKey: ["model-status"] }); } catch (error) { const message = error instanceof Error ? error.message : "Не удалось сохранить настройки"; setMessageTone("danger"); setMessage(message); toast.error(message); } finally { setSaving(false); } };
   return (
     <section className="page">
       <Title
@@ -884,9 +958,7 @@ function ModelPage() {
           className={`orb ${q.data?.connected && q.data.model_available ? "online" : ""}`}
         ></div>
         <div>
-          <Status
-            value={q.data?.connected ? "Соединение есть" : "Нет соединения"}
-          />
+          <Status value={q.data?.connected ? "CONNECTED" : "DISCONNECTED"} />
           <h2>{q.data?.model || "Модель не указана"}</h2>
           <p>
             {q.data?.model_available
@@ -895,7 +967,7 @@ function ModelPage() {
           </p>
           <code>Ключ хранится в защищённом хранилище DPAPI</code>
         </div>
-        <button type="button" onClick={() => { void qc.invalidateQueries({ queryKey: ["model-status"] }); void qc.invalidateQueries({ queryKey: ["model-settings"] }); }}>
+        <button type="button" className="secondary" onClick={() => { void qc.invalidateQueries({ queryKey: ["model-status"] }); void qc.invalidateQueries({ queryKey: ["model-settings"] }); }}>
           Проверить снова
         </button>
       </article>
@@ -903,9 +975,9 @@ function ModelPage() {
         <label>Base URL (HTTPS или настроенный локальный gateway)<input value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setModels([]); setMessage(""); }} placeholder="https://api.openai.com/v1" inputMode="url" /></label>
         <label>API-ключ<input type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setModels([]); setMessage(""); }} autoComplete="new-password" placeholder={settings.data?.has_api_key ? "Сохранённый ключ не отображается" : "Введите ключ"} /></label>
         {settings.data?.has_api_key && <small>Сохранён: {settings.data.masked_key}. Ключ не показывается.</small>}
-        {models.length > 0 && <label>Модель<select value={model} onChange={(event) => setModel(event.target.value)}>{models.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>}
-        <div className="model-settings-actions"><button type="button" onClick={() => void loadModels()} disabled={!baseUrl || loadingModels}>{loadingModels ? "Загрузка…" : "Загрузить модели"}</button><button type="button" onClick={() => void save()} disabled={saving || !model || models.length === 0}>{saving ? "Сохранение…" : "Сохранить изменения"}</button></div>
-        {message && <p role="status">{message}</p>}
+        {models.length > 0 && <SingleSelect label="Модель" options={models.map((name) => [name, name] as const)} value={model} onValueChange={setModel} />}
+        <div className="model-settings-actions"><button type="button" className="secondary" onClick={() => void loadModels()} disabled={!baseUrl || loadingModels}>{loadingModels ? "Загрузка…" : "Загрузить модели"}</button><button type="button" className="primary" onClick={() => void save()} disabled={saving || !model || models.length === 0}>{saving ? "Сохранение…" : "Сохранить изменения"}</button></div>
+        {message && <Notice tone={messageTone}>{message}</Notice>}
       </article>
     </section>
   );

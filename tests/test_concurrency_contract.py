@@ -53,9 +53,11 @@ async def test_model_gateway_instances_can_enter_api_concurrently(monkeypatch):
             await release.wait()
             assessment = '{"score":0,"confidence":0,"evidence":[],"explanation":"нет"}'
             return Response('{"tasks":' + assessment + ',"skills":[],'
+                            '"skills_summary":"Навыки соответствуют требованиям вакансии.",'
                             '"experience_depth":' + assessment + ',"role_match":' + assessment + ','
                             '"industry":' + assessment + ','
-                            '"special_requirements":' + assessment + '}')
+                            '"special_requirements":' + assessment + ','
+                            '"reason":"Вакансия соответствует профилю кандидата."}')
 
     class FakeOpenAI:
         def __init__(self, **kwargs):

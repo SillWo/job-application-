@@ -207,6 +207,7 @@ class ResumeAnalysis(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tasks: MatchAssessment
     skills: list[SkillAssessment]
+    skills_summary: str = ""
     experience_depth: MatchAssessment
     role_match: MatchAssessment
     industry: MatchAssessment

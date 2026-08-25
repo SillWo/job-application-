@@ -37,7 +37,8 @@ def test_cover_letter_closing_uses_only_profile_messengers_and_stays_within_limi
         "Буду рад продолжить общение с вами в этом чате или в мессенджерах - "
         "https://t.me/example, @example"
     )
-    assert len(result.split()) <= 100
+    assert result.startswith("Здравствуйте!")
+    assert len(result.split()) <= 110
 
 
 def test_cover_letter_does_not_invent_messenger_link_when_contacts_are_empty():
@@ -54,7 +55,8 @@ async def test_write_cover_letter_passes_three_blocks_and_adds_contractual_closi
         async def structured(self, role, payload, response_model):
             assert role == "writer"
             requirements = payload["requirements"]
-            assert "не более 70 слов" in requirements
+            assert "не более 80 слов" in requirements
+            assert "без приветствия" in requirements
             assert "почему понравилась вакансия" in requirements
             assert "почему понравилась компания" in requirements
             assert "преимущества кандидата" in requirements
@@ -69,4 +71,11 @@ async def test_write_cover_letter_passes_three_blocks_and_adds_contractual_closi
     assert result.endswith(
         "Буду рад продолжить общение с вами в этом чате или в мессенджерах - https://t.me/ivan"
     )
-    assert len(result.split()) <= 100
+    assert result.startswith("Здравствуйте!")
+    assert len(result.split()) <= 110
+
+
+def test_cover_letter_does_not_duplicate_greeting():
+    result = _finish_cover_letter("Здравствуйте!\n\nКороткий текст.", {})
+    assert result.startswith("Здравствуйте!\n\nКороткий текст.")
+    assert result.count("Здравствуйте!") == 1

@@ -35,7 +35,7 @@ class ModelUnavailable(RuntimeError):
 def _schema_for_role(role: str, schema: type[BaseModel]) -> dict:
     result = schema.model_json_schema()
     if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
-        result["required"] = list(_RESUME_ANALYSIS_CRITERIA)
+        result["required"] = [*(_RESUME_ANALYSIS_CRITERIA), "reason", "skills_summary"]
         assessment = result.get("$defs", {}).get("MatchAssessment", {})
         assessment["required"] = list(assessment.get("properties", {}))
         skill = result.get("$defs", {}).get("SkillAssessment", {})
@@ -78,6 +78,10 @@ def _resume_analysis_missing_fields(parsed: BaseModel, require_flag_matches: boo
         return []
     criteria = _RESUME_ANALYSIS_CRITERIA
     missing = []
+    for summary_name in ("reason", "skills_summary"):
+        summary = getattr(parsed, summary_name, "")
+        if summary_name not in parsed.model_fields_set or not isinstance(summary, str) or not summary.strip():
+            missing.append(summary_name)
     for field_name in criteria:
         if field_name not in parsed.model_fields_set:
             missing.append(field_name)
@@ -321,9 +325,10 @@ class ModelGateway:
                         root_contract = ""
                         if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
                             root_contract = (
-                                " Для ResumeAnalysis корень JSON обязан быть самим объектом с ровно "
-                                "полями tasks, skills (массив объектов skill/importance/score/evidence/explanation), "
-                                "experience_depth, role_match, industry, special_requirements; "
+                                " Для ResumeAnalysis корень JSON обязан быть самим объектом с обязательными полями "
+                                "tasks, skills (массив объектов skill/importance/score/evidence/explanation), "
+                                "experience_depth, role_match, industry, special_requirements, "
+                                "непустыми reason и skills_summary; "
                                 "НЕ оборачивай его в analysis, resumes, candidate_name, result или data "
                                 "и не возвращай массив в корне. skills обязан быть массивом SkillAssessment; "
                                 "остальные критерии обязаны быть объектами со score, confidence, explanation и evidence."
@@ -399,6 +404,7 @@ class ModelGateway:
                 {
                     "tasks": mock_assessment(2, 0.7, description),
                     "skills": [{"skill": item, "importance": "required", "score": 2 if item in skills else 0, "evidence": [item] if item in skills else [], "explanation": "Детерминированная mock-оценка"} for item in required],
+                    "skills_summary": "Навыки частично соответствуют требованиям вакансии.",
                     "experience_depth": mock_assessment(1, 0.7, description),
                     "role_match": mock_assessment(1, 0.7, title_evidence),
                     "industry": mock_assessment(2, 0.7, description),

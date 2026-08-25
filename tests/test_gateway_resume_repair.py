@@ -20,6 +20,8 @@ CRITERIA = {
     "role_match",
     "industry",
     "special_requirements",
+    "reason",
+    "skills_summary",
 }
 
 
@@ -33,6 +35,8 @@ def _valid_analysis() -> dict:
     assessment = {"score": 0, "confidence": 0, "explanation": "нет", "evidence": []}
     result = {name: dict(assessment) for name in CRITERIA - {"skills"}}
     result["skills"] = []
+    result["skills_summary"] = "Навыки соответствуют требованиям вакансии."
+    result["reason"] = "Краткое саммари релевантности вакансии."
     return result
 
 

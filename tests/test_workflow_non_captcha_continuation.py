@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -112,7 +113,7 @@ def runtime(tmp_path, monkeypatch):
         db.add(Resume(profile_id=profile.id, name="Resume", desired_title="Role",
                       selected_for_matching=True))
         item = JobSession(profile_id=profile.id, adapter_id="fake",
-                          viewed_limit=None, application_limit=None,
+                          application_limit=None,
                           status=SessionStatus.CREATED, counters={})
         db.add(item)
         db.commit()
@@ -132,6 +133,41 @@ async def run_workflow(runtime, monkeypatch, adapter, evaluate_impl=None):
     monkeypatch.setattr(workflow, "evaluate", evaluate_impl)
     await workflow.WorkflowManager()._run(session_id)
     return sessions, session_id
+
+
+@pytest.mark.asyncio
+async def test_high_viewed_count_does_not_stop_session_but_application_limit_does(runtime, monkeypatch):
+    sessions, session_id = runtime
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.counters = {"viewed": 1000}
+        item.started_at = datetime.now(timezone.utc)
+        db.commit()
+    refs = [JobRef(external_id="one", url="https://fake/one"), JobRef(external_id="two", url="https://fake/two")]
+    async def skip_evaluation(*args, **kwargs):
+        return evaluation("skip")
+    sessions, session_id = await run_workflow(runtime, monkeypatch, FakeAdapter(refs), evaluate_impl=skip_evaluation)
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        assert item.status == SessionStatus.COMPLETED
+        assert item.counters["viewed"] == 1002
+        assert item.stop_reason != "Достигнут лимит просмотра вакансий"
+
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.status = SessionStatus.CREATED
+        item.finished_at = None
+        item.stop_reason = None
+        item.application_limit = 1
+        item.counters = {"viewed": 1000, "submitted": 1}
+        db.commit()
+    async def apply_evaluation(*args, **kwargs):
+        return evaluation("apply")
+    sessions, session_id = await run_workflow(runtime, monkeypatch, FakeAdapter(refs), evaluate_impl=apply_evaluation)
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        assert item.status == SessionStatus.COMPLETED
+        assert item.stop_reason == "Достигнут лимит отправленных откликов"
 
 
 @pytest.mark.asyncio

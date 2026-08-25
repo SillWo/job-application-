@@ -51,6 +51,8 @@ def test_history_cleanup_preserves_good_history(tmp_path):
     tables = {row[0] for row in db.execute("select name from sqlite_master where type='table'")}
     assert not {"search_policies", "site_accounts", "employer_contacts"} & tables
     assert not {"policy_id", "resume_url", "resume_path"} & _columns(db, "sessions")
+    assert "viewed_limit" not in _columns(db, "sessions")
+    assert "application_limit" in _columns(db, "sessions")
     assert not {"filename", "data", "resume_path"} & _columns(db, "candidate_profiles")
     db.close()
 
@@ -62,6 +64,8 @@ def test_fresh_upgrade_head_isolated(tmp_path):
     assert "vacancies" in {row[0] for row in db.execute("select name from sqlite_master where type='table'")}
     assert "session_id" in _columns(db, "vacancies")
     assert {"desired_job_description", "preference_policy"} <= _columns(db, "sessions")
+    assert "viewed_limit" not in _columns(db, "sessions")
+    assert "application_limit" in _columns(db, "sessions")
     db.close()
 
 
@@ -78,7 +82,7 @@ def test_database_url_environment_override_wins_without_touching_default(tmp_pat
     command.upgrade(config, "head")
 
     target_db = sqlite3.connect(target)
-    assert target_db.execute("select version_num from alembic_version").fetchone()[0] == "0019"
+    assert target_db.execute("select version_num from alembic_version").fetchone()[0] == "0020"
     assert "vacancies" in {row[0] for row in target_db.execute("select name from sqlite_master where type='table'")}
     target_db.close()
     assert not decoy.exists()
