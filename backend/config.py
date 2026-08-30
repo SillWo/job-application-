@@ -8,7 +8,10 @@ ROOT = Path(__file__).resolve().parent.parent
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="JAO_",
-        env_file=".env",
+        # Configuration is supplied by process environment (for deployment and
+        # tests) and persisted model settings entered in the UI.  Do not load a
+        # project-local .env: it is not part of the user-facing configuration
+        # flow and could silently override deployment defaults.
         extra="ignore",
     )
 

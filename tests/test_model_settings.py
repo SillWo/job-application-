@@ -214,3 +214,55 @@ def test_env_key_is_not_settings_field(monkeypatch):
     import backend.config as config
 
     assert not hasattr(config.settings, "openai_api_key")
+
+
+def test_project_dotenv_is_ignored(tmp_path, monkeypatch):
+    """A local .env must not be an implicit configuration source."""
+    (tmp_path / ".env").write_text(
+        "JAO_OPENAI_MODEL=dotenv-model\nJAO_OPENAI_BASE_URL=https://dotenv.example/v1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    from backend.config import Settings
+
+    loaded = Settings()
+    assert loaded.openai_model == "gpt-4o-mini"
+    assert loaded.openai_base_url == "https://api.openai.com/v1"
+
+
+def test_gateway_uses_saved_ui_model_settings(monkeypatch):
+    """Gateway requests always use the encrypted, UI-persisted config."""
+    item = SimpleNamespace(
+        base_url="https://saved.example/v1", model="saved-model", encrypted_api_key="cipher"
+    )
+    monkeypatch.setattr(gateway.ModelGateway, "_saved_config", staticmethod(lambda: item))
+    monkeypatch.setattr(gateway, "decrypt_secret", lambda value: "saved-key")
+    captured = {}
+
+    class Completions:
+        async def create(self, **kwargs):
+            captured["request"] = kwargs
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(content='{"summary":"ok"}'))
+                ]
+            )
+
+    class Client:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setattr(gateway, "AsyncOpenAI", Client)
+    from backend.intelligence.hirehi_category import JobSummary
+
+    result = asyncio.run(
+        gateway.ModelGateway(provider="openai_compat")._structured_openai(
+            "job_summary", {"job": {"title": "x"}}, JobSummary
+        )
+    )
+    assert result.summary == "ok"
+    assert captured["base_url"] == item.base_url
+    assert captured["api_key"] == "saved-key"
+    assert captured["request"]["model"] == item.model
