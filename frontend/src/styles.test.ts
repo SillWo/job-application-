@@ -54,6 +54,10 @@ test('all page content shares the centered influence rail without shrinking pane
   expect(css).not.toContain('.session-page>')
 })
 
+test('vacancy filters preserve the centered page rail', () => {
+  expect(css).toContain('.vacancy-filters{display:grid;gap:1rem;margin-block:1rem;margin-inline:auto;')
+})
+
 test('resume editor fields and repeated experience cards have explicit boundaries', () => {
   expect(css).toContain('.resume-editor.form-contentinput:not([type="checkbox"]),.resume-editor.form-contentselect,.resume-editor.form-contenttextarea{')
   expect(css).toContain('.experience-card{border:1pxsolidvar(--line);background:var(--paper);border-radius:var(--radius-subcard);box-shadow:none;}')

@@ -31,6 +31,14 @@ const RELEVANCE_CRITERIA: ReadonlyArray<{ key: string; title: string; maxPoints:
   { key: "industry", title: "Сфера", maxPoints: 4, weight: 10 },
   { key: "special_requirements", title: "Особые требования", maxPoints: 2, weight: 10 },
 ];
+const VACANCY_FILTER_CRITERIA = [
+  { key: "tasks", title: "Задачи", max: 35 },
+  { key: "skills", title: "Навыки", max: 20 },
+  { key: "experience_depth", title: "Опыт", max: 15 },
+  { key: "role_match", title: "Роль", max: 10 },
+  { key: "industry", title: "Сфера", max: 10 },
+  { key: "special_requirements", title: "Особые требования", max: 10 },
+] as const;
 
 const SESSION_DRAFT_STORAGE_KEY = "job-orchestrator.session-draft";
 type SessionDraft = {
@@ -49,7 +57,7 @@ function readSessionDraft(): Partial<SessionDraft> {
     if (!value || typeof value !== "object") return {};
     const candidate = value as Record<string, unknown>;
     const draft: Partial<SessionDraft> = {};
-    if (candidate.adapter === "hh" || candidate.adapter === "hirehi") draft.adapter = candidate.adapter;
+    if (candidate.adapter === "hh" || candidate.adapter === "hirehi" || candidate.adapter === "zarplata") draft.adapter = candidate.adapter;
     for (const key of ["applicationLimit", "desiredJobDescription"] as const) {
       if (typeof candidate[key] === "string") draft[key] = candidate[key];
     }
@@ -105,9 +113,82 @@ function presentationBreakdown(rows: ScoreComponent[]): ScoreComponent[] {
 
 const nav = [["/", "Обзор", "M4 12h16M12 4l8 8-8 8"], ["/profile", "Профиль", "M20 21a8 8 0 0 0-16 0M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8"], ["/session", "Сессия", "M4 6h16M4 12h16M4 18h16"], ["/vacancies", "Вакансии", "M6 3h9l3 3v15H6zM9 12h6M9 16h6"], ["/model", "Модель", "M4 6h16M4 12h16M4 18h16M8 4v4m8 2v4m-5 4v4"]] as const;
 const STATUS_META: Record<string, { label: string; tone: string }> = {
-  CREATED: { label: "Создана", tone: "neutral" }, RUNNING: { label: "В работе", tone: "success" }, EVALUATING: { label: "Оценка вакансии", tone: "info" }, WAITING_FOR_LOGIN: { label: "Ожидает входа", tone: "warning" }, PAUSED: { label: "Приостановлена", tone: "warning" }, STOPPED: { label: "Остановлена", tone: "neutral" }, COMPLETED: { label: "Завершена", tone: "success" }, FAILED: { label: "Ошибка", tone: "danger" }, UNKNOWN: { label: "Ошибка", tone: "danger" }, UNKNOWN_RESULT: { label: "Ошибка", tone: "danger" }, REJECTED_BY_MODEL: { label: "Отклонена моделью", tone: "danger" }, FILTERED_OUT: { label: "Отклонена моделью", tone: "danger" }, ERROR: { label: "Ошибка", tone: "danger" }, SUBMITTED: { label: "Отклик отправлен", tone: "success" }, REPORTED: { label: "В отчёте", tone: "success" }, ALREADY_APPLIED: { label: "Отклик отправлен", tone: "success" }, CONNECTED: { label: "Соединение есть", tone: "success" }, DISCONNECTED: { label: "Нет соединения", tone: "danger" },
+  CREATED: { label: "Создана", tone: "neutral" }, RUNNING: { label: "В работе", tone: "success" }, DISCOVERED: { label: "Найдена", tone: "neutral" }, EXTRACTED: { label: "Данные получены", tone: "neutral" }, EVALUATING: { label: "Оценка вакансии", tone: "info" }, WAITING_FOR_LOGIN: { label: "Ожидает входа", tone: "warning" }, PAUSED: { label: "Приостановлена", tone: "warning" }, STOPPED: { label: "Остановлена", tone: "neutral" }, COMPLETED: { label: "Завершена", tone: "success" }, FAILED: { label: "Ошибка", tone: "danger" }, UNKNOWN: { label: "Ошибка", tone: "danger" }, UNKNOWN_RESULT: { label: "Ошибка", tone: "danger" }, REJECTED_BY_MODEL: { label: "Отклонена моделью", tone: "danger" }, FILTERED_OUT: { label: "Отклонена моделью", tone: "danger" }, ERROR: { label: "Ошибка", tone: "danger" }, READY_TO_SUBMIT: { label: "Готова к отклику", tone: "success" }, READY_TO_REPORT: { label: "Готова к отчёту", tone: "success" }, SUBMITTED: { label: "Отклик отправлен", tone: "success" }, REPORTED: { label: "В отчёте", tone: "success" }, ALREADY_APPLIED: { label: "Отклик отправлен", tone: "success" }, CONTACT_COLLECTED: { label: "Контакт получен", tone: "neutral" }, NEEDS_REVIEW: { label: "Требует проверки", tone: "warning" }, SKIPPED_TEST: { label: "Тест пропущен", tone: "neutral" }, LETTER_GENERATED: { label: "Письмо подготовлено", tone: "neutral" }, FILLING_FORM: { label: "Заполнение формы", tone: "info" }, SUBMITTING: { label: "Отправка отклика", tone: "info" }, CONNECTED: { label: "Соединение есть", tone: "success" }, DISCONNECTED: { label: "Нет соединения", tone: "danger" },
 };
+type VacancyFilters = {
+  search: string;
+  state: string;
+  site: string;
+  status_date_from: string;
+  status_date_to: string;
+  total_score_min: string;
+  total_score_max: string;
+  sort: string;
+  sort_dir: string;
+  tasks_min: string;
+  tasks_max: string;
+  skills_min: string;
+  skills_max: string;
+  experience_depth_min: string;
+  experience_depth_max: string;
+  role_match_min: string;
+  role_match_max: string;
+  industry_min: string;
+  industry_max: string;
+  special_requirements_min: string;
+  special_requirements_max: string;
+};
+const DEFAULT_VACANCY_FILTERS: VacancyFilters = {
+  search: "",
+  state: "",
+  site: "",
+  status_date_from: "",
+  status_date_to: "",
+  total_score_min: "",
+  total_score_max: "",
+  sort: "date",
+  sort_dir: "desc",
+  tasks_min: "",
+  tasks_max: "",
+  skills_min: "",
+  skills_max: "",
+  experience_depth_min: "",
+  experience_depth_max: "",
+  role_match_min: "",
+  role_match_max: "",
+  industry_min: "",
+  industry_max: "",
+  special_requirements_min: "",
+  special_requirements_max: "",
+};
+
+function buildVacancyParams(
+  filters: VacancyFilters,
+  includePaging = false,
+  offset = 0,
+) {
+  const params = new URLSearchParams();
+  Object.entries(filters).forEach(([key, value]) => {
+    const isDefaultSort = key === "sort" && value === DEFAULT_VACANCY_FILTERS.sort;
+    const isDefaultDirection = key === "sort_dir" && value === DEFAULT_VACANCY_FILTERS.sort_dir;
+    if (value && !isDefaultSort && !isDefaultDirection) params.set(key, value);
+  });
+  if (includePaging && offset > 0) {
+    params.set("limit", "30");
+    params.set("offset", String(offset));
+  }
+  return params;
+}
+
+function vacancyExportUrl(filters: VacancyFilters, format: "csv" | "xlsx" | "xml") {
+  const params = buildVacancyParams(filters);
+  params.set("format", format);
+  return `/api/vacancies/export?${params}`;
+}
 function humanStatus(value: string) { return STATUS_META[value]?.label ?? value.replaceAll("_", " ").toLowerCase(); }
+const VACANCY_STATUS_OPTIONS = [
+  { value: "EVALUATING", label: "Оценка вакансии" }, { value: "REJECTED_BY_MODEL", label: "Отклонена моделью" }, { value: "REPORTED", label: "В отчёте" }, { value: "ERROR", label: "Ошибка" },
+] as const;
 function vacancyOutcome(value: string) {
   if (value === "SUBMITTED") return "Отклик действительно отправлен после положительной оценки вакансии.";
   if (value === "ALREADY_APPLIED") return "Новый отклик не отправлялся: вы уже откликались на эту вакансию.";
@@ -680,6 +761,8 @@ function SessionPage() {
       setMessage(
         session.adapter_id === "hh"
           ? `Сессия #${session.id} запущена. Откройте браузер и войдите в HH.ru.`
+          : session.adapter_id === "zarplata"
+            ? `Сессия #${session.id} запущена. Откройте браузер и войдите в Zarplata.ru.`
           : `Сессия #${session.id} запущена.`,
       );
       toast.success(`Сессия #${session.id} запущена`);
@@ -792,7 +875,7 @@ function SessionPage() {
 
 function SessionCard({ session, formatSessionLimit, action }: { session: JobSession; formatSessionLimit: (limit: number | null | undefined) => string; action: (id: number, name: string) => Promise<void> }) {
   const report = useQuery({ queryKey: ["session-report", session.id], queryFn: () => api<{ ready: boolean; pdf_url: string | null }>(`/sessions/${session.id}/report`), enabled: session.adapter_id === "hirehi", retry: false, refetchInterval: (query) => query.state.data?.ready ? false : 2000 });
-  const browserAvailable = session.adapter_id === "hh" || session.adapter_id === "hirehi";
+  const browserAvailable = ["hh", "hirehi", "zarplata"].includes(session.adapter_id);
   const counters = session.counters ?? {};
   return <>
           <article className="panel sessiontop" data-testid={`session-${session.id}`}>
@@ -861,13 +944,25 @@ function SessionCard({ session, formatSessionLimit, action }: { session: JobSess
         </>;
 }
 
+function formatStatusDate(value: string) {
+  if (/(?:Z|[+-]\d{2}:\d{2})$/u.test(value)) {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) {
+      const pad = (part: number) => String(part).padStart(2, "0");
+      return `${pad(parsed.getDate())}.${pad(parsed.getMonth() + 1)}.${parsed.getFullYear()} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+    }
+  }
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/u);
+  return match ? `${match[3]}.${match[2]}.${match[1]} ${match[4]}:${match[5]}` : value;
+}
+
 function VacancyCard({ v }: { v: Vacancy }) {
   const [open, setOpen] = useState(false);
   return <details className="panel vacancy-score vacancy-disclosure" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
     <summary aria-expanded={open} aria-controls={`vacancy-details-${v.id}`}>
-      <span className="vacancy-main"><b>{v.title}</b><small>#{v.id} · {v.company || "Компания не указана"}</small></span>
+      <span className="vacancy-main"><b>{v.title}</b><small>#{v.id} · {v.company || "Компания не указана"}{v.site ? ` · ${v.site}` : ""}</small></span>
       <span className="score-total"><strong>{v.evaluation?.score ?? "—"}</strong><small>/ 100</small></span>
-      <Status value={v.state} />
+      <span><Status value={v.state} />{v.status_changed_at && <small className="vacancy-status-date">{formatStatusDate(v.status_changed_at)}</small>}</span>
       <span className="vacancy-disclosure-control"><span className="sr-only">{open ? "Скрыть подробности вакансии" : "Показать подробности вакансии"}</span><ChevronIcon className="vacancy-chevron" /></span>
     </summary>
     {v.evaluation ? <div className="score-details" id={`vacancy-details-${v.id}`}>
@@ -886,10 +981,19 @@ function VacancyCard({ v }: { v: Vacancy }) {
 function VacanciesPage() {
   const [offset, setOffset] = useState(0);
   const [allVacancies, setAllVacancies] = useState<Vacancy[]>([]);
+  const [filters, setFilters] = useState<VacancyFilters>(DEFAULT_VACANCY_FILTERS);
+  const [criteriaOpen, setCriteriaOpen] = useState(false);
+  const setFilter = (key: keyof VacancyFilters, value: string) => {
+    setOffset(0);
+    setAllVacancies([]);
+    setFilters((current) => ({ ...current, [key]: value }));
+  };
   const q = useQuery({
-    queryKey: ["vacancies", offset],
+    queryKey: ["vacancies", offset, filters],
     queryFn: async () => {
-      const response = await api<VacancyPage | Vacancy[]>(offset ? `/vacancies?limit=30&offset=${offset}` : "/vacancies");
+      const params = buildVacancyParams(filters, true, offset);
+      const query = params.toString();
+      const response = await api<VacancyPage | Vacancy[]>(query ? `/vacancies?${query}` : "/vacancies");
       return Array.isArray(response)
         ? { items: response, total: response.length, has_more: false }
         : response ?? { items: [], total: 0, has_more: false };
@@ -906,6 +1010,30 @@ function VacanciesPage() {
       >
         Каждое решение объяснимо
       </Title>
+      <div className="vacancy-filters" aria-label="Фильтры вакансий">
+        <div className="vacancy-filter-primary">
+        <label className="vacancy-search">Поиск<input aria-label="Поиск" value={filters.search} onChange={(event) => setFilter("search", event.target.value)} placeholder="Номер, вакансия или компания" /></label>
+        <label>Статус<select aria-label="Статус" value={filters.state} onChange={(event) => setFilter("state", event.target.value)}><option value="">Все</option>{VACANCY_STATUS_OPTIONS.map((status) => <option value={status.value} key={status.value}>{status.label}</option>)}</select></label>
+        <fieldset className="vacancy-filter-range"><legend>Дата</legend><label>От<input aria-label="Дата от" type="date" value={filters.status_date_from} onChange={(event) => setFilter("status_date_from", event.target.value)} /></label><label>До<input aria-label="Дата до" type="date" value={filters.status_date_to} onChange={(event) => setFilter("status_date_to", event.target.value)} /></label></fieldset>
+        <fieldset className="vacancy-filter-range"><legend>Общий балл</legend><label>От<input aria-label="Общий балл от" type="number" min="0" max="100" value={filters.total_score_min} onChange={(event) => setFilter("total_score_min", event.target.value)} /></label><label>До<input aria-label="Общий балл до" type="number" min="0" max="100" value={filters.total_score_max} onChange={(event) => setFilter("total_score_max", event.target.value)} /></label></fieldset>
+        </div>
+        <details className="vacancy-filter-criteria" open={criteriaOpen} onToggle={(event) => setCriteriaOpen(event.currentTarget.open)}>
+          <summary aria-expanded={criteriaOpen} aria-controls="vacancy-criteria-fields"><span><strong>Баллы по критериям</strong><small>Уточните минимальные и максимальные значения для каждого критерия.</small></span><ChevronIcon className="vacancy-filter-chevron" /></summary>
+          <div className="vacancy-filter-criteria-grid" id="vacancy-criteria-fields">
+        {VACANCY_FILTER_CRITERIA.map((criterion) => {
+          const minimumKey = `${criterion.key}_min` as keyof VacancyFilters;
+          const maximumKey = `${criterion.key}_max` as keyof VacancyFilters;
+          return <fieldset className="vacancy-filter-range" key={criterion.key}><legend>{criterion.title}</legend><label>От<input aria-label={`${criterion.title} от`} type="number" min="0" max={criterion.max} value={filters[minimumKey]} onChange={(event) => setFilter(minimumKey, event.target.value)} /></label><label>До<input aria-label={`${criterion.title} до`} type="number" min="0" max={criterion.max} value={filters[maximumKey]} onChange={(event) => setFilter(maximumKey, event.target.value)} /></label></fieldset>;
+        })}
+          </div>
+        </details>
+        <div className="vacancy-filter-secondary">
+        <label>Сайт<select aria-label="Сайт" value={filters.site} onChange={(event) => setFilter("site", event.target.value)}><option value="">Все</option><option value="HH.ru">HH.ru</option><option value="HireHi">HireHi</option><option value="Zarplata.ru">Zarplata.ru</option><option value="__legacy__">Без сайта</option></select></label>
+        <label>Сортировка<select aria-label="Сортировка" value={filters.sort} onChange={(event) => setFilter("sort", event.target.value)}><option value="date">Дата</option><option value="state">Статус</option><option value="total_score">Общий балл</option>{VACANCY_FILTER_CRITERIA.map((criterion) => <option value={criterion.key} key={criterion.key}>{criterion.title}</option>)}<option value="site">Сайт</option><option value="title">Название вакансии</option><option value="id">Номер вакансии</option></select></label>
+        <label>Направление<select aria-label="Направление" value={filters.sort_dir} onChange={(event) => setFilter("sort_dir", event.target.value)}><option value="desc">По убыванию</option><option value="asc">По возрастанию</option></select></label>
+        </div>
+        <div className="vacancy-export-actions" aria-label="Экспорт вакансий">{(["csv", "xlsx", "xml"] as const).map((format) => <a key={format} className="button-link secondary" download href={vacancyExportUrl(filters, format)}>{format.toUpperCase()}</a>)}</div>
+      </div>
       {allVacancies.length ? (
         <div className="vacancy-list">
           {allVacancies.map((v) => <VacancyCard key={v.id} v={v} />)}

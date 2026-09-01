@@ -18,15 +18,20 @@ from backend.schemas.domain import ApplicationPlan, JobPosting
 from . import locators
 
 
-class HHAdapter:
-    site_id = "hh"
-    display_name = "HH.ru"
+class ZarplataAdapter:
+    site_id = "zarplata"
+    display_name = "Zarplata.ru"
     # HH redirects authenticated users to their regional subdomain and emits
     # vacancy links on that same host.
     allowed_domains = (
-        "hh.ru",
-        "www.hh.ru",
-        "krasnoyarsk.hh.ru",
+        "zarplata.ru",
+        "www.zarplata.ru",
+        "krasnoyarsk.zarplata.ru",
+        "ekb.zarplata.ru",
+        "krs.zarplata.ru",
+        "nsk.zarplata.ru",
+        "omsk.zarplata.ru",
+        "chelyabinsk.zarplata.ru",
     )
     manifest = AdapterManifest(
         site_id=site_id,
@@ -52,6 +57,9 @@ class HHAdapter:
         normalized = re.sub(r"[^\w\s+\-]", " ", normalized, flags=re.UNICODE)
         return re.sub(r"\s+", " ", normalized).strip()[:120]
 
+    # Backwards-compatible names used by older integrations.
+    _query = normalize_search_query
+
     @staticmethod
     def has_test_assignment(description: str) -> bool:
         text = unicodedata.normalize("NFKC", description).lower()
@@ -65,19 +73,76 @@ class HHAdapter:
         return any(re.search(pattern, text) for pattern in mandatory_patterns)
 
     async def get_login_state(self, page) -> LoginState:
-        # HH exposes stable UI hooks through ``data-qa`` rather than
-        # Playwright's default ``data-testid`` attribute. Using
-        # get_by_test_id() here therefore reported authenticated users as
-        # logged out.
-        authenticated_markers = page.locator(
-            "[data-qa='mainmenu_applicantProfile'], "
-            "[data-qa='mainmenu_myResumes'], "
-            "a[href*='/applicant/resumes']"
-        )
-        logged_in = await authenticated_markers.count() > 0
+        """Classify the visible Zarplata account controls conservatively."""
+
+        async def visible(locator) -> bool:
+            try:
+                is_visible = getattr(locator, "is_visible", None)
+                return bool(is_visible and await is_visible())
+            except Exception:
+                return False
+
+        async def count(locator) -> int:
+            try:
+                return int(await locator.count())
+            except Exception:
+                return 0
+
+        # These legacy hooks are unambiguous when visible. Keep each selector
+        # separate: test doubles and the live DOM need not support comma lists.
+        for selector in (
+            "[data-qa='mainmenu_applicantProfile']",
+            "[data-qa='mainmenu_myResumes']",
+            "a[href*='/applicant/resumes']",
+        ):
+            try:
+                marker = page.locator(selector).first
+                if await count(marker) and await visible(marker):
+                    logged_in = True
+                    break
+            except Exception:
+                continue
+        else:
+            logged_in = False
+
+        if logged_in:
+            return LoginState(authenticated=True, message="Вход выполнен")
+
+        # Profile and login controls are not authoritative: public Zarplata
+        # pages can render both, and regional redirects can change the host.
+        # Resolve the state through the same protected UI route the workflow
+        # can safely revisit before opening search. Do not inspect cookies,
+        # storage, or site APIs.
+        try:
+            await page.goto(
+                "https://zarplata.ru/applicant/resumes",
+                wait_until="commit",
+                timeout=15_000,
+            )
+            await page.wait_for_timeout(500)
+            reached = urlparse(str(getattr(page, "url", "")))
+            hostname = (reached.hostname or "").lower().rstrip(".")
+            path = unquote(reached.path or "/").rstrip("/") or "/"
+            if hostname not in ZarplataAdapter.allowed_domains:
+                authenticated = False
+            elif any(
+                path == prefix or path.startswith(f"{prefix}/")
+                for prefix in ("/applicant/resumes", "/applicant/profile")
+            ):
+                authenticated = True
+            elif (
+                path == "/account/login"
+                or path == "/account/signup"
+                or path.startswith("/auth/")
+            ):
+                authenticated = False
+            else:
+                authenticated = False
+        except Exception:
+            authenticated = False
         return LoginState(
-            authenticated=logged_in,
-            message="Вход выполнен" if logged_in else "Войдите вручную в открытом Chromium",
+            authenticated=authenticated,
+            message="Вход выполнен" if authenticated else "Войдите вручную в открытом Chromium",
         )
 
     async def open_search(self, page, filters: dict) -> None:
@@ -105,7 +170,7 @@ class HHAdapter:
             if filters.get("salary_min"):
                 params["salary"] = filters["salary_min"]
             self._fallback_search_urls.append(
-                f"https://hh.ru/search/vacancy?{urlencode(params)}"
+                f"https://zarplata.ru/search/vacancy?{urlencode(params)}"
             )
         self._fallback_search_url = (
             self._fallback_search_urls[0] if self._fallback_search_urls else None
@@ -119,11 +184,12 @@ class HHAdapter:
         self._repeated_search_pages = 0
         self.current_result_page: int | None = None
         self._search_navigation_count = 0
+        self._query_accepted_count = 0
 
-        # The authenticated home page contains HH's personalized "Для вас"
+        # The authenticated home page contains Zarplata\x27s personalized "Для вас"
         # recommendations. Prefer that ranking over a brittle text query.
         await page.goto(
-            "https://hh.ru/",
+            "https://zarplata.ru/",
             wait_until="commit",
             timeout=15_000,
         )
@@ -140,12 +206,65 @@ class HHAdapter:
         if await more_recommendations.count() and await more_recommendations.is_visible():
             await more_recommendations.click()
             await page.wait_for_timeout(1_500)
+        # The recommendation link can lead to a regional host or a different
+        # listing route.  Keep the URL actually reached; never manufacture a
+        # pagination URL from the home page.
+        self._recommendation_base_url = page.url
 
     async def collect_job_refs(self, page) -> list[JobRef]:
-        # Personalized recommendations are a larger initial snapshot than a
-        # single text-search page. Keep the latter capped by the helper's
-        # default limit of 100.
-        recommended_refs = await self._visible_job_refs(page, timeout=6_000, limit=200)
+        # Recommendation cards are paginated in the public DOM (usually about
+        # 20 per page). Traverse the reached listing, preserving page order
+        # and globally deduplicating ids. A home snapshot is still useful, but
+        # must not be followed by meaningless ``/?page=N`` navigations.
+        base_url = getattr(self, "_recommendation_base_url", None) or page.url
+        parsed_base = urlparse(base_url)
+        listing_path = parsed_base.path.rstrip("/") in {
+            "/search/vacancy",
+            "/vacancies",
+            "/recommendations",
+        }
+        recommended_refs: list[JobRef] = []
+        seen: set[str] = set()
+        previous_signature: tuple[str, ...] | None = None
+        repeated_signature_count = 0
+        max_pages = 25
+        for page_number in range(max_pages):
+            # Page 0 is the DOM already rendered after open_search.  For a
+            # known listing route, explicitly request each page so test and
+            # real navigation both observe the same deterministic sequence.
+            if page_number > 0 or listing_path and page_number == 0:
+                target = self._search_page_url(base_url, page_number)
+                try:
+                    await page.goto(target, wait_until="commit", timeout=15_000)
+                    await page.wait_for_timeout(1_500)
+                except Exception:
+                    # A stale/failed navigation must not spin indefinitely;
+                    # retain already collected refs and finish this phase.
+                    break
+            page_refs = await self._visible_job_refs(
+                page, timeout=6_000, limit=100 if listing_path else 200
+            )
+            signature = tuple(ref.external_id for ref in page_refs)
+            if not signature:
+                break
+            if signature == previous_signature:
+                repeated_signature_count += 1
+                if repeated_signature_count >= 3:
+                    break
+            else:
+                repeated_signature_count = 0
+            previous_signature = signature
+            for ref in page_refs:
+                if ref.external_id not in seen:
+                    seen.add(ref.external_id)
+                    recommended_refs.append(ref)
+                    if len(recommended_refs) >= 200:
+                        break
+            if len(recommended_refs) >= 200:
+                break
+            # A non-pageable home result is a single snapshot by design.
+            if not listing_path:
+                break
         self._search_page_number = 0
         self._search_seen_ids = {ref.external_id for ref in recommended_refs}
         self._search_exhausted = False
@@ -154,12 +273,13 @@ class HHAdapter:
         self.current_result_page = None
         self._search_query_index = 0
         self.current_search_query = None
+        self._query_accepted_count = 0
         return recommended_refs
 
     async def collect_more_job_refs(self, page) -> list[JobRef]:
         """Fetch the next search-result batch after recommendations are drained.
 
-        HH's personalized page and the text-search result pages are separate
+        Zarplata\x27s personalized page and the text-search result pages are separate
         listings. Keeping a cursor here prevents the workflow from treating a
         duplicate-heavy personalized snapshot as the end of an unlimited
         session. Empty/repeated pages are consumed internally, while the
@@ -197,8 +317,24 @@ class HHAdapter:
             new_refs = []
             for ref in page_refs:
                 if ref.external_id not in self._search_seen_ids:
-                    self._search_seen_ids.add(ref.external_id)
                     new_refs.append(ref)
+            remaining = 100 - self._query_accepted_count
+            if remaining <= 0:
+                new_refs = []
+            elif len(new_refs) > remaining:
+                new_refs = new_refs[:remaining]
+            # Only returned vacancies are globally processed.  Links beyond
+            # this query's 100-item cap may legitimately appear in a later
+            # adjacent query and must not be suppressed before the workflow
+            # has seen them.
+            self._search_seen_ids.update(ref.external_id for ref in new_refs)
+            self._query_accepted_count += len(new_refs)
+            if self._query_accepted_count >= 100:
+                self._search_query_index += 1
+                self._search_page_number = 0
+                self._last_search_page_signature = None
+                self._repeated_search_pages = 0
+                self._query_accepted_count = 0
             if new_refs:
                 return new_refs
         self._search_exhausted = True
@@ -263,6 +399,9 @@ class HHAdapter:
                     refs.append(JobRef(external_id=external_id, url=url))
         return refs
 
+    async def _refs(self, page, limit: int = 100) -> list[JobRef]:
+        return await self._visible_job_refs(page, timeout=6_000, limit=limit)
+
     async def open_job(self, page, ref: JobRef) -> None:
         if urlparse(ref.url).hostname not in self.allowed_domains:
             raise ValueError("Переход за пределы разрешённых доменов остановлен")
@@ -307,7 +446,7 @@ class HHAdapter:
         work_format = await optional_text(locators.WORK_FORMAT)
         external_id = page.url.rstrip("/").split("/")[-1].split("?")[0]
         return JobPosting(
-            source="hh",
+            source="zarplata",
             external_id=external_id,
             url=page.url,
             title=title,
@@ -324,7 +463,7 @@ class HHAdapter:
         )
 
     async def open_application(self, page) -> ApplicationForm:
-        # Keep the result classification tied to this attempt.  HH's
+        # Keep the result classification tied to this attempt.  Zarplata\x27s
         # one-click response closes the form immediately and then exposes the
         # same topic link used for responses that existed before this attempt.
         self._application_attempt_clicked = False
@@ -360,9 +499,9 @@ class HHAdapter:
     async def _application_questions(self, page) -> list[str]:
         """Return visible employer questions that the agent cannot answer safely.
 
-        HH's standalone response page renders test questions as bare textareas,
+        Zarplata\x27s standalone response page renders test questions as bare textareas,
         not as labels matching the popup selector. Detect controls first and
-        attach HH's nearby task prompts by order; metadata is a conservative
+        attach Zarplata\x27s nearby task prompts by order; metadata is a conservative
         fallback for other form variants.
         """
         for attempt in range(2):
@@ -457,9 +596,14 @@ class HHAdapter:
                 return await self.verify_submission(page, just_submitted=True)
             return SubmissionResult(
                 status="already_applied",
-                message="hh.ru показывает ранее отправленный отклик",
+                message="zarplata.ru показывает ранее отправленный отклик",
             )
-        return await self.verify_submission(page)
+        # A one-click response may close the form without rendering the topic
+        # link immediately.  Poll the independent success markers before
+        # classifying the attempt as unknown.
+        return await self.verify_submission(
+            page, just_submitted=getattr(self, "_application_attempt_clicked", False)
+        )
 
     async def verify_submission(self, page, just_submitted: bool = False) -> SubmissionResult:
         # HH updates the response form asynchronously. A fixed 1.2 second
@@ -470,25 +614,25 @@ class HHAdapter:
             if await page.locator(locators.ALREADY_APPLIED).count():
                 if just_submitted:
                     return SubmissionResult(
-                        status="submitted", message="hh.ru подтвердил отправку отклика"
+                        status="submitted", message="zarplata.ru подтвердил отправку отклика"
                     )
                 return SubmissionResult(
                     status="already_applied",
-                    message="hh.ru показывает ранее отправленный отклик",
+                    message="zarplata.ru показывает ранее отправленный отклик",
                 )
             if await page.locator(locators.SUBMISSION_CONFIRMED).count():
                 return SubmissionResult(
-                    status="submitted", message="hh.ru подтвердил отправку отклика"
+                    status="submitted", message="zarplata.ru подтвердил отправку отклика"
                 )
             text = (await page.locator("body").inner_text()).lower()
             if any(marker in text for marker in locators.SUBMISSION_TEXT_MARKERS):
                 return SubmissionResult(
-                    status="submitted", message="hh.ru подтвердил отправку отклика"
+                    status="submitted", message="zarplata.ru подтвердил отправку отклика"
                 )
             if attempt < 9:
                 await page.wait_for_timeout(500)
         return SubmissionResult(
-            status="unknown", message="hh.ru не показал однозначное подтверждение отправки"
+            status="unknown", message="zarplata.ru не показал однозначное подтверждение отправки"
         )
 
     async def detect_blockers(self, page) -> list[Blocker]:
@@ -498,3 +642,5 @@ class HHAdapter:
             if any(marker.lower() in text for marker in locators.CAPTCHA_MARKERS)
             else []
         )
+
+

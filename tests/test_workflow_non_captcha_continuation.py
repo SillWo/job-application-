@@ -131,7 +131,7 @@ async def run_workflow(runtime, monkeypatch, adapter, evaluate_impl=None):
         async def evaluate_impl(*args, **kwargs):
             return evaluation()
     monkeypatch.setattr(workflow, "evaluate", evaluate_impl)
-    await workflow.WorkflowManager()._run(session_id)
+    await workflow.WorkflowManager().run(session_id)
     return sessions, session_id
 
 
@@ -234,7 +234,7 @@ async def test_captcha_still_pauses(runtime, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_model_unavailable_marks_error_and_continues(runtime, monkeypatch):
+async def test_model_unavailable_pauses_without_error_and_does_not_continue(runtime, monkeypatch):
     refs = [JobRef(external_id="bad", url="https://fake/bad"),
             JobRef(external_id="next", url="https://fake/next")]
     calls = 0
@@ -250,9 +250,11 @@ async def test_model_unavailable_marks_error_and_continues(runtime, monkeypatch)
     with sessions() as db:
         item = db.get(JobSession, session_id)
         states = {v.external_id: v.state for v in db.scalars(select(Vacancy))}
-        assert item.status == SessionStatus.COMPLETED
-        assert item.counters["errors"] == 1
-        assert states == {"bad": "ERROR", "next": "REJECTED_BY_MODEL"}
+        assert item.status == SessionStatus.PAUSED
+        assert item.stop_reason == "offline"
+        assert item.finished_at is None
+        assert item.counters.get("errors", 0) == 0
+        assert states == {"bad": "EVALUATING"}
 
 
 @pytest.mark.asyncio
@@ -345,7 +347,7 @@ async def test_manual_review_decision_becomes_error_and_continues(runtime, monke
 
 
 @pytest.mark.asyncio
-async def test_letter_model_unavailable_marks_error_and_continues(runtime, monkeypatch):
+async def test_letter_model_unavailable_pauses_without_error(runtime, monkeypatch):
     refs = [JobRef(external_id="bad", url="https://fake/bad"),
             JobRef(external_id="next", url="https://fake/next")]
     letter_calls = 0
@@ -364,8 +366,66 @@ async def test_letter_model_unavailable_marks_error_and_continues(runtime, monke
     sessions, session_id = await run_workflow(runtime, monkeypatch, FakeAdapter(refs), apply_all)
     with sessions() as db:
         states = {v.external_id: v.state for v in db.scalars(select(Vacancy))}
-        assert db.get(JobSession, session_id).status == SessionStatus.COMPLETED
-        assert states == {"bad": "ERROR", "next": "SUBMITTED"}
+        item = db.get(JobSession, session_id)
+        assert item.status == SessionStatus.PAUSED
+        assert item.stop_reason == "offline"
+        assert item.finished_at is None
+        assert item.counters.get("errors", 0) == 0
+        assert states == {"bad": "EVALUATING"}
+
+
+@pytest.mark.asyncio
+async def test_uncaught_model_unavailable_pauses_session(runtime, monkeypatch):
+    manager = workflow.WorkflowManager()
+
+    async def fail_before_work(_session_id):
+        raise workflow.ModelUnavailable("API unavailable")
+
+    monkeypatch.setattr(manager, "_run", fail_before_work)
+    await manager.run(runtime[1])
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        assert item.status == SessionStatus.PAUSED
+        assert item.stop_reason == "API unavailable"
+        assert item.finished_at is None
+
+
+@pytest.mark.asyncio
+async def test_model_unavailable_resume_retries_same_vacancy(runtime, monkeypatch):
+    refs = [JobRef(external_id="first", url="https://fake/first"),
+            JobRef(external_id="second", url="https://fake/second")]
+    adapter = FakeAdapter(refs)
+    calls = 0
+
+    async def unavailable_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise workflow.ModelUnavailable("temporary API outage")
+        return evaluation()
+
+    monkeypatch.setattr(workflow.adapter_registry, "get", lambda adapter_id: adapter)
+    monkeypatch.setattr(workflow, "evaluate", unavailable_once)
+    manager = workflow.WorkflowManager()
+    await manager.run(runtime[1])
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        first = db.scalar(select(Vacancy).where(Vacancy.external_id == "first"))
+        assert item.status == SessionStatus.PAUSED
+        assert first.state == "EVALUATING"
+        assert item.counters.get("errors", 0) == 0
+
+    async def available(*args, **kwargs):
+        return evaluation()
+
+    monkeypatch.setattr(workflow, "evaluate", available)
+    await manager.run(runtime[1])
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        states = {v.external_id: v.state for v in db.scalars(select(Vacancy))}
+        assert item.status == SessionStatus.COMPLETED
+        assert item.counters.get("errors", 0) == 0
+        assert states == {"first": "REJECTED_BY_MODEL", "second": "REJECTED_BY_MODEL"}
 
 
 @pytest.mark.asyncio

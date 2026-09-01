@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .gateway import ModelUnavailable
+
 CATEGORIES = ("все вакансии", "дизайн", "разработка", "DevOps", "менеджмент", "тестирование", "аналитика", "маркетинг", "продажи", "финансы", "рекрутинг")
 
 HireHiCategory = Literal["все вакансии", "дизайн", "разработка", "DevOps", "менеджмент", "тестирование", "аналитика", "маркетинг", "продажи", "финансы", "рекрутинг"]
@@ -29,6 +31,8 @@ async def choose_hirehi_category(gateway, resume: dict, preference_policy=None) 
         choice = await gateway.structured("hirehi_category", payload, HireHiCategoryChoice)
         if choice.category in CATEGORIES:
             return choice
+    except ModelUnavailable:
+        raise
     except Exception:
         pass
     return deterministic_category(resume)

@@ -2,6 +2,7 @@ from collections.abc import Callable
 
 from backend.adapters.hh.adapter import HHAdapter
 from backend.adapters.hirehi.adapter import HireHiAdapter
+from backend.adapters.zarplata.adapter import ZarplataAdapter
 
 
 class AdapterRegistry:
@@ -9,6 +10,7 @@ class AdapterRegistry:
         self._factories: dict[str, Callable[[], object]] = {
             HHAdapter.site_id: HHAdapter,
             HireHiAdapter.site_id: HireHiAdapter,
+            ZarplataAdapter.site_id: ZarplataAdapter,
         }
         self._manifests = {
             site_id: factory().manifest for site_id, factory in self._factories.items()

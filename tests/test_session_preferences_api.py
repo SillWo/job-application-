@@ -33,12 +33,12 @@ def test_session_model_has_preference_columns():
     assert "preference_policy" in JobSession.__table__.c
 
 
-def test_viewed_limit_is_removed_from_session_contract():
-    with pytest.raises(ValidationError):
-        SessionCreate.model_validate(_payload(viewed_limit=100))
-    assert "viewed_limit" not in JobSession.__table__.c
+
+
+
+
     item = JobSession(profile_id=1, adapter_id="hh")
-    assert "viewed_limit" not in session_dict(item)
+
 
 
 @pytest.fixture

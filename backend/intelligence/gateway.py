@@ -32,6 +32,15 @@ class ModelUnavailable(RuntimeError):
     pass
 
 
+def _safe_api_error_text(error: APIError) -> str:
+    """Return useful provider detail without exposing credentials."""
+    detail = str(error).strip() or error.__class__.__name__
+    detail = re.sub(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+", r"\1[REDACTED]", detail)
+    detail = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[REDACTED]", detail)
+    detail = re.sub(r"\b(?:sk|sess|key)-[A-Za-z0-9_-]+\b", "[REDACTED]", detail)
+    return detail[:1000]
+
+
 def _schema_for_role(role: str, schema: type[BaseModel]) -> dict:
     result = schema.model_json_schema()
     if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
@@ -254,7 +263,12 @@ class ModelGateway:
                             },
                         },
                     )
-                    content = (response.choices[0].message.content or "").strip()
+                    try:
+                        content = (response.choices[0].message.content or "").strip()
+                    except (IndexError, AttributeError, TypeError) as exc:
+                        raise ModelUnavailable(
+                            "OpenAI-compat API вернул ответ неожиданной структуры"
+                        ) from exc
                     try:
                         if not content:
                             raise ValueError("OpenAI-compat вернул пустой ответ")
@@ -344,7 +358,9 @@ class ModelGateway:
             except ModelUnavailable:
                 raise
             except APIError as exc:
-                raise ModelUnavailable("OpenAI-compat API недоступен") from exc
+                raise ModelUnavailable(
+                    f"OpenAI-compat API недоступен: {_safe_api_error_text(exc)}"
+                ) from exc
 
     @staticmethod
     def _saved_config():

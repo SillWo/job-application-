@@ -5,8 +5,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .gateway import ModelUnavailable
-
 
 class SearchQuery(BaseModel):
     model_config = {"extra": "forbid"}
@@ -87,7 +85,7 @@ async def plan_search_queries(gateway, resumes: list[dict[str, Any]], limit: int
     try:
         planned = await gateway.structured("search_planner", payload, SearchQueryPlan)
         values = [item.query for item in planned.queries if not item.is_title_equivalent]
-    except (ModelUnavailable, ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError):
         values = []
     result = _sanitize(values, resumes, limit)
     if result:

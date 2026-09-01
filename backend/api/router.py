@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+import csv
+import io
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, time, timezone
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from fastapi import (
@@ -16,9 +21,9 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import func, select, update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from backend.adapters import adapter_registry
@@ -695,7 +700,10 @@ async def open_session_browser(session_id: int, db: Session = Depends(get_db)) -
     except Exception:
         release_browser_lease(session_id, adapter.site_id)
         raise
-    target = "https://hirehi.ru/" if item.adapter_id == "hirehi" else "https://hh.ru"
+    # Keep the landing page explicit per supported site: this is also the
+    # first page used for manual login in the persistent Chromium profile.
+    targets = {"hh": "https://hh.ru/", "hirehi": "https://hirehi.ru/", "zarplata": "https://zarplata.ru/"}
+    target = targets.get(item.adapter_id, f"https://{adapter.allowed_domains[0]}/")
     site_name = getattr(adapter, "display_name", item.adapter_id)
     set_browser(session_id, executor)
     try:
@@ -737,6 +745,37 @@ async def check_session_browser(session_id: int, db: Session = Depends(get_db)) 
     return {
         "ok": True,
         "message": f"Вход в {getattr(adapter, 'display_name', item.adapter_id)} подтверждён, сессия продолжена",
+    }
+
+
+@router.get("/sessions/{session_id}/browser/login-status")
+async def session_browser_login_status(session_id: int, db: Session = Depends(get_db)) -> dict:
+    """Return login state without starting or mutating the workflow."""
+    item = db.get(JobSession, session_id)
+    if not item:
+        raise HTTPException(404, "Сессия не найдена")
+    adapter = adapter_registry.get(item.adapter_id)
+    executor = get_browser(session_id)
+    if not executor:
+        raise HTTPException(
+            400,
+            f"Сначала откройте Chromium для {getattr(adapter, 'display_name', item.adapter_id)}",
+        )
+
+    login = await adapter.get_login_state(executor.page)
+    raw_url = str(getattr(executor.page, "url", "") or "")
+    parsed = urlparse(raw_url)
+    hostname = (parsed.hostname or "").lower()
+    allowed = {str(domain).lower() for domain in adapter.allowed_domains}
+    safe_url = (
+        urlunparse(("https", parsed.netloc, parsed.path or "/", "", "", ""))
+        if parsed.scheme.lower() == "https" and hostname in allowed
+        else None
+    )
+    return {
+        "authenticated": bool(login.authenticated),
+        "message": str(login.message),
+        "url": safe_url,
     }
 
 
@@ -804,32 +843,302 @@ def public_evaluation(data: dict | None) -> dict | None:
     return result
 
 
+VACANCY_SCORE_KEYS = (
+    "tasks",
+    "skills",
+    "experience_depth",
+    "role_match",
+    "industry",
+    "special_requirements",
+)
+VACANCY_SCORE_ALIASES = {
+    "experience_depth": "required_years",
+    "role_match": "title",
+    "special_requirements": "languages",
+}
+VacancySort = Literal[
+    "id",
+    "title",
+    "state",
+    "date",
+    "site",
+    "total_score",
+    "tasks",
+    "skills",
+    "experience_depth",
+    "role_match",
+    "industry",
+    "special_requirements",
+]
+VacancySortDirection = Literal["asc", "desc"]
+VacancyExportFormat = Literal["csv", "xlsx", "xml"]
+VACANCY_EXPORT_HEADERS = (
+    "Номер вакансии",
+    "Название вакансии",
+    "Компания",
+    "Сайт",
+    "Дата",
+    "Общий балл",
+    "Задачи",
+    "Навыки",
+    "Опыт",
+    "Роль",
+    "Сфера",
+    "Особые требования",
+)
+
+
+def _numeric_score(value: object) -> int | float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _evaluation_scores(evaluation: Evaluation | None) -> dict[str, int | float | None]:
+    if evaluation is None:
+        return {}
+    data = evaluation.data or {}
+    result: dict[str, int | float | None] = {"total_score": _numeric_score(data.get("score"))}
+    breakdown = data.get("score_breakdown")
+    if isinstance(breakdown, list):
+        for row in breakdown:
+            if not isinstance(row, dict) or not isinstance(row.get("key"), str):
+                continue
+            result[row["key"]] = _numeric_score(row.get("points"))
+    for key, alias in VACANCY_SCORE_ALIASES.items():
+        if result.get(key) is None and result.get(alias) is not None:
+            result[key] = result[alias]
+    return result
+
+
+def _comparable_status_time(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _public_status_time(vacancy: Vacancy) -> str | None:
+    value = vacancy.status_changed_at
+    if value is None:
+        return None
+    # SQLite drops timezone offsets. New rows have a display platform and are
+    # written by ``now()`` in UTC; migrated legacy rows intentionally keep the
+    # exact local-looking literal requested for 01.09.2026 00:00.
+    if vacancy.site and value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat(timespec="seconds")
+
+
+def _export_status_time(vacancy: Vacancy) -> str:
+    value = vacancy.status_changed_at
+    if value is None:
+        return ""
+    if vacancy.site:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        value = value.astimezone()
+    return value.strftime("%d.%m.%Y %H:%M")
+
+
+def _filtered_vacancy_rows(
+    db: Session,
+    *,
+    search: str | None = None,
+    state: str | None = None,
+    site: str | None = None,
+    status_date_from: date | None = None,
+    status_date_to: date | None = None,
+    total_score_min: float | None = None,
+    total_score_max: float | None = None,
+    score_limits: dict[str, tuple[float | None, float | None]] | None = None,
+    sort: VacancySort = "date",
+    sort_dir: VacancySortDirection = "desc",
+) -> list[tuple[Vacancy, Evaluation | None]]:
+    rows = list(
+        db.execute(
+            select(Vacancy, Evaluation).outerjoin(
+                Evaluation, Evaluation.vacancy_id == Vacancy.id
+            )
+        ).all()
+    )
+    needle = (search or "").strip().casefold()
+    date_from = datetime.combine(status_date_from, time.min) if status_date_from else None
+    date_to = datetime.combine(status_date_to, time.max) if status_date_to else None
+    requested_site = "" if site == "__legacy__" else site
+    limits = score_limits or {}
+    filtered: list[tuple[Vacancy, Evaluation | None]] = []
+
+    state_groups = {
+        "EVALUATING": {"EVALUATING"},
+        "REJECTED_BY_MODEL": {"REJECTED_BY_MODEL", "FILTERED_OUT"},
+        "REPORTED": {"REPORTED"},
+        "ERROR": {"ERROR", "FAILED", "UNKNOWN", "UNKNOWN_RESULT"},
+    }
+    accepted_states = state_groups.get(state) if state else None
+
+    for vacancy, evaluation in rows:
+        haystack = " ".join(
+            (
+                str(vacancy.id),
+                vacancy.external_id or "",
+                vacancy.title or "",
+                vacancy.company or "",
+            )
+        ).casefold()
+        if needle and needle not in haystack:
+            continue
+        if state and (vacancy.state not in accepted_states if accepted_states is not None else vacancy.state != state):
+            continue
+        if requested_site is not None and vacancy.site != requested_site:
+            continue
+        status_time = _comparable_status_time(vacancy.status_changed_at)
+        if date_from and (status_time is None or status_time < date_from):
+            continue
+        if date_to and (status_time is None or status_time > date_to):
+            continue
+        scores = _evaluation_scores(evaluation)
+        total_score = scores.get("total_score")
+        if total_score_min is not None and (
+            total_score is None or total_score < total_score_min
+        ):
+            continue
+        if total_score_max is not None and (
+            total_score is None or total_score > total_score_max
+        ):
+            continue
+        outside_limit = False
+        for key, (minimum, maximum) in limits.items():
+            value = scores.get(key)
+            if minimum is not None and (value is None or value < minimum):
+                outside_limit = True
+                break
+            if maximum is not None and (value is None or value > maximum):
+                outside_limit = True
+                break
+        if not outside_limit:
+            filtered.append((vacancy, evaluation))
+
+    def sort_value(row: tuple[Vacancy, Evaluation | None]) -> object | None:
+        vacancy, evaluation = row
+        if sort == "id":
+            return vacancy.id
+        if sort == "title":
+            return (vacancy.title or "").casefold()
+        if sort == "state":
+            return (vacancy.state or "").casefold()
+        if sort == "date":
+            return _comparable_status_time(vacancy.status_changed_at)
+        if sort == "site":
+            return (vacancy.site or "").casefold()
+        return _evaluation_scores(evaluation).get(sort)
+
+    filtered.sort(key=lambda row: row[0].id)
+    populated = [row for row in filtered if sort_value(row) is not None]
+    missing = [row for row in filtered if sort_value(row) is None]
+    populated.sort(key=sort_value, reverse=sort_dir == "desc")
+    return populated + missing
+
+
+def _vacancy_score_limits(
+    *,
+    tasks_min: float | None,
+    tasks_max: float | None,
+    skills_min: float | None,
+    skills_max: float | None,
+    experience_depth_min: float | None,
+    experience_depth_max: float | None,
+    role_match_min: float | None,
+    role_match_max: float | None,
+    industry_min: float | None,
+    industry_max: float | None,
+    special_requirements_min: float | None,
+    special_requirements_max: float | None,
+) -> dict[str, tuple[float | None, float | None]]:
+    return {
+        "tasks": (tasks_min, tasks_max),
+        "skills": (skills_min, skills_max),
+        "experience_depth": (experience_depth_min, experience_depth_max),
+        "role_match": (role_match_min, role_match_max),
+        "industry": (industry_min, industry_max),
+        "special_requirements": (special_requirements_min, special_requirements_max),
+    }
+
+
+def _public_vacancy(vacancy: Vacancy, evaluation: Evaluation | None, include_data: bool) -> dict:
+    result = {
+        "id": vacancy.id,
+        "session_id": vacancy.session_id,
+        "title": vacancy.title,
+        "company": vacancy.company,
+        "url": vacancy.url,
+        "state": vacancy.state,
+        "source": vacancy.source or "",
+        "site": vacancy.site or "",
+        "status_changed_at": _public_status_time(vacancy),
+        "evaluation": public_evaluation(evaluation.data) if evaluation else None,
+    }
+    if include_data:
+        result["data"] = vacancy.data
+    return result
+
+
 @router.get("/vacancies")
 def vacancies(
     limit: int = Query(30, ge=1, le=100),
     offset: int = Query(0, ge=0),
     include_data: bool = Query(False),
+    search: str | None = Query(None),
+    state: str | None = Query(None),
+    site: str | None = Query(None),
+    status_date_from: date | None = Query(None),
+    status_date_to: date | None = Query(None),
+    total_score_min: float | None = Query(None, ge=0, le=100),
+    total_score_max: float | None = Query(None, ge=0, le=100),
+    sort: VacancySort = Query("date"),
+    sort_dir: VacancySortDirection = Query("desc"),
+    tasks_min: float | None = Query(None, ge=0, le=100),
+    tasks_max: float | None = Query(None, ge=0, le=100),
+    skills_min: float | None = Query(None, ge=0, le=100),
+    skills_max: float | None = Query(None, ge=0, le=100),
+    experience_depth_min: float | None = Query(None, ge=0, le=100),
+    experience_depth_max: float | None = Query(None, ge=0, le=100),
+    role_match_min: float | None = Query(None, ge=0, le=100),
+    role_match_max: float | None = Query(None, ge=0, le=100),
+    industry_min: float | None = Query(None, ge=0, le=100),
+    industry_max: float | None = Query(None, ge=0, le=100),
+    special_requirements_min: float | None = Query(None, ge=0, le=100),
+    special_requirements_max: float | None = Query(None, ge=0, le=100),
     db: Session = Depends(get_db),
 ) -> dict:
-    total = db.scalar(select(func.count()).select_from(Vacancy)) or 0
-    rows = []
-    for vacancy in db.scalars(
-        select(Vacancy).order_by(Vacancy.id.desc()).offset(offset).limit(limit)
-    ):
-        evaluation = db.scalar(select(Evaluation).where(Evaluation.vacancy_id == vacancy.id))
-        rows.append(
-            {
-                "id": vacancy.id,
-                "session_id": vacancy.session_id,
-                "title": vacancy.title,
-                "company": vacancy.company,
-                "url": vacancy.url,
-                "state": vacancy.state,
-                "evaluation": public_evaluation(evaluation.data) if evaluation else None,
-            }
-        )
-        if include_data:
-            rows[-1]["data"] = vacancy.data
+    all_rows = _filtered_vacancy_rows(
+        db,
+        search=search,
+        state=state,
+        site=site,
+        status_date_from=status_date_from,
+        status_date_to=status_date_to,
+        total_score_min=total_score_min,
+        total_score_max=total_score_max,
+        score_limits=_vacancy_score_limits(
+            tasks_min=tasks_min,
+            tasks_max=tasks_max,
+            skills_min=skills_min,
+            skills_max=skills_max,
+            experience_depth_min=experience_depth_min,
+            experience_depth_max=experience_depth_max,
+            role_match_min=role_match_min,
+            role_match_max=role_match_max,
+            industry_min=industry_min,
+            industry_max=industry_max,
+            special_requirements_min=special_requirements_min,
+            special_requirements_max=special_requirements_max,
+        ),
+        sort=sort,
+        sort_dir=sort_dir,
+    )
+    total = len(all_rows)
+    page_rows = all_rows[offset : offset + limit]
+    rows = [_public_vacancy(vacancy, evaluation, include_data) for vacancy, evaluation in page_rows]
     return {
         "items": rows,
         "total": total,
@@ -837,6 +1146,112 @@ def vacancies(
         "offset": offset,
         "has_more": offset + len(rows) < total,
     }
+
+
+@router.get("/vacancies/export")
+def export_vacancies(
+    format: VacancyExportFormat = Query("csv"),
+    search: str | None = Query(None),
+    state: str | None = Query(None),
+    site: str | None = Query(None),
+    status_date_from: date | None = Query(None),
+    status_date_to: date | None = Query(None),
+    total_score_min: float | None = Query(None, ge=0, le=100),
+    total_score_max: float | None = Query(None, ge=0, le=100),
+    sort: VacancySort = Query("date"),
+    sort_dir: VacancySortDirection = Query("desc"),
+    tasks_min: float | None = Query(None, ge=0, le=100),
+    tasks_max: float | None = Query(None, ge=0, le=100),
+    skills_min: float | None = Query(None, ge=0, le=100),
+    skills_max: float | None = Query(None, ge=0, le=100),
+    experience_depth_min: float | None = Query(None, ge=0, le=100),
+    experience_depth_max: float | None = Query(None, ge=0, le=100),
+    role_match_min: float | None = Query(None, ge=0, le=100),
+    role_match_max: float | None = Query(None, ge=0, le=100),
+    industry_min: float | None = Query(None, ge=0, le=100),
+    industry_max: float | None = Query(None, ge=0, le=100),
+    special_requirements_min: float | None = Query(None, ge=0, le=100),
+    special_requirements_max: float | None = Query(None, ge=0, le=100),
+    db: Session = Depends(get_db),
+) -> Response:
+    rows = _filtered_vacancy_rows(
+        db,
+        search=search,
+        state=state,
+        site=site,
+        status_date_from=status_date_from,
+        status_date_to=status_date_to,
+        total_score_min=total_score_min,
+        total_score_max=total_score_max,
+        score_limits=_vacancy_score_limits(
+            tasks_min=tasks_min,
+            tasks_max=tasks_max,
+            skills_min=skills_min,
+            skills_max=skills_max,
+            experience_depth_min=experience_depth_min,
+            experience_depth_max=experience_depth_max,
+            role_match_min=role_match_min,
+            role_match_max=role_match_max,
+            industry_min=industry_min,
+            industry_max=industry_max,
+            special_requirements_min=special_requirements_min,
+            special_requirements_max=special_requirements_max,
+        ),
+        sort=sort,
+        sort_dir=sort_dir,
+    )
+
+    def export_values(vacancy: Vacancy, evaluation: Evaluation | None) -> list[object]:
+        scores = _evaluation_scores(evaluation)
+        return [
+            vacancy.id,
+            vacancy.title,
+            vacancy.company or "",
+            vacancy.site or "",
+            _export_status_time(vacancy),
+            scores.get("total_score") if scores.get("total_score") is not None else "",
+            *[
+                scores.get(key) if scores.get(key) is not None else ""
+                for key in VACANCY_SCORE_KEYS
+            ],
+        ]
+
+    data = [export_values(vacancy, evaluation) for vacancy, evaluation in rows]
+    if format == "xlsx":
+        from openpyxl import Workbook
+
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Вакансии"
+        sheet.append(VACANCY_EXPORT_HEADERS)
+        for row in data:
+            sheet.append(row)
+        output = io.BytesIO()
+        book.save(output)
+        return Response(
+            output.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="vacancies.xlsx"'},
+        )
+    if format == "xml":
+        root = ET.Element("vacancies")
+        for row in data:
+            item = ET.SubElement(root, "vacancy")
+            for header, value in zip(VACANCY_EXPORT_HEADERS, row, strict=True):
+                field = ET.SubElement(item, "field", name=header)
+                field.text = "" if value is None else str(value)
+        return Response(
+            ET.tostring(root, encoding="utf-8", xml_declaration=True),
+            media_type="application/xml",
+            headers={"Content-Disposition": 'attachment; filename="vacancies.xml"'},
+        )
+    output = io.StringIO(newline="")
+    csv.writer(output).writerows([VACANCY_EXPORT_HEADERS, *data])
+    return Response(
+        output.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="vacancies.csv"'},
+    )
 
 
 async def session_socket(websocket: WebSocket, session_id: int) -> None:

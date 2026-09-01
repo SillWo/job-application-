@@ -164,6 +164,13 @@ def _notify_vacancy_state_changes(session: Session, _flush_context, _instances) 
             session.add(_vacancy_notification(item))
 
 
+@event.listens_for(Session, "before_flush")
+def _stamp_vacancy_state_changes(session: Session, _flush_context, _instances) -> None:
+    for item in session.dirty:
+        if isinstance(item, Vacancy) and inspect(item).attrs.state.history.has_changes():
+            item.status_changed_at = now()
+
+
 @event.listens_for(Session, "after_flush_postexec")
 def _notify_new_vacancy_states(session: Session, _flush_context) -> None:
     pending = session.info.pop("_pending_vacancy_notifications", set())
@@ -186,13 +193,24 @@ class Vacancy(Base):
     # Historical HH vacancies may outlive their deleted session.
     session_id: Mapped[int | None] = mapped_column(ForeignKey("sessions.id"), nullable=True)
     source: Mapped[str] = mapped_column(String(50))
+    # ``None`` means a newly discovered vacancy whose display platform should
+    # be derived from ``source``.  An explicit empty string is reserved for
+    # migrated legacy rows and must remain empty.
+    site: Mapped[str | None] = mapped_column(String(100), nullable=False, default=None)
     external_id: Mapped[str | None] = mapped_column(String(255))
     url: Mapped[str] = mapped_column(String(1000))
     title: Mapped[str] = mapped_column(String(500))
     company: Mapped[str | None] = mapped_column(String(500))
     state: Mapped[str] = mapped_column(String(40), default="DISCOVERED")
+    status_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+@event.listens_for(Vacancy, "before_insert")
+def _set_vacancy_site(mapper, connection, item: Vacancy) -> None:
+    if item.site is None:
+        item.site = {"hh": "HH.ru", "hirehi": "HireHi", "zarplata": "Zarplata.ru"}.get(item.source, item.source or "")
 
 
 class VacancySnapshot(Base):

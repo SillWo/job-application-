@@ -14,12 +14,8 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Server defaults preserve the behaviour of sessions created before this
-    # release. Explicit NULL remains the durable representation of unlimited.
-    op.add_column(
-        "sessions",
-        sa.Column("viewed_limit", sa.Integer(), nullable=True, server_default="30"),
-    )
+    # Server defaults preserve the behaviour of sessions created before this release.
+    # Explicit NULL remains the durable representation of unlimited.
     op.add_column(
         "sessions",
         sa.Column("application_limit", sa.Integer(), nullable=True, server_default="5"),
@@ -28,4 +24,3 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_column("sessions", "application_limit")
-    op.drop_column("sessions", "viewed_limit")

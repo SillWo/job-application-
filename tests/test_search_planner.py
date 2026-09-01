@@ -45,7 +45,7 @@ async def test_model_failure_uses_explicit_safe_fallback_and_limit():
     resume = {**RESUME, "adjacent_titles": ["A", "B"], "related_titles": [
         "Project Manager", "Руководитель проектов"
     ]}
-    assert await plan_search_queries(Gateway(error=ModelUnavailable("down")), [resume], 2) == []
+    assert await plan_search_queries(Gateway(error=ValueError("down")), [resume], 2) == []
 
 
 @pytest.mark.asyncio
@@ -55,7 +55,13 @@ async def test_structured_fallback_candidate_is_trusted_only_when_classified():
         {"query": "Core role", "relation_to_resume": "same", "is_title_equivalent": True},
         "Legacy role",
     ]}
-    assert await plan_search_queries(Gateway(error=ModelUnavailable("down")), [resume]) == ["Adjacent role"]
+    assert await plan_search_queries(Gateway(error=ValueError("down")), [resume]) == ["Adjacent role"]
+
+
+@pytest.mark.asyncio
+async def test_model_unavailable_is_propagated_to_pause_workflow():
+    with pytest.raises(ModelUnavailable, match="down"):
+        await plan_search_queries(Gateway(error=ModelUnavailable("down")), [RESUME])
 
 
 @pytest.mark.asyncio

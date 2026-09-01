@@ -1483,3 +1483,90 @@ button:not(:disabled):active, .button-link:active { transform: scale(.98); }
   .topbar, .topbar-nav, .sticky-actions, .profile-save-bar { background: var(--paper); backdrop-filter: none; }
   button, .button-link, input, select, textarea, .panel, .status, .notice { border-color: var(--ink); }
 }
+.vacancy-status-date {
+  display: block;
+  margin-top: .2rem;
+  color: var(--muted);
+  font-size: .7rem;
+}
+.vacancy-filters {
+  display: grid;
+  gap: 1rem;
+  margin-block: 1rem;
+  margin-inline: auto;
+  padding: 20px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-surface);
+}
+.vacancy-filter-primary, .vacancy-filter-secondary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: .75rem;
+  align-items: end;
+}
+.vacancy-filter-criteria { overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius-subcard); background: var(--surface); }
+.vacancy-filter-criteria summary { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 48px; padding: .5rem .75rem; cursor: pointer; list-style: none; }
+.vacancy-filter-criteria summary::-webkit-details-marker { display: none; }
+.vacancy-filter-criteria summary > span { display: grid; gap: .1rem; }
+.vacancy-filter-criteria summary small { color: var(--muted); font-size: 12px; }
+.vacancy-filter-criteria summary { transition: background-color var(--duration-fast) var(--ease-out); }
+.vacancy-filter-criteria summary:active { background-color: var(--canvas); }
+.vacancy-filter-chevron { flex: 0 0 auto; width: 18px; height: 18px; transition: transform var(--duration-fast) var(--ease-out); }
+.vacancy-filter-criteria[open] .vacancy-filter-chevron { transform: rotate(180deg); }
+.vacancy-filter-criteria-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .75rem; padding: .75rem; border-top: 1px solid var(--line); background: var(--paper); }
+.vacancy-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: .3rem;
+  min-width: 0;
+  color: var(--soft);
+  font-size: 14px;
+  font-weight: 500;
+}
+.vacancy-filters fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.vacancy-filters legend {
+  margin-bottom: .3rem;
+  color: var(--muted);
+  font-size: .75rem;
+}
+.vacancy-filters input, .vacancy-filters select {
+  width: 100%;
+  min-width: 0;
+  min-height: var(--field-height);
+  padding: 0 .85rem;
+  background: var(--canvas);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  color: var(--ink);
+}
+.vacancy-filters input:focus-visible, .vacancy-filters select:focus-visible { background: var(--paper); border-color: var(--ink); box-shadow: 0 0 0 3px var(--paper), 0 0 0 5px var(--ink) !important; }
+.vacancy-filter-range {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: .45rem;
+}
+.vacancy-filter-range legend { grid-column: 1 / -1; }
+.vacancy-filter-range label { color: var(--muted); font-size: 12px; }
+.vacancy-export-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  gap: .5rem;
+}
+@media (max-width: 640px) {
+  .vacancy-filter-primary, .vacancy-filter-secondary, .vacancy-filter-criteria-grid { grid-template-columns: 1fr; }
+  .vacancy-search, .vacancy-export-actions { grid-column: 1 / -1; }
+}
+@media (hover: hover) and (pointer: fine) {
+  .vacancy-filter-criteria summary:hover { background-color: var(--canvas); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vacancy-filter-chevron { transition: none; }
+}

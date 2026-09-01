@@ -1,15 +1,19 @@
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import APIError
 from pydantic import ValidationError
 
 from backend.intelligence import gateway as gateway_module
 from backend.intelligence.gateway import (
     ModelGateway,
     ModelUnavailable,
+    _safe_api_error_text,
     _schema_for_role,
 )
+from backend.intelligence.hirehi_category import JobSummary
 from backend.intelligence.prompts import ROLE_PROMPTS
 from backend.schemas.domain import ResumeAnalysis
 
@@ -23,6 +27,18 @@ CRITERIA = {
     "reason",
     "skills_summary",
 }
+
+
+def test_api_error_text_keeps_provider_detail_and_redacts_credentials():
+    error = APIError(
+        "HTTP 401: invalid key; Authorization: Bearer sk-secret-value",
+        httpx.Request("POST", "https://llm.example.test/chat/completions"),
+        body=None,
+    )
+    detail = _safe_api_error_text(error)
+    assert "HTTP 401" in detail
+    assert "sk-secret-value" not in detail
+    assert "[REDACTED]" in detail
 
 
 def _response(payload: dict) -> SimpleNamespace:
@@ -130,3 +146,65 @@ async def test_resume_analyst_four_invalid_responses_raise_model_unavailable(mon
             "resume_analyst", {"job": {}, "resumes": []}, ResumeAnalysis
         )
     assert len(completions.calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_structured_api_error_preserves_provider_detail_without_secret(monkeypatch):
+    provider_detail = "HTTP 429: quota exceeded; Authorization: Bearer sk-live-secret"
+    api_error = APIError(
+        provider_detail,
+        httpx.Request("POST", "https://api.example.test/v1/chat/completions"),
+        body=None,
+    )
+
+    class FailingCompletions:
+        async def create(self, **kwargs):
+            raise api_error
+
+    monkeypatch.setattr(
+        gateway_module,
+        "AsyncOpenAI",
+        lambda **_: _FakeClient(FailingCompletions()),
+    )
+    saved = SimpleNamespace(
+        base_url="https://api.example.test/v1",
+        model="test-model",
+        encrypted_api_key="ciphertext",
+    )
+    monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
+    monkeypatch.setattr(gateway_module, "decrypt_secret", lambda _: "test-key")
+
+    with pytest.raises(ModelUnavailable) as raised:
+        await ModelGateway(provider="openai_compat").structured(
+            "job_summary", {"job": {"title": "Test"}}, JobSummary
+        )
+
+    message = str(raised.value)
+    assert "HTTP 429" in message
+    assert "quota exceeded" in message
+    assert "sk-live-secret" not in message
+
+
+@pytest.mark.asyncio
+async def test_structured_empty_choices_becomes_model_unavailable(monkeypatch):
+    class EmptyCompletions:
+        async def create(self, **kwargs):
+            return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr(
+        gateway_module,
+        "AsyncOpenAI",
+        lambda **_: _FakeClient(EmptyCompletions()),
+    )
+    saved = SimpleNamespace(
+        base_url="https://api.example.test/v1",
+        model="test-model",
+        encrypted_api_key="ciphertext",
+    )
+    monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
+    monkeypatch.setattr(gateway_module, "decrypt_secret", lambda _: "test-key")
+
+    with pytest.raises(ModelUnavailable, match="неожиданной структуры"):
+        await ModelGateway(provider="openai_compat").structured(
+            "job_summary", {"job": {"title": "Test"}}, JobSummary
+        )

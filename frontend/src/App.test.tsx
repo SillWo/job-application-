@@ -127,6 +127,144 @@ test('captures only the user job description with a 2000-character limit', async
   expect(payload).not.toHaveProperty('red_flags')
 })
 
+test('renders vacancy site and exact status timestamp while legacy has no dangling site separator', async () => {
+  const rows = [
+    { id: 1, title: 'Роль', company: 'Компания', site: 'HH.ru', status_changed_at: '2026-09-01T00:00:00', url: '#', state: 'REPORTED', evaluation: null },
+    { id: 2, title: 'Legacy', company: 'Старая', site: '', status_changed_at: '2026-09-01T00:00:00', url: '#', state: 'REPORTED', evaluation: null },
+  ]
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).includes('/api/vacancies') ? Promise.resolve({ ok: true, json: async () => ({ items: rows, total: 2, limit: 30, offset: 0, has_more: false }) }) : Promise.resolve({ ok: true, json: async () => [] })));
+  render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByText(/#1 · Компания · HH\.ru/)).toBeInTheDocument()
+  expect(screen.getAllByText('01.09.2026 00:00').length).toBeGreaterThan(0)
+  expect(screen.getByText(/#2 · Старая$/)).toBeInTheDocument()
+})
+
+test('status filter shows unique Russian labels while preserving state values', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).includes('/api/vacancies')
+    ? Promise.resolve({ ok: true, json: async () => ({ items: [], total: 0, limit: 30, offset: 0, has_more: false }) })
+    : Promise.resolve({ ok: true, json: async () => [] })))
+  render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  const select = await screen.findByRole('combobox', { name: 'Статус' })
+  const options = within(select).getAllByRole('option')
+  const labels = options.map((option) => option.textContent ?? '')
+  expect(new Set(labels).size).toBe(labels.length)
+  expect(labels.every((label) => !/[A-Za-z]/.test(label))).toBe(true)
+  expect(labels).toEqual(['Все', 'Оценка вакансии', 'Отклонена моделью', 'В отчёте', 'Ошибка'])
+  expect(within(select).getByRole('option', { name: 'Отклонена моделью' })).toHaveValue('REJECTED_BY_MODEL')
+})
+
+test('builds CSV XLSX XML export links without pagination', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).includes('/api/vacancies') ? Promise.resolve({ ok: true, json: async () => ({ items: [], total: 0, limit: 30, offset: 0, has_more: false }) }) : Promise.resolve({ ok: true, json: async () => [] })))
+  render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  fireEvent.change(await screen.findByRole('textbox', { name: 'Поиск' }), { target: { value: 'аналитик' } })
+  const criteriaDetails = screen.getByText('Баллы по критериям').closest('details') as HTMLDetailsElement
+  const criteriaSummary = criteriaDetails.querySelector('summary') as HTMLElement
+  expect(criteriaDetails).not.toHaveAttribute('open')
+  expect(criteriaSummary).toHaveAttribute('aria-expanded', 'false')
+  expect(screen.getByRole('spinbutton', { name: 'Задачи от' })).not.toBeVisible()
+  fireEvent.click(criteriaSummary)
+  await waitFor(() => {
+    expect(criteriaDetails).toHaveAttribute('open')
+    expect(criteriaSummary).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('spinbutton', { name: 'Задачи от' })).toBeVisible()
+  })
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'Задачи от' }), { target: { value: '20' } })
+  for (const format of ['CSV', 'XLSX', 'XML']) {
+    const href = screen.getByRole('link', { name: format }).getAttribute('href') ?? ''
+    expect(href).toContain(`format=${format.toLowerCase()}`)
+    expect(href).toContain('search=%D0%B0%D0%BD%D0%B0%D0%BB%D0%B8%D1%82%D0%B8%D0%BA')
+    expect(href).toContain('tasks_min=20')
+    expect(href).not.toMatch(/limit|offset/)
+  }
+})
+
+test('sends server search and every vacancy filter range before pagination', async () => {
+  const requests: string[] = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    requests.push(url)
+    return url.includes('/api/vacancies')
+      ? Promise.resolve({ ok: true, json: async () => ({ items: [], total: 0, limit: 30, offset: 0, has_more: false }) })
+      : Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  fireEvent.change(await screen.findByRole('textbox', { name: 'Поиск' }), { target: { value: 'global needle' } })
+  fireEvent.click(screen.getByText('Баллы по критериям').closest('summary') as HTMLElement)
+  fireEvent.change(screen.getByRole('combobox', { name: 'Статус' }), { target: { value: 'REJECTED_BY_MODEL' } })
+  fireEvent.change(screen.getByRole('combobox', { name: 'Сайт' }), { target: { value: 'HH.ru' } })
+  fireEvent.change(screen.getByLabelText('Дата от'), { target: { value: '2026-09-01' } })
+  fireEvent.change(screen.getByLabelText('Дата до'), { target: { value: '2026-09-30' } })
+  const ranges: Array<[string, string]> = [
+    ['Общий балл', '80'],
+    ['Задачи', '30'],
+    ['Навыки', '18'],
+    ['Опыт', '12'],
+    ['Роль', '8'],
+    ['Сфера', '9'],
+    ['Особые требования', '7'],
+  ]
+  for (const [label, maximum] of ranges) {
+    fireEvent.change(screen.getByRole('spinbutton', { name: `${label} от` }), { target: { value: '1' } })
+    fireEvent.change(screen.getByRole('spinbutton', { name: `${label} до` }), { target: { value: maximum } })
+  }
+
+  await waitFor(() => {
+    const latest = requests.filter((url) => url.includes('/api/vacancies?')).at(-1)
+    expect(latest).toBeTruthy()
+    const params = new URL(latest!, 'http://local').searchParams
+    expect(Object.fromEntries(params)).toMatchObject({
+      search: 'global needle',
+      state: 'REJECTED_BY_MODEL',
+      site: 'HH.ru',
+      status_date_from: '2026-09-01',
+      status_date_to: '2026-09-30',
+      total_score_min: '1',
+      total_score_max: '80',
+      tasks_min: '1',
+      tasks_max: '30',
+      skills_min: '1',
+      skills_max: '18',
+      experience_depth_min: '1',
+      experience_depth_max: '12',
+      role_match_min: '1',
+      role_match_max: '8',
+      industry_min: '1',
+      industry_max: '9',
+      special_requirements_min: '1',
+      special_requirements_max: '7',
+    })
+    expect(params.has('offset')).toBe(false)
+  })
+})
+
+test('sorts vacancies by a criterion and resets loaded pagination', async () => {
+  const requests: string[] = []
+  const vacancy = (id: number, title: string) => ({ id, title, company: 'Компания', site: 'HH.ru', status_changed_at: '2026-09-01T00:00:00', url: '#', state: 'REPORTED', evaluation: null })
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    requests.push(url)
+    if (!url.includes('/api/vacancies')) return Promise.resolve({ ok: true, json: async () => [] })
+    if (url.includes('sort=tasks')) return Promise.resolve({ ok: true, json: async () => ({ items: [vacancy(3, 'Sorted')], total: 1, limit: 30, offset: 0, has_more: false }) })
+    if (url.includes('offset=30')) return Promise.resolve({ ok: true, json: async () => ({ items: [vacancy(2, 'Second page')], total: 2, limit: 30, offset: 30, has_more: false }) })
+    return Promise.resolve({ ok: true, json: async () => ({ items: [vacancy(1, 'First page')], total: 2, limit: 30, offset: 0, has_more: true }) })
+  }))
+  render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Показать ещё' }))
+  expect(await screen.findByText('Second page')).toBeInTheDocument()
+  fireEvent.change(screen.getByRole('combobox', { name: 'Сортировка' }), { target: { value: 'tasks' } })
+  fireEvent.change(screen.getByRole('combobox', { name: 'Направление' }), { target: { value: 'asc' } })
+  expect(await screen.findByText('Sorted')).toBeInTheDocument()
+  await waitFor(() => {
+    const latest = requests.filter((url) => url.includes('sort=tasks')).at(-1) ?? ''
+    const params = new URL(latest, 'http://local').searchParams
+    expect(params.get('sort')).toBe('tasks')
+    expect(params.get('sort_dir')).toBe('asc')
+    expect(params.has('offset')).toBe(false)
+  })
+  expect(screen.queryByText('First page')).not.toBeInTheDocument()
+  expect(screen.queryByText('Second page')).not.toBeInTheDocument()
+})
+
 test.each([
   ['unavailable', { connected: false, model_available: false }],
   ['http failure', null],
@@ -720,11 +858,13 @@ test('paused session exposes only resume and stop actions', async () => {
     const url = String(input)
     if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [pausedSession] })
     if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: '', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [] })
     return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
   }))
 
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
 
+  expect(await screen.findByText('Модель временно недоступна')).toBeInTheDocument()
   expect(await screen.findByRole('button', { name: 'Продолжить' })).toBeInTheDocument()
   expect(screen.getByRole('button', { name: 'Остановить' })).toBeInTheDocument()
   for (const name of ['Запустить', 'Пауза', 'Открыть браузер', 'Проверить вход', 'Повторить безопасный шаг']) {
@@ -802,9 +942,9 @@ test('shows resume relevance breakdown without policy UI', async () => {
   expect(screen.getByText('КРАТКОЕ РЕЗЮМЕ')).toBeInTheDocument()
   expect(screen.queryByText('Почему вакансия подходит и что с откликом')).not.toBeInTheDocument()
   expect(screen.queryByText('Короткое объяснение по каждому критерию')).not.toBeInTheDocument()
-  expect(screen.getByText('Роль')).toBeInTheDocument()
+  expect(screen.getByText('Роль', { selector: 'b' })).toBeInTheDocument()
   expect(screen.queryByText('Уровень позиции')).not.toBeInTheDocument()
-  expect(screen.getByText('Особые требования')).toBeInTheDocument()
+  expect(screen.getByText('Особые требования', { selector: 'b' })).toBeInTheDocument()
   expect(screen.queryByText('Отклонено политическим фильтром')).not.toBeInTheDocument()
   expect(screen.queryByText('Принятые Green flags')).not.toBeInTheDocument()
   expect(screen.queryByText('Сработавшие Red flags')).not.toBeInTheDocument()
@@ -882,7 +1022,7 @@ test('renders legacy six-row relevance payload as six named criteria', async () 
   expect((await screen.findAllByText(/Задачи: пояснение/)).length).toBeGreaterThan(0)
   expect(screen.queryByText('Не пройден минимум по навыкам')).not.toBeInTheDocument()
   for (const title of ['Задачи', 'Навыки', 'Годы опыта', 'Роль', 'Сфера', 'Особые требования']) {
-    expect(screen.getByText(title)).toBeInTheDocument()
+    expect(screen.getByText(title, { selector: 'b' })).toBeInTheDocument()
   }
   expect(screen.queryByText('Условия труда')).not.toBeInTheDocument()
   expect(screen.getByText('23 / 35')).toBeInTheDocument()
@@ -951,13 +1091,13 @@ test('renders vacancy disclosure with localized status and accessible toggle con
     ? Promise.resolve({ ok: true, json: async () => [vacancy(501, 'SUBMITTED'), vacancy(502, 'ALREADY_APPLIED'), vacancy(503, 'REJECTED_BY_MODEL'), vacancy(504, 'ERROR', false)] })
     : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
-  const localizedStatus = await screen.findAllByText('Отклик отправлен')
+  const localizedStatus = await screen.findAllByText('Отклик отправлен', { selector: '.status' })
   expect(localizedStatus).toHaveLength(2)
   expect(localizedStatus[0]).toHaveClass('status-success')
   expect(localizedStatus[1]).toHaveClass('status-success')
   expect(localizedStatus.map((item) => item.getAttribute('data-status'))).toEqual(['SUBMITTED', 'ALREADY_APPLIED'])
   expect(screen.queryByText('Отклик уже был отправлен')).not.toBeInTheDocument()
-  const summary = screen.getAllByRole('group')[0].querySelector('summary') as HTMLElement
+  const summary = screen.getByText('Тестовая роль 501').closest('details')?.querySelector('summary') as HTMLElement
   expect(summary).toHaveAttribute('aria-expanded', 'false')
   expect(within(summary).getByText('Показать подробности вакансии')).toBeInTheDocument()
   expect(within(summary).queryByText('Разбор')).not.toBeInTheDocument()
@@ -966,24 +1106,26 @@ test('renders vacancy disclosure with localized status and accessible toggle con
   await waitFor(() => expect(summary).toHaveAttribute('aria-expanded', 'true'))
   expect(within(summary).getByText('Скрыть подробности вакансии')).toBeInTheDocument()
   expect(screen.getByText('Отклик действительно отправлен после положительной оценки вакансии.')).toBeInTheDocument()
-  const submittedSummary = screen.getAllByRole('group')[0].querySelector('.score-details > p')
+  const submittedCard = screen.getByText('Тестовая роль 501').closest('details') as HTMLElement
+  const submittedSummary = submittedCard.querySelector('.score-details > p')
   expect(submittedSummary).toHaveTextContent('Вакансия предполагает управление проектами. Опыт кандидата относится к другой сфере.')
   expect(submittedSummary).not.toHaveTextContent('Второе предложение задач')
   expect(submittedSummary).not.toHaveTextContent('Второе предложение сферы')
   expect(screen.queryByText('Оценка вакансии на основе резюме.')).not.toBeInTheDocument()
-  const secondSummary = screen.getAllByRole('group')[1].querySelector('summary') as HTMLElement
+  const secondSummary = screen.getByText('Тестовая роль 502').closest('details')?.querySelector('summary') as HTMLElement
   fireEvent.click(secondSummary)
   expect(await screen.findByText('Новый отклик не отправлялся: вы уже откликались на эту вакансию.')).toBeInTheDocument()
-  const rejectedSummary = screen.getAllByRole('group')[2].querySelector('summary') as HTMLElement
+  const rejectedCardElement = screen.getByText('Тестовая роль 503').closest('details') as HTMLElement
+  const rejectedSummary = rejectedCardElement.querySelector('summary') as HTMLElement
   fireEvent.click(rejectedSummary)
   expect(await screen.findByText('Модель отклонила вакансию из-за недостаточной релевантности, поэтому отклик не отправлен.')).toBeInTheDocument()
-  const rejectedCard = within(screen.getAllByRole('group')[2])
+  const rejectedCard = within(rejectedCardElement)
   expect(rejectedCard.getByRole('progressbar', { name: 'Релевантность: Задачи' })).toBeInTheDocument()
   expect(rejectedCard.getAllByText(/Вакансия предполагает управление проектами/).length).toBeGreaterThan(0)
   expect(screen.queryByText('СЕКРЕТНАЯ ЦИТАТА')).not.toBeInTheDocument()
   expect(screen.queryByText(/Evidence не прошло/)).not.toBeInTheDocument()
   expect(screen.queryByText(/Минимум/)).not.toBeInTheDocument()
-  const errorSummary = screen.getAllByRole('group')[3].querySelector('summary') as HTMLElement
+  const errorSummary = screen.getByText('Тестовая роль 504').closest('details')?.querySelector('summary') as HTMLElement
   fireEvent.click(errorSummary)
   expect(await screen.findByText('Отклик не отправлен из-за ошибки обработки вакансии.')).toBeInTheDocument()
 })
@@ -994,7 +1136,7 @@ test('renders reported vacancy as a successful status', async () => {
     ? Promise.resolve({ ok: true, json: async () => [vacancy] })
     : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
-  const status = await screen.findByText('В отчёте')
+  const status = await screen.findByText('В отчёте', { selector: '.status' })
   expect(status).toHaveClass('status-success')
   expect(status).toHaveAttribute('data-status', 'REPORTED')
 })
@@ -1055,6 +1197,18 @@ test('SingleSelect opens, selects an option, and closes on Escape', async () => 
   expect(await screen.findByRole('option', { name: 'HH.ru' })).toBeVisible()
   fireEvent.keyDown(document, { key: 'Escape' })
   await waitFor(() => expect(screen.queryByRole('option', { name: 'HH.ru' })).not.toBeInTheDocument())
+})
+
+test('site filter labels legacy vacancies simply as без сайта', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  const select = await screen.findByRole('combobox', { name: 'Сайт' })
+  expect(screen.getByRole('option', { name: 'Без сайта' })).toHaveValue('__legacy__')
+  expect(select).not.toHaveTextContent('легаси')
 })
 
 test.each([

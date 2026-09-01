@@ -339,6 +339,19 @@ class WorkflowManager:
     async def run(self, session_id: int) -> None:
         try:
             await self._run(session_id)
+        except ModelUnavailable as exc:
+            # An AI outage is recoverable: keep the session resumable and leave
+            # the in-progress vacancy at its current AI step.
+            with SessionLocal() as db:
+                item = db.get(JobSession, session_id)
+                if item and item.status not in {
+                    SessionStatus.STOPPED,
+                    SessionStatus.COMPLETED,
+                    SessionStatus.FAILED,
+                }:
+                    item.status = SessionStatus.PAUSED
+                    item.stop_reason = str(exc)
+                    self.emit(db, session_id, "model_unavailable", str(exc))
         except Exception as exc:  # task boundary records every unexpected failure
             with SessionLocal() as db:
                 item = db.get(JobSession, session_id)
@@ -510,7 +523,7 @@ class WorkflowManager:
                     db,
                     session_id,
                     "search_empty",
-                    "HH.ru не вернул ссылки на вакансии",
+                    f"{getattr(adapter, 'display_name', adapter_id)} не вернул ссылки на вакансии",
                     {"url": executor.page.url, "page_text": page_text},
                 )
 
@@ -732,14 +745,8 @@ class WorkflowManager:
                             minimum_scores,
                             preference_policy,
                         )
-                    except ModelUnavailable as exc:
-                        vacancy.state = "ERROR"
-                        counters = dict(item.counters)
-                        counters["errors"] = counters.get("errors", 0) + 1
-                        item.counters = counters
-                        db.commit()
-                        self.emit(db, session_id, "model_unavailable", str(exc))
-                        continue
+                    except ModelUnavailable:
+                        raise
                 db.refresh(item)
                 if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
                     return
@@ -808,14 +815,8 @@ class WorkflowManager:
                             letter = await write_cover_letter(
                                 posting, profile, selected_resumes, gateway, preference_policy
                             )
-                        except ModelUnavailable as exc:
-                            vacancy.state = "ERROR"
-                            counters = dict(item.counters)
-                            counters["errors"] = counters.get("errors", 0) + 1
-                            item.counters = counters
-                            db.commit()
-                            self.emit(db, session_id, "model_unavailable", str(exc))
-                            continue
+                        except ModelUnavailable:
+                            raise
                     db.refresh(item)
                     if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
                         return
@@ -872,6 +873,8 @@ class WorkflowManager:
                                     summary_payload["preference_policy"] = preference_policy.model_dump(mode="json")
                                 summary = await gateway.structured("job_summary", summary_payload, JobSummary)
                                 short_description = summary.summary
+                            except ModelUnavailable:
+                                raise
                             except Exception:
                                 short_description = vacancy.title
                             target_url = ""

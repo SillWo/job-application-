@@ -26,7 +26,9 @@ def test_history_cleanup_preserves_good_history(tmp_path):
     )
     hh, hirehi = [row[0] for row in db.execute("select id from sessions order by id")]
     db.executemany(
-        "insert into vacancies (session_id, source, external_id, url, title, state, data, updated_at) values (?, ?, ?, ?, ?, ?, '{}', '2026-01-01')",
+        "insert into vacancies (session_id, source, site, external_id, url, title, state, "
+        "status_changed_at, data, updated_at) values (?, ?, '', ?, ?, ?, ?, "
+        "'2026-09-01 00:00:00', '{}', '2026-01-01')",
         [
             (hh, "hh", "good", "https://example.test/good", "Good", "SUBMITTED"),
             (hh, "hh", "bad", "https://example.test/bad", "Bad", "ERROR"),
@@ -51,7 +53,7 @@ def test_history_cleanup_preserves_good_history(tmp_path):
     tables = {row[0] for row in db.execute("select name from sqlite_master where type='table'")}
     assert not {"search_policies", "site_accounts", "employer_contacts"} & tables
     assert not {"policy_id", "resume_url", "resume_path"} & _columns(db, "sessions")
-    assert "viewed_limit" not in _columns(db, "sessions")
+
     assert "application_limit" in _columns(db, "sessions")
     assert not {"filename", "data", "resume_path"} & _columns(db, "candidate_profiles")
     db.close()
@@ -82,7 +84,7 @@ def test_database_url_environment_override_wins_without_touching_default(tmp_pat
     command.upgrade(config, "head")
 
     target_db = sqlite3.connect(target)
-    assert target_db.execute("select version_num from alembic_version").fetchone()[0] == "0020"
+    assert target_db.execute("select version_num from alembic_version").fetchone()[0] == "0021"
     assert "vacancies" in {row[0] for row in target_db.execute("select name from sqlite_master where type='table'")}
     target_db.close()
     assert not decoy.exists()

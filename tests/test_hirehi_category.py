@@ -1,6 +1,6 @@
 import pytest
 
-from backend.intelligence.gateway import ModelGateway, _system_prompt_for_role
+from backend.intelligence.gateway import ModelGateway, ModelUnavailable, _system_prompt_for_role
 from backend.intelligence.hirehi_category import (
     CATEGORIES,
     HireHiCategoryChoice,
@@ -22,6 +22,14 @@ async def test_model_invalid_category_falls_back():
         async def structured(self, *args): return HireHiCategoryChoice(category="unknown")
     choice = await choose_hirehi_category(Gateway(), {"desired_title": "Product Owner"})
     assert choice.category in CATEGORIES
+
+
+@pytest.mark.asyncio
+async def test_model_unavailable_is_propagated_to_pause_workflow():
+    class Gateway:
+        async def structured(self, *args): raise ModelUnavailable("provider said unavailable")
+    with pytest.raises(ModelUnavailable, match="provider said unavailable"):
+        await choose_hirehi_category(Gateway(), {"desired_title": "Product Owner"})
 
 @pytest.mark.asyncio
 async def test_mock_gateway_category_and_registered_prompt():
