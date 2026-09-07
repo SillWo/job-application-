@@ -52,6 +52,7 @@ def _session(status=SessionStatus.RUNNING, adapter_id="hh"):
     ],
 )
 async def test_workflow_run_closes_browser_only_for_terminal_status(monkeypatch, status, closes):
+    monkeypatch.setattr(workflow.search_metrics, "freeze", lambda db, item: None)
     item = _session()
     db = _DB(item)
     closed = []

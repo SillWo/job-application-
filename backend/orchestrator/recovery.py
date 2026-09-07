@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 
+from backend.services.search_metrics import discovery, measure
+
 
 class CaptchaRequired(RuntimeError):
     pass
@@ -31,7 +33,8 @@ class RecoveryAdapter:
 
         async def invoke(*args, **kwargs):
             try:
-                result = await asyncio.wait_for(value(*args, **kwargs), timeout=self.timeout)
+                with measure(f"browser.{name}"):
+                    result = await asyncio.wait_for(value(*args, **kwargs), timeout=self.timeout)
             except Exception:
                 # A CAPTCHA may replace any page, including a response dialog.
                 if args and name != "detect_blockers":
@@ -41,6 +44,8 @@ class RecoveryAdapter:
                 "open_application", "fill_application", "submit_application", "verify_submission",
             }):
                 await self._captcha(args[0])
+            if name in {"collect_job_refs", "collect_more_job_refs"}:
+                discovery(self.adapter, result)
             return result
 
         return invoke

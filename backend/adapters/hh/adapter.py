@@ -189,6 +189,7 @@ class HHAdapter:
         # single text-search page. Keep the latter capped by the helper's
         # default limit of 100.
         recommended_refs = await self._visible_job_refs(page, timeout=6_000, limit=200)
+        self.last_discovery_batch = {"source": "recommendations", "ids": [r.external_id for r in recommended_refs]}
         self._search_page_number = 0
         self._search_seen_ids = {ref.external_id for ref in recommended_refs}
         self._search_exhausted = False
@@ -209,6 +210,7 @@ class HHAdapter:
         stale listings raise an error for the workflow to recover.
         """
         if self._search_exhausted:
+            self.last_discovery_batch = {"source": "exhausted", "ids": []}
             return []
         search_urls = getattr(self, "_fallback_search_urls", [])
         if not search_urls:
@@ -222,6 +224,8 @@ class HHAdapter:
         self.current_search_query = self._search_queries[self._search_query_index]
         page_number = self._search_page_number
         page_refs = await self._collect_search_page(page, fallback_url, page_number)
+        self.last_discovery_batch = {"source": self.current_search_query or "broad", "page": page_number,
+                                     "ids": [r.external_id for r in page_refs]}
         # Advance only after a successfully read page. Return one page per call
         # so the workflow can persist progress even through duplicate-only pages.
         self._search_page_number += 1

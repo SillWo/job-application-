@@ -44,6 +44,7 @@ from backend.schemas.domain import (
     JobEvaluation,
     SessionStatus,
 )
+from backend.services import search_metrics
 from backend.services.hirehi_reporting import write_session_pdf
 
 
@@ -293,6 +294,7 @@ class WorkflowManager:
     def emit(
         self, db, session_id: int, event_type: str, message: str, data: dict | None = None
     ) -> None:
+        search_metrics.flush(db, session_id)
         db.add(
             BrowserEvent(
                 session_id=session_id, event_type=event_type, message=message, data=data or {}
@@ -350,6 +352,7 @@ class WorkflowManager:
             self.emit(db, session_id, "session", "Сессия завершена")
 
     async def run(self, session_id: int) -> None:
+        metric_token = search_metrics.begin()
         try:
             while True:
                 try:
@@ -364,12 +367,19 @@ class WorkflowManager:
                             self.emit(db, session_id, "human_required", str(exc), {"kind": "captcha"})
                     break
                 except Exception as exc:
-                    if not await self._recover(session_id, exc):
+                    with search_metrics.measure("recovery"):
+                        recovered = await self._recover(session_id, exc)
+                    if not recovered:
                         break
         finally:
             with SessionLocal() as db:
+                if search_metrics.flush(db, session_id):
+                    db.commit()
                 final_item = db.get(JobSession, session_id)
                 final_status = final_item.status if final_item else SessionStatus.FAILED
+                if final_item and final_status in {SessionStatus.COMPLETED, SessionStatus.STOPPED, SessionStatus.FAILED}:
+                    search_metrics.freeze(db, final_item)
+            search_metrics.end(metric_token)
             if final_status in {SessionStatus.COMPLETED, SessionStatus.STOPPED, SessionStatus.FAILED}:
                 with suppress(Exception):
                     await asyncio.wait_for(close_browser(session_id), timeout=15)
@@ -454,6 +464,7 @@ class WorkflowManager:
             if checkpoint:
                 recovery["search_checkpoint"] = checkpoint()
             item.recovery = recovery
+            search_metrics.flush(db, session_id)
             db.commit()
             return [JobRef.model_validate(ref) for ref in recovery["pending_refs"]]
 
@@ -509,6 +520,7 @@ class WorkflowManager:
             profile = _profile_schema().model_validate(_profile_payload(profile_record))
             selected_records = _selected_resume_records(db, profile_record)
             selected_resumes = [_record_payload(resume) for resume in selected_records]
+            search_metrics.initialize(db, item, _profile_payload(profile_record), selected_resumes)
             resume_file = (
                 _resume_file(selected_records[0], selected_resumes[0]) if selected_records else ""
             )
@@ -686,6 +698,10 @@ class WorkflowManager:
                 if existing and (existing.session_id != session_id or existing.state not in {
                     "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING",
                 }):
+                    if existing.session_id != session_id:
+                        search_metrics.record("overlap", {"external_id": ref.external_id})
+                        search_metrics.flush(db, session_id)
+                        db.commit()
                     continue
             try:
                 await adapter.open_job(executor.page, ref)
@@ -870,6 +886,7 @@ class WorkflowManager:
                         {
                             "vacancy_id": vacancy.id,
                             "score": result.score,
+                            "external_id": posting.external_id,
                             "decision": result.decision,
                             "minimum_score_violations": result.minimum_score_violations,
                             "breakdown": [row.model_dump() for row in result.score_breakdown],

@@ -800,6 +800,16 @@ def session_report_pdf(session_id: int, db: Session = Depends(get_db)) -> FileRe
     )
 
 
+@router.get("/sessions/{session_id}/metrics")
+def session_metrics(session_id: int, db: Session = Depends(get_db)) -> dict:
+    from backend.services.search_metrics import summary
+
+    item = db.get(JobSession, session_id)
+    if not item:
+        raise HTTPException(404, "Сессия не найдена")
+    return (item.recovery or {}).get("measurement_report") or summary(db, item)
+
+
 @router.get("/sessions/{session_id}/events")
 def events(session_id: int, after: int = 0, db: Session = Depends(get_db)) -> list[dict]:
     rows = db.scalars(

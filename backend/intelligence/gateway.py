@@ -13,6 +13,7 @@ from backend.config import settings
 from backend.persistence.crypto import decrypt_secret
 from backend.persistence.database import SessionLocal
 from backend.persistence.models import AIModelSettings
+from backend.services.search_metrics import measure, record
 
 from .prompts import ROLE_OPTIONS, ROLE_PROMPTS
 
@@ -211,6 +212,10 @@ class ModelGateway:
         raise ValueError(f"Unsupported AI provider: {self.provider}")
 
     async def structured(self, role: str, payload: dict, schema: type[T]) -> T:
+        with measure(f"model.{role}"):
+            return await self._structured(role, payload, schema)
+
+    async def _structured(self, role: str, payload: dict, schema: type[T]) -> T:
         if self.provider == "mock":
             return self._mock(role, payload, schema)
         if self.provider == "openai_compat":
@@ -263,6 +268,11 @@ class ModelGateway:
                             },
                         },
                     )
+                    usage = getattr(response, "usage", None)
+                    if usage is not None:
+                        tokens = {name: getattr(usage, name, None) for name in ("prompt_tokens", "completion_tokens", "total_tokens")}
+                        if all(isinstance(value, int) for value in tokens.values()):
+                            record("tokens", {"role": role, **tokens})
                     try:
                         content = (response.choices[0].message.content or "").strip()
                     except (IndexError, AttributeError, TypeError) as exc:
