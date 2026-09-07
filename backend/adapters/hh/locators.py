@@ -35,3 +35,5 @@ CAPTCHA_MARKERS = ("captcha", "Подтвердите, что вы не робо
 SEARCH_EMPTY = "[data-qa='vacancy-serp__vacancy-not-found'], [data-qa='vacancy-serp__no-results']"
 SEARCH_PAGER = "[data-qa='pager-block']"
 SEARCH_NEXT = "[data-qa='pager-next']"
+DISCOVERY_LINKS = "a[href]"
+RELATED_VACANCIES = "[data-qa*='similar'] a[href*='/vacancy/'], [data-qa*='related'] a[href*='/vacancy/'], [data-qa*='recommend'] a[href*='/vacancy/']"

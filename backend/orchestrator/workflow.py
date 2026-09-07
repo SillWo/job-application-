@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+from time import perf_counter
 from typing import Any
 
 from sqlalchemy import select
@@ -10,6 +11,7 @@ from sqlalchemy import select
 from backend.adapters import adapter_registry
 from backend.adapters.base.protocol import JobRef
 from backend.browser.sessions import close_browser, get_browser, restore_browser
+from backend.intelligence.adaptive_search_planner import plan_portfolio
 from backend.intelligence.evaluator import _payload, evaluate
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
 from backend.intelligence.hirehi_category import JobSummary, choose_hirehi_category
@@ -17,6 +19,7 @@ from backend.intelligence.hirehi_grade import hirehi_grades
 from backend.intelligence.letter_writer import write_cover_letter
 from backend.intelligence.preference_policy import compile_preference_policy
 from backend.intelligence.search_planner import plan_search_queries
+from backend.orchestrator.adaptive_search import AdaptiveSearch
 from backend.orchestrator.application_guard import unresolved_application_questions
 from backend.orchestrator.recovery import (
     AuthenticationPending,
@@ -554,6 +557,8 @@ class WorkflowManager:
             with SessionLocal() as db:
                 db.get(JobSession, session_id).preference_policy = preference_policy.model_dump(mode="json")
                 db.commit()
+        if adapter_id == "hh":
+            adapter = RecoveryAdapter(AdaptiveSearch(adapter.adapter, gateway, selected_resumes, preference_policy))
         hirehi_category: str | None = None
         hirehi_grade_values: list[str] | None = None
         with SessionLocal() as db:
@@ -574,6 +579,9 @@ class WorkflowManager:
                     {"years": experience_years, "grades": hirehi_grade_values},
                 )
                 event_db.commit()
+        elif adapter_id == "hh":
+            portfolio_queries = await plan_portfolio(gateway, selected_resumes, preference_policy)
+            search_filters = {"portfolio_queries": portfolio_queries}
         else:
             planned_queries = await plan_search_queries(gateway, selected_resumes, preference_policy=preference_policy)
             search_filters = {"queries": planned_queries}
@@ -699,11 +707,15 @@ class WorkflowManager:
                     "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING",
                 }):
                     if existing.session_id != session_id:
+                        observer = getattr(adapter, "observe_overlap", None)
+                        if observer:
+                            observer(ref.external_id)
                         search_metrics.record("overlap", {"external_id": ref.external_id})
                         search_metrics.flush(db, session_id)
                         db.commit()
                     continue
             try:
+                processing_started = perf_counter()
                 await adapter.open_job(executor.page, ref)
                 blockers = await adapter.detect_blockers(executor.page)
                 if blockers:
@@ -892,6 +904,14 @@ class WorkflowManager:
                             "breakdown": [row.model_dump() for row in result.score_breakdown],
                         },
                     )
+                observer = getattr(adapter, "observe", None)
+                if observer:
+                    await observer(executor.page, posting, result.decision, perf_counter() - processing_started)
+                    # Feedback changes the scheduler, not the discovery queue.
+                    # Avoid rescanning all vacancies after every evaluation.
+                    item.recovery = {**(item.recovery or {}), "search_checkpoint": adapter.search_checkpoint()}
+                    search_metrics.flush(db, session_id)
+                    db.commit()
                 if result.decision == "skip":
                     vacancy.state = "REJECTED_BY_MODEL"
                     counters = dict(item.counters)

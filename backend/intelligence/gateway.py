@@ -378,6 +378,8 @@ class ModelGateway:
             return db.get(AIModelSettings, 1)
 
     def _mock(self, role: str, payload: dict, schema: type[T]) -> T:
+        if role == "adaptive_search_planner":
+            return schema.model_validate({"queries": []})
         from backend.schemas.domain import (
             CoverLetterDraft,
             JobEvaluation,

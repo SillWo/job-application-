@@ -15,11 +15,12 @@ from backend.adapters.base.protocol import (
 )
 from backend.schemas.domain import ApplicationPlan, JobPosting
 
-from . import locators
+from . import discovery, locators
 from .salary import parse_salary
 
 
 class HHAdapter:
+    home_url = "https://hh.ru/"
     site_id = "hh"
     display_name = "HH.ru"
     # HH redirects authenticated users to their regional subdomain and emits
@@ -37,6 +38,31 @@ class HHAdapter:
     )
     async def start(self, context, settings: dict) -> None:
         return None
+
+    def query_source(self, query, field="name", cluster=""):
+        return discovery.query_spec(self, query, field, cluster)
+
+    def validate_search_source(self, spec):
+        discovery.validate_url(self, spec["url"])
+
+    async def read_discovery_page(self, page, spec, page_number):
+        # The orchestrator maintains an independent signature for every source.
+        self._last_search_page_signature = None
+        self._repeated_search_pages = 0
+        return await discovery.read_page(self, page, spec, page_number)
+
+    async def collect_visible_sources(self, page, context="listing"):
+        return await discovery.visible_sources(self, page, context=context)
+
+    async def collect_related_refs(self, page):
+        return await discovery.related_refs(self, page)
+
+    async def discovery_listing_terminal(self, page):
+        pager = page.locator(locators.SEARCH_PAGER).first
+        next_page = page.locator(locators.SEARCH_NEXT).first
+        if await pager.count() and await pager.is_visible():
+            return not await next_page.count() or not await next_page.is_visible()
+        return False
 
     @property
     def search_exhausted(self) -> bool:
