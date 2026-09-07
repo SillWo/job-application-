@@ -664,6 +664,12 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     await close_browser(session_id)
     if item.adapter_id == "hirehi":
         workflow_manager.write_hirehi_report(session_id)
+    if (getattr(item, "recovery", None) or {}).get("measurement_identity"):
+        # A CAPTCHA-paused session has no running task to freeze it in finally.
+        from backend.services.search_metrics import freeze
+
+        db.refresh(item)
+        freeze(db, item)
     return session_dict(item)
 
 
