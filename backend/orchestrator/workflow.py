@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
 
 from backend.adapters import adapter_registry
-from backend.browser.sessions import close_browser, get_browser
+from backend.adapters.base.protocol import JobRef
+from backend.browser.sessions import close_browser, get_browser, restore_browser
 from backend.intelligence.evaluator import _payload, evaluate
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
 from backend.intelligence.hirehi_category import JobSummary, choose_hirehi_category
 from backend.intelligence.hirehi_grade import hirehi_grades
 from backend.intelligence.letter_writer import write_cover_letter
+from backend.intelligence.preference_policy import compile_preference_policy
 from backend.intelligence.search_planner import plan_search_queries
 from backend.orchestrator.application_guard import unresolved_application_questions
+from backend.orchestrator.recovery import (
+    AuthenticationPending,
+    CaptchaRequired,
+    RecoverableFailure,
+    RecoveryAdapter,
+)
 from backend.persistence import models as persistence_models
 from backend.persistence.database import SessionLocal
 from backend.persistence.models import (
@@ -236,6 +245,9 @@ def _resume_file(record: Any, payload: dict) -> str:
 
 
 class WorkflowManager:
+    retry_base_seconds = 5
+    retry_max_seconds = 300
+
     def __init__(self) -> None:
         self.tasks: dict[int, asyncio.Task] = {}
         self.site_leases: dict[str, int] = {}
@@ -332,44 +344,78 @@ class WorkflowManager:
             if not was_stopped:
                 item.status = SessionStatus.COMPLETED
                 item.stop_reason = completion_reason
+            item.recovery = {**(item.recovery or {}), "pending_refs": [], "retry_at": None, "message": None}
             item.finished_at = datetime.now(timezone.utc)
             db.commit()
             self.emit(db, session_id, "session", "Сессия завершена")
 
     async def run(self, session_id: int) -> None:
         try:
-            await self._run(session_id)
-        except ModelUnavailable as exc:
-            # An AI outage is recoverable: keep the session resumable and leave
-            # the in-progress vacancy at its current AI step.
-            with SessionLocal() as db:
-                item = db.get(JobSession, session_id)
-                if item and item.status not in {
-                    SessionStatus.STOPPED,
-                    SessionStatus.COMPLETED,
-                    SessionStatus.FAILED,
-                }:
-                    item.status = SessionStatus.PAUSED
-                    item.stop_reason = str(exc)
-                    self.emit(db, session_id, "model_unavailable", str(exc))
-        except Exception as exc:  # task boundary records every unexpected failure
-            with SessionLocal() as db:
-                item = db.get(JobSession, session_id)
-                if item:
-                    item.status = SessionStatus.FAILED
-                    item.stop_reason = str(exc)
-                    item.finished_at = datetime.now(timezone.utc)
-                    self.emit(db, session_id, "error", f"Сессия завершилась с ошибкой: {exc}")
+            while True:
+                try:
+                    await self._run(session_id)
+                    break
+                except CaptchaRequired as exc:
+                    with SessionLocal() as db:
+                        item = db.get(JobSession, session_id)
+                        if item and item.status not in {SessionStatus.STOPPED, SessionStatus.COMPLETED}:
+                            item.status = SessionStatus.PAUSED
+                            item.stop_reason = str(exc)
+                            self.emit(db, session_id, "human_required", str(exc), {"kind": "captcha"})
+                    break
+                except Exception as exc:
+                    if not await self._recover(session_id, exc):
+                        break
         finally:
             with SessionLocal() as db:
                 final_item = db.get(JobSession, session_id)
                 final_status = final_item.status if final_item else SessionStatus.FAILED
             if final_status in {SessionStatus.COMPLETED, SessionStatus.STOPPED, SessionStatus.FAILED}:
-                await close_browser(session_id)
+                with suppress(Exception):
+                    await asyncio.wait_for(close_browser(session_id), timeout=15)
             self.tasks.pop(session_id, None)
             site_id = self.task_sites.pop(session_id, None)
             if site_id and self.site_leases.get(site_id) == session_id:
                 self.site_leases.pop(site_id, None)
+
+    async def _recover(self, session_id: int, exc: Exception) -> bool:
+        with SessionLocal() as db:
+            item = db.get(JobSession, session_id)
+            if not item or item.status in {SessionStatus.STOPPED, SessionStatus.COMPLETED, SessionStatus.PAUSED}:
+                return False
+            recovery = dict(item.recovery or {})
+            attempt = recovery.get("attempt", 0) + 1
+            delay = min(self.retry_max_seconds, self.retry_base_seconds * 2 ** min(attempt - 1, 10))
+            if isinstance(exc, AuthenticationPending):
+                delay = self.retry_base_seconds
+            if isinstance(exc, AuthenticationPending):
+                reason = "Ожидаем вход в открытом браузере; проверка продолжится автоматически"
+            elif isinstance(exc, ModelUnavailable):
+                reason = "Модель временно недоступна"
+            else:
+                reason = "Временный сбой обработки или загрузки страницы"
+            message = f"{reason}. Автоматический повтор через {delay} с."
+            recovery.update(attempt=attempt, retry_at=(datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(), message=message)
+            item.recovery = recovery
+            item.status = SessionStatus.RUNNING
+            item.stop_reason = message
+            item.finished_at = None
+            self.emit(db, session_id, "recovery_retry", message, {"attempt": attempt, "delay_seconds": delay, "error_type": type(exc).__name__})
+        # Short waits keep a user's Stop responsive and never relinquish the site lease.
+        deadline = asyncio.get_running_loop().time() + delay
+        while True:
+            with SessionLocal() as db:
+                item = db.get(JobSession, session_id)
+                if not item or item.status != SessionStatus.RUNNING:
+                    return False
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(remaining, 0.25))
+        if not isinstance(exc, (ModelUnavailable, AuthenticationPending)):
+            with suppress(Exception):
+                await asyncio.wait_for(close_browser(session_id), timeout=15)
+        return True
 
     async def _wait_if_paused(self, session_id: int) -> bool:
         while True:
@@ -380,14 +426,62 @@ class WorkflowManager:
                 continue
             return status not in {SessionStatus.STOPPED, SessionStatus.FAILED}
 
+    def _save_refs(self, session_id: int, refs: list[JobRef], adapter=None) -> list[JobRef]:
+        """Persist discovery before extraction so vanished listings cannot lose work."""
+        with SessionLocal() as db:
+            item = db.get(JobSession, session_id)
+            recovery = dict(item.recovery or {})
+            queued = {ref["external_id"]: ref for ref in recovery.get("pending_refs", [])}
+            queued.update({ref.external_id: ref.model_dump() for ref in refs})
+            # Include unfinished work from sessions started before queue persistence.
+            uncertain = []
+            for vacancy in db.scalars(select(Vacancy).where(
+                Vacancy.session_id == session_id,
+                Vacancy.state.in_(("EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING")),
+            )):
+                queued.setdefault(vacancy.external_id, {"external_id": vacancy.external_id, "url": vacancy.url})
+                if vacancy.state == "SUBMITTING":
+                    uncertain.append(vacancy.external_id)
+            done = set(db.scalars(select(Vacancy.external_id).where(
+                Vacancy.session_id == session_id,
+                Vacancy.state.not_in(("EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING")),
+            )))
+            # Resolve possible sends before consuming the remaining application budget.
+            uncertain_ids = set(uncertain)
+            ordered_keys = [*uncertain, *(key for key in queued if key not in uncertain_ids)]
+            recovery["pending_refs"] = [queued[key] for key in ordered_keys if key not in done]
+            checkpoint = getattr(adapter, "search_checkpoint", None)
+            if checkpoint:
+                recovery["search_checkpoint"] = checkpoint()
+            item.recovery = recovery
+            db.commit()
+            return [JobRef.model_validate(ref) for ref in recovery["pending_refs"]]
+
+    def _record_submission(self, db, item, vacancy, submission) -> None:
+        vacancy.state = submission.status.upper()
+        existing = db.scalar(select(Application).where(Application.vacancy_id == vacancy.id))
+        if existing is None:
+            db.add(Application(candidate_profile_id=item.profile_id, vacancy_id=vacancy.id,
+                               status=submission.status,
+                               submitted_at=datetime.now(timezone.utc) if submission.status == "submitted" else None))
+            key = submission.status if submission.status in {"submitted", "already_applied"} else "errors"
+            _increment_counter(db, item, key)
+        # The outcome and its counter are one transaction, including crash recovery.
+        self.emit(db, item.id, "submission", submission.message,
+                  {"vacancy_id": vacancy.id, "status": submission.status})
+
     async def _run(self, session_id: int) -> None:
         with SessionLocal() as db:
             item = db.get(JobSession, session_id)
             if not item:
                 return
+            if item.status in {SessionStatus.STOPPED, SessionStatus.COMPLETED}:
+                return
             first_start = item.started_at is None
             item.status = SessionStatus.RUNNING
             item.started_at = item.started_at or datetime.now(timezone.utc)
+            item.stop_reason = None
+            item.finished_at = None
             initial_counters = {
                 "viewed": 0,
                 "filtered": 0,
@@ -403,6 +497,9 @@ class WorkflowManager:
             item.counters = initial_counters
             db.commit()
             self.emit(db, session_id, "session", "Сессия запущена")
+            if _limit_reached(_application_count(item, item.adapter_id), item.application_limit):
+                self.finalize(session_id, _application_limit_reason(item.adapter_id))
+                return
 
         with SessionLocal() as db:
             item = db.get(JobSession, session_id)
@@ -425,44 +522,34 @@ class WorkflowManager:
             )
             adapter_id = item.adapter_id
 
-        adapter = adapter_registry.get(adapter_id)
+        adapter = RecoveryAdapter(adapter_registry.get(adapter_id))
         executor = get_browser(session_id)
         if not executor:
-            with SessionLocal() as db:
-                item = db.get(JobSession, session_id)
-                item.status = SessionStatus.WAITING_FOR_LOGIN
-                item.stop_reason = f"Откройте отдельный Chromium и войдите в {getattr(adapter, 'display_name', adapter_id)} вручную"
-                db.commit()
-                self.emit(db, session_id, "human_required", item.stop_reason)
-            return
+            executor = await restore_browser(session_id, adapter)
 
         login = await adapter.get_login_state(executor.page)
         if not login.authenticated:
-            with SessionLocal() as db:
-                item = db.get(JobSession, session_id)
-                item.status = SessionStatus.WAITING_FOR_LOGIN
-                item.stop_reason = login.message
-                db.commit()
-                self.emit(db, session_id, "human_required", login.message)
-            return
+            # Keep the login page open; automatically notice a restored login.
+            await adapter._captcha(executor.page)
+            raise AuthenticationPending("Ожидание восстановления авторизации на сайте")
 
         if not selected_records:
-            with SessionLocal() as db:
-                item = db.get(JobSession, session_id)
-                item.status = SessionStatus.FAILED
-                item.stop_reason = "Для оценки вакансий не выбрано ни одного резюме"
-                item.finished_at = datetime.now(timezone.utc)
-                db.commit()
-                self.emit(db, session_id, "profile_error", item.stop_reason)
-            return
+            raise RecoverableFailure("Для оценки вакансий не выбрано ни одного резюме")
 
         gateway = ModelGateway()
         if preference_description and stored_policy is None:
-            raise ValueError("Политика желаемой вакансии не подготовлена до запуска сессии")
+            preference_policy = await compile_preference_policy(gateway, preference_description)
+            with SessionLocal() as db:
+                db.get(JobSession, session_id).preference_policy = preference_policy.model_dump(mode="json")
+                db.commit()
         hirehi_category: str | None = None
         hirehi_grade_values: list[str] | None = None
-        search_filters = {}
-        if adapter_id == "hirehi":
+        with SessionLocal() as db:
+            search_filters = (db.get(JobSession, session_id).recovery or {}).get("search_filters")
+            saved_cursor = (db.get(JobSession, session_id).recovery or {}).get("search_checkpoint")
+        if search_filters is not None:
+            hirehi_category = search_filters.get("category")
+        elif adapter_id == "hirehi":
             choice = await choose_hirehi_category(gateway, selected_resumes[0], preference_policy)
             hirehi_category = choice.category
             experience_years, hirehi_grade_values = hirehi_grades(selected_resumes[0])
@@ -483,6 +570,10 @@ class WorkflowManager:
                     "desired_title": _resume_desired_title(selected_resumes[0]), "queries": planned_queries,
                 })
                 event_db.commit()
+        with SessionLocal() as db:
+            item = db.get(JobSession, session_id)
+            item.recovery = {**(item.recovery or {}), "search_filters": search_filters}
+            db.commit()
         await adapter.open_search(executor.page, search_filters)
         blockers = await adapter.detect_blockers(executor.page)
         if blockers:
@@ -500,12 +591,19 @@ class WorkflowManager:
                 self.emit(
                     db, session_id, "blocker_skipped", blocker.message, {"kind": blocker.kind}
                 )
-        refs = await adapter.collect_job_refs(executor.page)
+        restore_cursor = getattr(adapter, "restore_search_checkpoint", None)
+        if saved_cursor is not None and restore_cursor:
+            restore_cursor(saved_cursor)
+            refs = []
+        else:
+            refs = await adapter.collect_job_refs(executor.page)
         collect_more = getattr(adapter, "collect_more_job_refs", None)
         seen_ref_ids = {ref.external_id for ref in refs}
-        if not refs and collect_more is not None:
+        if not refs and collect_more is not None and saved_cursor is None:
             refs.extend(await collect_more(executor.page))
             seen_ref_ids.update(ref.external_id for ref in refs)
+        refs = self._save_refs(session_id, refs, adapter)
+        seen_ref_ids.update(ref.external_id for ref in refs)
         if adapter_id == "hirehi":
             with SessionLocal() as event_db:
                 self.emit(
@@ -528,6 +626,7 @@ class WorkflowManager:
                 )
 
         completion_reason = "Доступная выдача обработана"
+        retry_needed = False
 
         async def refill_if_exhausted() -> bool:
             """Refill only after rechecking state and session limits."""
@@ -547,8 +646,13 @@ class WorkflowManager:
                     collect_more = None
                     return False
             next_refs = await collect_more(executor.page)
+            self._save_refs(session_id, next_refs, adapter)
             while not next_refs and not getattr(adapter, "search_exhausted", True):
+                if not await self._wait_if_paused(session_id):
+                    collect_more = None
+                    return False
                 next_refs = await collect_more(executor.page)
+                self._save_refs(session_id, next_refs, adapter)
             new_refs = [
                 candidate for candidate in next_refs if candidate.external_id not in seen_ref_ids
             ]
@@ -576,6 +680,13 @@ class WorkflowManager:
                 if _limit_reached(_application_count(item, adapter_id), application_limit):
                     completion_reason = _application_limit_reason(adapter_id)
                     break
+                existing = db.scalar(select(Vacancy).where(
+                    *_vacancy_scope(adapter_id, adapter.site_id, ref.external_id, session_id)
+                ))
+                if existing and (existing.session_id != session_id or existing.state not in {
+                    "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING",
+                }):
+                    continue
             try:
                 await adapter.open_job(executor.page, ref)
                 blockers = await adapter.detect_blockers(executor.page)
@@ -623,36 +734,12 @@ class WorkflowManager:
                             return
                     continue
                 posting = await adapter.extract_job(executor.page)
-            except Exception as exc:
+            except CaptchaRequired:
+                raise
+            except Exception:
+                retry_needed = True
                 with SessionLocal() as db:
-                    item = db.get(JobSession, session_id)
-                    vacancy = db.scalar(
-                        select(Vacancy).where(
-                            *_vacancy_scope(
-                                adapter_id,
-                                adapter.site_id,
-                                ref.external_id,
-                                session_id,
-                            )
-                        )
-                    )
-                    if vacancy is None:
-                        vacancy = Vacancy(
-                            session_id=session_id,
-                            source=adapter.site_id,
-                            external_id=ref.external_id,
-                            url=ref.url,
-                            title=ref.external_id,
-                            state="ERROR",
-                            data={"error": str(exc)},
-                        )
-                        db.add(vacancy)
-                    counters = dict(item.counters)
-                    counters["errors"] = counters.get("errors", 0) + 1
-                    item.counters = counters
-                    self.emit(
-                        db, session_id, "browser_error", f"Не удалось прочитать вакансию: {exc}"
-                    )
+                    self.emit(db, session_id, "vacancy_retry", "Чтение вакансии будет повторено", {"external_id": ref.external_id})
                 continue
             with SessionLocal() as db:
                 item = db.get(JobSession, session_id)
@@ -680,6 +767,7 @@ class WorkflowManager:
                     "EVALUATING",
                     "READY_TO_SUBMIT",
                     "READY_TO_REPORT",
+                    "SUBMITTING",
                 }:
                     self.emit(
                         db,
@@ -716,6 +804,28 @@ class WorkflowManager:
                         f"Извлечена вакансия: {posting.title}",
                         {"vacancy_id": vacancy.id},
                     )
+
+                if vacancy.state == "SUBMITTING":
+                    verifier = getattr(adapter, "verify_submission", None)
+                    if verifier is None:
+                        raise RecoverableFailure("Адаптер не умеет проверять отправку")
+                    verified = await verifier(executor.page)
+                    if verified.status == "already_applied" and (vacancy.data or {}).get("submission_was_absent"):
+                        verified = verified.model_copy(update={"status": "submitted"})
+                    if verified.status in {"submitted", "already_applied"}:
+                        self._record_submission(db, item, vacancy, verified)
+                        continue
+                    retry_check = getattr(adapter, "can_retry_application", None)
+                    if not retry_check or not await retry_check(executor.page):
+                        # Never click again on an ambiguous outcome. Other vacancies continue.
+                        self._record_submission(db, item, vacancy, verified)
+                        continue
+                    vacancy.state = "READY_TO_SUBMIT"
+                    db.commit()
+                    # The site confirmed absence. Let other vacancies run before
+                    # retrying a repeatedly failing form in the next pass.
+                    retry_needed = True
+                    continue
 
                 vacancy.state = "EVALUATING"
                 db.commit()
@@ -855,6 +965,12 @@ class WorkflowManager:
                             route = await route_reader(executor.page) if route_reader else None
                             form = None
                         else:
+                            retry_check = getattr(adapter, "can_retry_application", None)
+                            absent = bool(retry_check and await retry_check(executor.page))
+                            vacancy.data = {**(vacancy.data or {}), "submission_was_absent": absent}
+                            # Opening HH's form can itself send a one-click application.
+                            vacancy.state = "SUBMITTING"
+                            db.commit()
                             form = await adapter.open_application(executor.page)
                             route = getattr(form, "route", None)
                         kind = getattr(route, "kind", None)
@@ -900,20 +1016,14 @@ class WorkflowManager:
                             db.commit()
                             continue
                         result = await adapter.fill_application(executor.page, plan)
-                    except Exception as exc:
-                        vacancy.state = "UNKNOWN"
-                        counters = dict(item.counters)
-                        counters["errors"] = counters.get("errors", 0) + 1
-                        item.counters = counters
-                        self.emit(
-                            db,
-                            session_id,
-                            "unknown_form",
-                            f"Форма отклика недоступна: {exc}",
-                            {"vacancy_id": vacancy.id},
-                        )
-                        db.commit()
-                        continue
+                    except (ModelUnavailable, CaptchaRequired):
+                        raise
+                    except Exception:
+                        # Keep SUBMITTING durable; reconcile it on the next attempt.
+                        if adapter_id == "hirehi":
+                            retry_needed = True
+                            continue
+                        raise
                     questions = unresolved_application_questions(form, result)
                     if questions:
                         vacancy.state = "UNKNOWN"
@@ -935,53 +1045,28 @@ class WorkflowManager:
                             return
                         try:
                             submission = await adapter.submit_application(executor.page)
-                        except Exception as exc:
-                            vacancy.state = "ERROR"
-                            counters = dict(item.counters)
-                            counters["errors"] = counters.get("errors", 0) + 1
-                            item.counters = counters
-                            self.emit(
-                                db,
-                                session_id,
-                                "submission_error",
-                                f"Не удалось отправить отклик: {exc}",
-                                {"vacancy_id": vacancy.id},
-                            )
-                            db.commit()
-                            continue
-                        vacancy.state = submission.status.upper()
-                        db.add(
-                            Application(
-                                candidate_profile_id=item.profile_id,
-                                vacancy_id=vacancy.id,
-                                status=submission.status,
-                                submitted_at=datetime.now(timezone.utc)
-                                if submission.status == "submitted"
-                                else None,
-                            )
-                        )
-                        if submission.status == "submitted":
-                            counters = dict(item.counters)
-                            counters["submitted"] += 1
-                            item.counters = counters
-                        elif submission.status == "already_applied":
-                            counters = dict(item.counters)
-                            counters["already_applied"] = counters.get("already_applied", 0) + 1
-                            item.counters = counters
-                        elif submission.status == "unknown":
-                            counters = dict(item.counters)
-                            counters["errors"] += 1
-                            item.counters = counters
-                        self.emit(
-                            db,
-                            session_id,
-                            "submission",
-                            submission.message,
-                            {"vacancy_id": vacancy.id, "status": submission.status},
-                        )
+                        except CaptchaRequired:
+                            raise
+                        except Exception:
+                            raise
+                        if submission.status in {"unknown", "blocked"}:
+                            raise RecoverableFailure("Ожидание подтверждения отклика")
+                        self._record_submission(db, item, vacancy, submission)
+                db.commit()
+            with SessionLocal() as db:
+                item = db.get(JobSession, session_id)
+                item.recovery = {**(item.recovery or {}), "attempt": 0, "retry_at": None, "message": None}
                 db.commit()
             await asyncio.sleep(0.05)
 
+        with SessionLocal() as db:
+            item = db.get(JobSession, session_id)
+            if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
+                return
+            if _limit_reached(_application_count(item, adapter_id), item.application_limit):
+                completion_reason = _application_limit_reason(adapter_id)
+            elif retry_needed:
+                raise RecoverableFailure("Не все найденные вакансии обработаны; повторяем временные сбои")
         self.finalize(session_id, completion_reason)
 
 
@@ -989,25 +1074,11 @@ workflow_manager = WorkflowManager()
 
 
 def recover_orphaned_sessions() -> list[int]:
-    """Fail process-owned sessions left active by a previous backend process."""
-    recovered: list[int] = []
+    """Resume accepted work after a process restart; leave drafts/CAPTCHA alone."""
     with SessionLocal() as db:
-        orphaned = list(
-            db.scalars(
-                select(JobSession).where(
-                    JobSession.status.in_((SessionStatus.CREATED, SessionStatus.RUNNING))
-                )
-            )
-        )
-        for item in orphaned:
-            item.status = SessionStatus.FAILED
-            item.stop_reason = "Сессия прервана перезапуском платформы; запустите новую сессию"
-            item.finished_at = datetime.now(timezone.utc)
-            workflow_manager.emit(
-                db,
-                item.id,
-                "recovery",
-                item.stop_reason,
-            )
-            recovered.append(item.id)
+        recovered = list(db.scalars(select(JobSession.id).where(
+            JobSession.status.in_((SessionStatus.RUNNING, SessionStatus.WAITING_FOR_LOGIN))
+        )))
+    for session_id in recovered:
+        workflow_manager.launch(session_id)
     return recovered

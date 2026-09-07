@@ -43,7 +43,7 @@ class BrowserExecutor:
             return await self.page.goto(
                 kwargs["url"],
                 wait_until=kwargs.get("wait_until", "commit"),
-                timeout=min(int(kwargs.get("timeout_ms", 15_000)), 30_000),
+                timeout=min(int(kwargs.get("timeout_ms", 60_000)), 60_000),
             )
         locator = self.page.get_by_role(kwargs["role"], name=kwargs.get("name")) if "role" in kwargs else None
         if action == "click":

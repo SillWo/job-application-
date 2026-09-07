@@ -3,6 +3,7 @@ VACANCY_LINK = "a[data-qa='serp-item__title'], a[href*='/vacancy/']"
 VACANCY_TITLE = "[data-qa='vacancy-title']"
 COMPANY = "[data-qa='vacancy-company-name']"
 DESCRIPTION = "[data-qa='vacancy-description']"
+SALARY = "[data-qa='vacancy-salary'], [data-qa='vacancy-compensation']"
 PAYMENT_FREQUENCY = "[data-qa='compensation-frequency-text']"
 WORK_EXPERIENCE = "[data-qa='work-experience-text']"
 EMPLOYMENT = "[data-qa='common-employment-text']"
@@ -29,3 +30,8 @@ SUBMISSION_TEXT_MARKERS = (
     "ваш отклик отправлен",
 )
 CAPTCHA_MARKERS = ("captcha", "Подтвердите, что вы не робот")
+
+# Explicit empty-result UI; a blank/error page is never exhaustion.
+SEARCH_EMPTY = "[data-qa='vacancy-serp__vacancy-not-found'], [data-qa='vacancy-serp__no-results']"
+SEARCH_PAGER = "[data-qa='pager-block']"
+SEARCH_NEXT = "[data-qa='pager-next']"

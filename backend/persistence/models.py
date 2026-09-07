@@ -73,6 +73,7 @@ class JobSession(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stop_reason: Mapped[str | None] = mapped_column(String(255))
+    recovery: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
 
 
 class Notification(Base):

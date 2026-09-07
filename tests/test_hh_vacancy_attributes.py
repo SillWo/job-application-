@@ -170,6 +170,89 @@ class RecordingGateway:
         )
 
 
+@pytest.mark.parametrize("text,expected", [
+    ("до 36\u00a0000 ₽ за месяц, на руки", (None, 36000, "RUB", False)),
+    ("от 60\u202f000 до 90\u202f000 ₽ в месяц, до вычета налогов", (60000, 90000, "RUB", True)),
+    ("60 000–90 000 руб.", (60000, 90000, "RUB", None)),
+    ("от 60 000 ₽", (60000, None, "RUB", None)),
+    ("60 000 ₽ за месяц", (60000, 60000, "RUB", None)),
+    ("до 36 тыс. руб/мес", (None, 36000, "RUB", None)),
+    ("от 1 000 до 2 000 USD за месяц", (1000, 2000, "USD", None)),
+    ("до 500 € в месяц", (None, 500, "EUR", None)),
+    ("500 ₽ за час", None),
+    ("5 000 ₽ за смену", None),
+    ("1 000 000 ₽ в год", None),
+    ("По договорённости", None),
+    ("до 36 000 неизвестных единиц", None),
+    (None, None),
+])
+async def test_salary_survives_extraction_and_model_payload(text, expected):
+    job = await HHAdapter().extract_job(Page({
+        locators.VACANCY_TITLE: "Стажёр",
+        locators.COMPANY: "Компания",
+        locators.DESCRIPTION: "Координация проектов",
+        locators.SALARY: text,
+    }))
+    gateway = RecordingGateway()
+    await evaluate(job, {}, [], gateway)
+    if expected is None:
+        assert job.salary is None
+        assert gateway.payload["job"]["salary"] is None
+    else:
+        assert (job.salary.minimum, job.salary.maximum, job.salary.currency, job.salary.gross) == expected
+        assert gateway.payload["job"]["salary"] == job.salary.model_dump()
+    if text:
+        assert " ".join(text.split()) in gateway.payload["job"]["description"]
+
+
+async def test_salary_skips_hidden_and_empty_duplicate_blocks():
+    class DuplicateSalaryPage(Page):
+        def locator(self, selector):
+            if selector == locators.SALARY:
+                return MultiLocator(["999 000 ₽", "", "до 36 000 ₽ за месяц"], [False, True, True])
+            return super().locator(selector)
+
+    job = await HHAdapter().extract_job(DuplicateSalaryPage({
+        locators.VACANCY_TITLE: "Стажёр",
+        locators.COMPANY: "Компания",
+        locators.DESCRIPTION: "Координация проектов",
+    }))
+    assert job.salary.maximum == 36000
+    assert "999 000" not in job.description
+
+
+@pytest.mark.parametrize("unreadable", ["", "timeout"])
+async def test_unreadable_salary_does_not_silently_become_unspecified(unreadable):
+    class UnreadableSalaryPage(Page):
+        def locator(self, selector):
+            locator = super().locator(selector)
+            if selector == locators.SALARY and unreadable == "timeout":
+                async def fail(**kwargs):
+                    raise TimeoutError("Block detached during extraction")
+                locator.inner_text = fail
+            return locator
+
+    with pytest.raises(ValueError, match="блок зарплаты"):
+        await HHAdapter().extract_job(UnreadableSalaryPage({
+            locators.VACANCY_TITLE: "Стажёр", locators.COMPANY: "Компания",
+            locators.DESCRIPTION: "Координация проектов", locators.SALARY: unreadable,
+        }))
+
+
+async def test_extracted_36000_is_blocked_by_60000_salary_policy():
+    job = await HHAdapter().extract_job(Page({
+        locators.VACANCY_TITLE: "Стажёр",
+        locators.COMPANY: "Компания",
+        locators.DESCRIPTION: "Координация проектов",
+        locators.SALARY: "до 36 000 ₽ за месяц, на руки",
+    }))
+    result = await evaluate(job, {}, [], RecordingGateway(), preference_policy={
+        "desired_salary": {"minimum_monthly_amount": 60000, "currency": "RUB"},
+    })
+    assert result.decision == "skip"
+    assert "salary_below_preference" in result.hard_rule_violations
+
+
 @pytest.mark.asyncio
 async def test_evaluate_passes_structured_attributes_to_resume_analyst():
     job = JobPosting(

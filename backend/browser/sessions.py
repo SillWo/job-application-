@@ -1,3 +1,6 @@
+import asyncio
+from contextlib import suppress
+
 from .executor import BrowserExecutor
 
 open_browsers: dict[int, BrowserExecutor] = {}
@@ -48,3 +51,23 @@ async def close_browser(session_id: int) -> None:
         await executor.close()
     finally:
         release_browser_lease(session_id, executor.site_id)
+
+
+async def restore_browser(session_id: int, adapter) -> BrowserExecutor:
+    """Reopen the site's existing local profile without moving browser storage."""
+    with suppress(Exception):
+        await asyncio.wait_for(close_browser(session_id), timeout=15)
+    if not acquire_browser_lease(session_id, adapter.site_id):
+        raise RuntimeError("Профиль браузера занят другой сессией")
+    executor = BrowserExecutor(adapter.site_id, adapter.allowed_domains, headless=False)
+    try:
+        await asyncio.wait_for(executor.start(), timeout=60)
+        set_browser(session_id, executor)
+        await executor.execute("navigate", url=f"https://{adapter.allowed_domains[0]}/")
+        return executor
+    except BaseException:
+        with suppress(Exception):
+            await asyncio.wait_for(executor.close(), timeout=15)
+        open_browsers.pop(session_id, None)
+        release_browser_lease(session_id, adapter.site_id)
+        raise

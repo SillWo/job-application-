@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -58,6 +59,7 @@ class FakeAdapter:
         return LoginState(authenticated=True, message="ok")
 
     async def open_search(self, page, filters):
+        self.current_ref = None
         return None
 
     async def collect_job_refs(self, page):
@@ -101,6 +103,10 @@ class FakeAdapter:
         return SubmissionResult(status="submitted", message="submitted")
 
 
+    async def verify_submission(self, page):
+        return SubmissionResult(status="unknown", message="No confirmation")
+
+
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'workflow.db'}")
@@ -118,6 +124,7 @@ def runtime(tmp_path, monkeypatch):
         db.add(item)
         db.commit()
         session_id = item.id
+    monkeypatch.setattr(workflow.WorkflowManager, "retry_base_seconds", 0)
     monkeypatch.setattr(workflow, "SessionLocal", sessions)
     monkeypatch.setattr(workflow, "get_browser", lambda session_id: SimpleNamespace(page=object()))
     monkeypatch.setattr(workflow, "ModelGateway", lambda: object())
@@ -131,7 +138,7 @@ async def run_workflow(runtime, monkeypatch, adapter, evaluate_impl=None):
         async def evaluate_impl(*args, **kwargs):
             return evaluation()
     monkeypatch.setattr(workflow, "evaluate", evaluate_impl)
-    await workflow.WorkflowManager().run(session_id)
+    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=20)
     return sessions, session_id
 
 
@@ -234,7 +241,7 @@ async def test_captcha_still_pauses(runtime, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_model_unavailable_pauses_without_error_and_does_not_continue(runtime, monkeypatch):
+async def test_model_unavailable_recovers_without_error_and_continues(runtime, monkeypatch):
     refs = [JobRef(external_id="bad", url="https://fake/bad"),
             JobRef(external_id="next", url="https://fake/next")]
     calls = 0
@@ -250,11 +257,12 @@ async def test_model_unavailable_pauses_without_error_and_does_not_continue(runt
     with sessions() as db:
         item = db.get(JobSession, session_id)
         states = {v.external_id: v.state for v in db.scalars(select(Vacancy))}
-        assert item.status == SessionStatus.PAUSED
-        assert item.stop_reason == "offline"
-        assert item.finished_at is None
+        assert item.status == SessionStatus.COMPLETED
         assert item.counters.get("errors", 0) == 0
-        assert states == {"bad": "EVALUATING"}
+        assert item.counters["viewed"] == 2
+        assert states == {"bad": "REJECTED_BY_MODEL", "next": "REJECTED_BY_MODEL"}
+        assert calls == 3
+
 
 
 @pytest.mark.asyncio
@@ -347,7 +355,7 @@ async def test_manual_review_decision_becomes_error_and_continues(runtime, monke
 
 
 @pytest.mark.asyncio
-async def test_letter_model_unavailable_pauses_without_error(runtime, monkeypatch):
+async def test_letter_model_unavailable_recovers_without_duplicate_match_count(runtime, monkeypatch):
     refs = [JobRef(external_id="bad", url="https://fake/bad"),
             JobRef(external_id="next", url="https://fake/next")]
     letter_calls = 0
@@ -367,27 +375,31 @@ async def test_letter_model_unavailable_pauses_without_error(runtime, monkeypatc
     with sessions() as db:
         states = {v.external_id: v.state for v in db.scalars(select(Vacancy))}
         item = db.get(JobSession, session_id)
-        assert item.status == SessionStatus.PAUSED
-        assert item.stop_reason == "offline"
-        assert item.finished_at is None
+        assert item.status == SessionStatus.COMPLETED
         assert item.counters.get("errors", 0) == 0
-        assert states == {"bad": "EVALUATING"}
+        assert item.counters["matched"] == 2
+        assert item.counters["submitted"] == 2
+        assert states == {"bad": "SUBMITTED", "next": "SUBMITTED"}
+
 
 
 @pytest.mark.asyncio
-async def test_uncaught_model_unavailable_pauses_session(runtime, monkeypatch):
+async def test_uncaught_model_unavailable_is_retried_until_success(runtime, monkeypatch):
     manager = workflow.WorkflowManager()
+    calls = 0
 
-    async def fail_before_work(_session_id):
-        raise workflow.ModelUnavailable("API unavailable")
+    async def fail_before_work(session_id):
+        nonlocal calls
+        calls += 1
+        if calls < 5:
+            raise workflow.ModelUnavailable("API unavailable")
+        manager.finalize(session_id, "Доступная выдача обработана")
 
     monkeypatch.setattr(manager, "_run", fail_before_work)
-    await manager.run(runtime[1])
+    await asyncio.wait_for(manager.run(runtime[1]), timeout=2)
+    assert calls == 5
     with runtime[0]() as db:
-        item = db.get(JobSession, runtime[1])
-        assert item.status == SessionStatus.PAUSED
-        assert item.stop_reason == "API unavailable"
-        assert item.finished_at is None
+        assert db.get(JobSession, runtime[1]).status == SessionStatus.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -407,19 +419,8 @@ async def test_model_unavailable_resume_retries_same_vacancy(runtime, monkeypatc
     monkeypatch.setattr(workflow.adapter_registry, "get", lambda adapter_id: adapter)
     monkeypatch.setattr(workflow, "evaluate", unavailable_once)
     manager = workflow.WorkflowManager()
-    await manager.run(runtime[1])
-    with runtime[0]() as db:
-        item = db.get(JobSession, runtime[1])
-        first = db.scalar(select(Vacancy).where(Vacancy.external_id == "first"))
-        assert item.status == SessionStatus.PAUSED
-        assert first.state == "EVALUATING"
-        assert item.counters.get("errors", 0) == 0
-
-    async def available(*args, **kwargs):
-        return evaluation()
-
-    monkeypatch.setattr(workflow, "evaluate", available)
-    await manager.run(runtime[1])
+    await asyncio.wait_for(manager.run(runtime[1]), timeout=5)
+    assert calls == 3
     with runtime[0]() as db:
         item = db.get(JobSession, runtime[1])
         states = {v.external_id: v.state for v in db.scalars(select(Vacancy))}
@@ -431,7 +432,7 @@ async def test_model_unavailable_resume_retries_same_vacancy(runtime, monkeypatc
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("adapter_kwargs", "state"), [
     ({"questions": ["Неизвестный вопрос"]}, "UNKNOWN"),
-    ({"submission_error": "submit failed"}, "ERROR"),
+    ({"submission_error": "submit failed"}, "UNKNOWN"),
 ])
 async def test_form_and_submission_failures_do_not_pause(runtime, monkeypatch, adapter_kwargs, state):
     refs = [JobRef(external_id="one", url="https://fake/one"),

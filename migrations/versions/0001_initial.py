@@ -55,7 +55,7 @@ def upgrade() -> None:
         sa.Column("csv_path", sa.String(500), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
-    for column in ("viewed_limit", "application_limit", "minimum_scores", "resume_url", "resume_path", "desired_job_description", "preference_policy"):
+    for column in ("viewed_limit", "application_limit", "minimum_scores", "resume_url", "resume_path", "desired_job_description", "preference_policy", "recovery"):
         if column in sessions.c:
             sessions._columns.remove(sessions.c[column])
     if "employer_contacts" in legacy_metadata.tables:

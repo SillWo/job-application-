@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -8,8 +9,9 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.api.router import router as api_router
 from backend.api.router import session_socket
+from backend.browser.sessions import close_browser, open_browsers
 from backend.config import settings
-from backend.orchestrator.workflow import recover_orphaned_sessions
+from backend.orchestrator.workflow import recover_orphaned_sessions, workflow_manager
 from backend.persistence.database import init_database
 
 
@@ -17,7 +19,14 @@ from backend.persistence.database import init_database
 async def lifespan(app: FastAPI):
     init_database()
     recover_orphaned_sessions()
-    yield
+    try:
+        yield
+    finally:
+        tasks = list(workflow_manager.tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*(close_browser(key) for key in list(open_browsers)), return_exceptions=True)
 
 
 app = FastAPI(title="Job Application Orchestrator", version="0.1.0", lifespan=lifespan)

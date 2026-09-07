@@ -30,6 +30,8 @@ if ($listener) {
 }
 
 Write-Host "Starting Job Application Orchestrator at $appUrl"
+& .\.venv\Scripts\python.exe -m alembic upgrade head
+if ($LASTEXITCODE -ne 0) { throw 'Database migration failed' }
 $browserJob = $null
 if (-not $NoBrowser) {
     $browserJob = Start-Job -ScriptBlock {

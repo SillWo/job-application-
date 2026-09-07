@@ -117,7 +117,7 @@ class ZarplataAdapter:
             await page.goto(
                 "https://zarplata.ru/applicant/resumes",
                 wait_until="commit",
-                timeout=15_000,
+                timeout=60_000,
             )
             await page.wait_for_timeout(500)
             reached = urlparse(str(getattr(page, "url", "")))
@@ -191,7 +191,7 @@ class ZarplataAdapter:
         await page.goto(
             "https://zarplata.ru/",
             wait_until="commit",
-            timeout=15_000,
+            timeout=60_000,
         )
         await page.wait_for_timeout(1_500)
         for label in ("Для вас", "Вакансии для вас", "Подходящие вакансии"):
@@ -235,7 +235,7 @@ class ZarplataAdapter:
             if page_number > 0 or listing_path and page_number == 0:
                 target = self._search_page_url(base_url, page_number)
                 try:
-                    await page.goto(target, wait_until="commit", timeout=15_000)
+                    await page.goto(target, wait_until="commit", timeout=60_000)
                     await page.wait_for_timeout(1_500)
                 except Exception:
                     # A stale/failed navigation must not spin indefinitely;
@@ -292,13 +292,14 @@ class ZarplataAdapter:
             self._search_exhausted = True
             return []
 
-        while self._search_navigation_count < 100 and self._search_query_index < len(search_urls):
+        while self._search_query_index < len(search_urls):
             fallback_url = search_urls[self._search_query_index]
             self.current_search_query = self._search_queries[self._search_query_index]
             page_number = self._search_page_number
+            page_refs = await self._collect_search_page(page, fallback_url, page_number)
+            # Advance only after a successfully read page.
             self._search_page_number += 1
             self._search_navigation_count += 1
-            page_refs = await self._collect_search_page(page, fallback_url, page_number)
             if not page_refs:
                 # _collect_search_page already retried this page three times;
                 # only now is an empty listing considered confirmed exhaustion.
@@ -308,11 +309,7 @@ class ZarplataAdapter:
                 self._repeated_search_pages = 0
                 continue
             if self._repeated_search_pages >= 3:
-                self._search_query_index += 1
-                self._search_page_number = 0
-                self._last_search_page_signature = None
-                self._repeated_search_pages = 0
-                continue
+                raise RuntimeError("Выдача повторяет страницу; требуется повторная загрузка")
 
             new_refs = []
             for ref in page_refs:
@@ -345,16 +342,20 @@ class ZarplataAdapter:
         url = self._search_page_url(fallback_url, page_number)
         page_refs: list[JobRef] = []
         for attempt in range(3):
-            await page.goto(url, wait_until="commit", timeout=15_000)
+            await page.goto(url, wait_until="commit", timeout=60_000)
             await page.wait_for_timeout(1_500 + attempt * 500)
             page_refs = await self._visible_job_refs(page, timeout=8_000)
             if page_refs:
                 break
+        if not page_refs:
+            empty = page.locator(locators.SEARCH_EMPTY).first
+            if not await empty.count() or not await empty.is_visible():
+                raise RuntimeError("Выдача не загрузилась; отсутствие вакансий не подтверждено")
         signature = tuple(ref.external_id for ref in page_refs)
         if page_number and signature and signature == self._last_search_page_signature:
             # A commit navigation can leave the previous result list attached
             # briefly. Retry once before recording a no-progress page.
-            await page.goto(url, wait_until="commit", timeout=15_000)
+            await page.goto(url, wait_until="commit", timeout=60_000)
             await page.wait_for_timeout(1_500)
             page_refs = await self._visible_job_refs(page, timeout=8_000)
             signature = tuple(ref.external_id for ref in page_refs)
@@ -405,7 +406,7 @@ class ZarplataAdapter:
     async def open_job(self, page, ref: JobRef) -> None:
         if urlparse(ref.url).hostname not in self.allowed_domains:
             raise ValueError("Переход за пределы разрешённых доменов остановлен")
-        await page.goto(ref.url, wait_until="commit", timeout=15_000)
+        await page.goto(ref.url, wait_until="commit", timeout=60_000)
         await page.wait_for_timeout(1_000)
 
     async def extract_job(self, page) -> JobPosting:
@@ -580,6 +581,15 @@ class ZarplataAdapter:
             if prompt and "сопровод" not in prompt.lower() and prompt not in questions:
                 questions.append(prompt)
         return questions
+
+    async def can_retry_application(self, page) -> bool:
+        """The loaded vacancy explicitly offers a new application, with no prior response."""
+        if not (await self.get_login_state(page)).authenticated:
+            return False
+        if await page.locator(locators.ALREADY_APPLIED).count():
+            return False
+        response = page.locator(locators.RESPONSE_BUTTON).first
+        return bool(await response.count() and await response.is_visible())
 
     async def submit_application(self, page) -> SubmissionResult:
         submit = page.locator(locators.RESPONSE_SUBMIT)

@@ -16,6 +16,7 @@ from backend.adapters.base.protocol import (
 from backend.schemas.domain import ApplicationPlan, JobPosting
 
 from . import locators
+from .salary import parse_salary
 
 
 class HHAdapter:
@@ -45,6 +46,39 @@ class HHAdapter:
     @search_exhausted.setter
     def search_exhausted(self, value: bool) -> None:
         self._search_exhausted = value
+
+    def search_checkpoint(self) -> dict:
+        """Export only the listing cursor, never browser/account state."""
+        names = (
+            "_search_page_number", "_search_query_index", "_search_exhausted",
+            "_repeated_search_pages", "_search_navigation_count",
+            "current_result_page", "current_search_query",
+        )
+        return {
+            **{name: getattr(self, name, None) for name in names},
+            "_fallback_search_urls": list(getattr(self, "_fallback_search_urls", [])),
+            "_search_queries": list(getattr(self, "_search_queries", [])),
+            "_search_seen_ids": sorted(getattr(self, "_search_seen_ids", set())),
+            "_last_search_page_signature": getattr(self, "_last_search_page_signature", None),
+        }
+
+    def restore_search_checkpoint(self, checkpoint: dict) -> None:
+        urls = checkpoint.get("_fallback_search_urls")
+        if urls is not None:
+            if any(urlparse(url).hostname not in self.allowed_domains or urlparse(url).path != "/search/vacancy" for url in urls):
+                raise ValueError("Сохранённый поиск содержит недопустимый адрес")
+            self._fallback_search_urls = list(urls)
+            self._search_queries = list(checkpoint.get("_search_queries", []))
+        for name in (
+            "_search_page_number", "_search_query_index", "_search_exhausted",
+            "_repeated_search_pages", "_search_navigation_count",
+            "current_result_page", "current_search_query",
+        ):
+            if checkpoint.get(name) is not None:
+                setattr(self, name, checkpoint[name])
+        self._search_seen_ids = set(checkpoint.get("_search_seen_ids", []))
+        signature = checkpoint.get("_last_search_page_signature")
+        self._last_search_page_signature = tuple(signature) if signature else None
 
     @staticmethod
     def normalize_search_query(value: str) -> str:
@@ -125,7 +159,7 @@ class HHAdapter:
         await page.goto(
             "https://hh.ru/",
             wait_until="commit",
-            timeout=15_000,
+            timeout=60_000,
         )
         await page.wait_for_timeout(1_500)
         for label in ("Для вас", "Вакансии для вас", "Подходящие вакансии"):
@@ -140,6 +174,15 @@ class HHAdapter:
         if await more_recommendations.count() and await more_recommendations.is_visible():
             await more_recommendations.click()
             await page.wait_for_timeout(1_500)
+        # Traverse the actual recommendation listing as well as planned queries.
+        # A first-page snapshot alone is not evidence that recommendations ended.
+        reached = urlparse(page.url)
+        if reached.hostname in self.allowed_domains and reached.path == "/search/vacancy":
+            self._fallback_search_urls.insert(0, self._search_page_url(page.url, 0))
+            self._search_queries.insert(0, "Рекомендации")
+        if not self._fallback_search_urls:
+            self._fallback_search_urls = ["https://hh.ru/search/vacancy"]
+            self._search_queries = [""]
 
     async def collect_job_refs(self, page) -> list[JobRef]:
         # Personalized recommendations are a larger initial snapshot than a
@@ -162,8 +205,8 @@ class HHAdapter:
         HH's personalized page and the text-search result pages are separate
         listings. Keeping a cursor here prevents the workflow from treating a
         duplicate-heavy personalized snapshot as the end of an unlimited
-        session. Empty/repeated pages are consumed internally, while the
-        finite page bound protects against a broken/stale listing.
+        session. Only confirmed empty pages advance to the next query;
+        stale listings raise an error for the workflow to recover.
         """
         if self._search_exhausted:
             return []
@@ -172,53 +215,48 @@ class HHAdapter:
             self._search_exhausted = True
             return []
 
-        while self._search_navigation_count < 100 and self._search_query_index < len(search_urls):
-            fallback_url = search_urls[self._search_query_index]
-            self.current_search_query = self._search_queries[self._search_query_index]
-            page_number = self._search_page_number
-            self._search_page_number += 1
-            self._search_navigation_count += 1
-            page_refs = await self._collect_search_page(page, fallback_url, page_number)
-            if not page_refs:
-                # _collect_search_page already retried this page three times;
-                # only now is an empty listing considered confirmed exhaustion.
-                self._search_query_index += 1
-                self._search_page_number = 0
-                self._last_search_page_signature = None
-                self._repeated_search_pages = 0
-                continue
-            if self._repeated_search_pages >= 3:
-                self._search_query_index += 1
-                self._search_page_number = 0
-                self._last_search_page_signature = None
-                self._repeated_search_pages = 0
-                continue
-
-            new_refs = []
-            for ref in page_refs:
-                if ref.external_id not in self._search_seen_ids:
-                    self._search_seen_ids.add(ref.external_id)
-                    new_refs.append(ref)
-            if new_refs:
-                return new_refs
-        self._search_exhausted = True
-        return []
+        if self._search_query_index >= len(search_urls):
+            self._search_exhausted = True
+            return []
+        fallback_url = search_urls[self._search_query_index]
+        self.current_search_query = self._search_queries[self._search_query_index]
+        page_number = self._search_page_number
+        page_refs = await self._collect_search_page(page, fallback_url, page_number)
+        # Advance only after a successfully read page. Return one page per call
+        # so the workflow can persist progress even through duplicate-only pages.
+        self._search_page_number += 1
+        self._search_navigation_count += 1
+        if self._repeated_search_pages >= 3 and page_refs:
+            raise RuntimeError("Выдача повторяет страницу; требуется повторная загрузка")
+        new_refs = [ref for ref in page_refs if ref.external_id not in self._search_seen_ids]
+        self._search_seen_ids.update(ref.external_id for ref in new_refs)
+        if not page_refs or getattr(self, "_last_page_terminal", False):
+            self._search_query_index += 1
+            self._search_page_number = 0
+            self._last_search_page_signature = None
+            self._repeated_search_pages = 0
+            self._search_exhausted = self._search_query_index >= len(search_urls)
+        return new_refs
 
     async def _collect_search_page(self, page, fallback_url: str, page_number: int) -> list[JobRef]:
         """Navigate to a known result page and reject stale DOM snapshots."""
         url = self._search_page_url(fallback_url, page_number)
         page_refs: list[JobRef] = []
         for attempt in range(3):
-            await page.goto(url, wait_until="commit", timeout=15_000)
+            await page.goto(url, wait_until="commit", timeout=60_000)
             await page.wait_for_timeout(1_500 + attempt * 500)
             page_refs = await self._visible_job_refs(page, timeout=8_000)
             if page_refs:
                 break
+        if not page_refs:
+            empty = page.locator(locators.SEARCH_EMPTY).first
+            if not await empty.count() or not await empty.is_visible():
+                raise RuntimeError("Выдача не загрузилась; отсутствие вакансий не подтверждено")
         signature = tuple(ref.external_id for ref in page_refs)
         if page_number and signature and signature == self._last_search_page_signature:
             # A commit navigation can leave the previous result list attached
             # briefly. Retry once before recording a no-progress page.
-            await page.goto(url, wait_until="commit", timeout=15_000)
+            await page.goto(url, wait_until="commit", timeout=60_000)
             await page.wait_for_timeout(1_500)
             page_refs = await self._visible_job_refs(page, timeout=8_000)
             signature = tuple(ref.external_id for ref in page_refs)
@@ -229,6 +267,14 @@ class HHAdapter:
             self._repeated_search_pages = 0
         if not page_refs:
             self._repeated_search_pages += 1
+        pager = page.locator(locators.SEARCH_PAGER).first
+        next_page = page.locator(locators.SEARCH_NEXT).first
+        self._last_page_terminal = bool(
+            await pager.count() and await pager.is_visible()
+            and (not await next_page.count() or not await next_page.is_visible())
+        )
+        if self._last_page_terminal:
+            self._repeated_search_pages = 0
         self.current_result_page = page_number
         self._last_search_page_signature = signature or None
         return page_refs
@@ -266,7 +312,7 @@ class HHAdapter:
     async def open_job(self, page, ref: JobRef) -> None:
         if urlparse(ref.url).hostname not in self.allowed_domains:
             raise ValueError("Переход за пределы разрешённых доменов остановлен")
-        await page.goto(ref.url, wait_until="commit", timeout=15_000)
+        await page.goto(ref.url, wait_until="commit", timeout=60_000)
         await page.wait_for_timeout(1_000)
 
     async def extract_job(self, page) -> JobPosting:
@@ -288,16 +334,29 @@ class HHAdapter:
         title = await required_text(locators.VACANCY_TITLE, "название")
         company = await required_text(locators.COMPANY, "компанию")
         description = await required_text(locators.DESCRIPTION, "описание")
-        async def optional_text(selector: str) -> str | None:
-            locator = page.locator(selector).first
-            if not await locator.count():
-                return None
-            try:
-                value = " ".join((await locator.inner_text(timeout=3_000)).split())
-            except Exception:
-                return None
-            return value or None
+        async def optional_text(selector: str, *, require_readable: bool = False) -> str | None:
+            locator = page.locator(selector)
+            visible_found = False
+            for index in range(await locator.count()):
+                candidate = locator.nth(index) if hasattr(locator, "nth") else locator.first
+                if not await candidate.is_visible():
+                    continue
+                visible_found = True
+                try:
+                    value = " ".join((await candidate.inner_text(timeout=3_000)).split())
+                except Exception:
+                    continue
+                if value:
+                    return value
+            if require_readable and visible_found:
+                raise ValueError("Не удалось прочитать видимый блок зарплаты вакансии")
+            return None
 
+        salary_text = await optional_text(locators.SALARY, require_readable=True)
+        if salary_text:
+            # Keep exact compensation terms available to the model, grounding
+            # checks and persisted snapshots, even if normalization is impossible.
+            description = f"Зарплата: {salary_text}\n\n{description}"
         payment_frequency = await optional_text(locators.PAYMENT_FREQUENCY)
         required_experience = await optional_text(locators.WORK_EXPERIENCE)
         employment_type = await optional_text(locators.EMPLOYMENT)
@@ -313,6 +372,7 @@ class HHAdapter:
             title=title,
             company=company,
             description=description,
+            salary=parse_salary(salary_text),
             has_test_assignment=self.has_test_assignment(description),
             payment_frequency=payment_frequency,
             required_experience=required_experience,
@@ -441,6 +501,15 @@ class HHAdapter:
             if prompt and "сопровод" not in prompt.lower() and prompt not in questions:
                 questions.append(prompt)
         return questions
+
+    async def can_retry_application(self, page) -> bool:
+        """The loaded vacancy explicitly offers a new application, with no prior response."""
+        if not (await self.get_login_state(page)).authenticated:
+            return False
+        if await page.locator(locators.ALREADY_APPLIED).count():
+            return False
+        response = page.locator(locators.RESPONSE_BUTTON).first
+        return bool(await response.count() and await response.is_visible())
 
     async def submit_application(self, page) -> SubmissionResult:
         submit = page.locator(locators.RESPONSE_SUBMIT)

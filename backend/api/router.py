@@ -38,7 +38,6 @@ from backend.browser.sessions import (
 from backend.config import settings
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
 from backend.intelligence.model_config import validate_base_url
-from backend.intelligence.preference_policy import compile_preference_policy
 from backend.orchestrator.workflow import workflow_manager
 from backend.persistence.crypto import decrypt_secret, encrypt_secret
 from backend.persistence.database import get_db
@@ -620,29 +619,10 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(404, "Сессия не найдена")
     if item.status != SessionStatus.CREATED:
         raise HTTPException(409, "Запустить можно только новую сессию")
-    try:
-        model_status = await ModelGateway().status()
-        if (
-            model_status.get("connected") is not True
-            or model_status.get("model_available") is not True
-        ):
-            raise RuntimeError("model unavailable")
-    except Exception as exc:
-        raise HTTPException(503, "API модели не доступен") from exc
-    if item.preference_policy is None:
-        try:
-            if item.desired_job_description.strip():
-                policy = await compile_preference_policy(
-                    ModelGateway(), item.desired_job_description
-                )
-            else:
-                policy = None
-        except ModelUnavailable as exc:
-            raise HTTPException(503, "API модели не доступен") from exc
-        item.preference_policy = policy.model_dump(mode="json") if policy else None
-        db.commit()
     if workflow_manager.launch(session_id) is False:
         raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
+    item.status = SessionStatus.RUNNING
+    db.commit()
     return {"ok": True}
 
 
@@ -677,6 +657,10 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item.stop_reason = "Остановлено пользователем"
     item.finished_at = datetime.now(timezone.utc)
     db.commit()
+    task = workflow_manager.tasks.get(session_id)
+    if task and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     await close_browser(session_id)
     if item.adapter_id == "hirehi":
         workflow_manager.write_hirehi_report(session_id)

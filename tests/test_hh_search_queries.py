@@ -54,6 +54,27 @@ async def test_open_search_uses_only_deduped_queries_and_url_encodes():
 
 
 @pytest.mark.asyncio
+async def test_empty_query_plan_still_searches_available_vacancies():
+    adapter = await _configure([])
+    assert adapter._fallback_search_urls == ["https://hh.ru/search/vacancy"]
+    assert adapter._search_queries == [""]
+
+
+@pytest.mark.asyncio
+async def test_slow_navigation_has_time_to_finish():
+    class SlowPage(_Page):
+        async def goto(self, url, **kwargs):
+            # A page taking 25 seconds could never succeed with the old timeout.
+            if kwargs.get("timeout", 0) < 25_000:
+                raise TimeoutError("response headers took 25 seconds")
+            self.url = url
+
+    page = SlowPage()
+    await HHAdapter().open_job(page, JobRef(external_id="1", url="https://hh.ru/vacancy/1"))
+    assert page.url == "https://hh.ru/vacancy/1"
+
+
+@pytest.mark.asyncio
 async def test_empty_page_advances_query_and_resets_cursor_state():
     adapter = await _configure(["one", "two"])
     seen = []
@@ -67,6 +88,8 @@ async def test_empty_page_advances_query_and_resets_cursor_state():
     adapter._collect_search_page = collect
     adapter._last_search_page_signature = ("stale",)
     adapter._repeated_search_pages = 2
+    assert await adapter.collect_more_job_refs(_Page()) == []
+    assert adapter.search_exhausted is False
     assert [r.external_id for r in await adapter.collect_more_job_refs(_Page())] == ["2"]
     assert seen == [("one", 0), ("two", 0)]
     assert adapter._last_search_page_signature is None
@@ -87,12 +110,14 @@ async def test_dedupes_refs_across_queries_and_exhausts_after_all():
     adapter._collect_search_page = collect
     assert [r.external_id for r in await adapter.collect_more_job_refs(_Page())] == ["1"]
     assert await adapter.collect_more_job_refs(_Page()) == []
+    assert not adapter.search_exhausted
+    assert await adapter.collect_more_job_refs(_Page()) == []
     assert adapter.search_exhausted is True
     assert len(calls) == 3  # result page, then confirmed empty pages for both queries
 
 
 @pytest.mark.asyncio
-async def test_repeated_page_advances_and_resets_signature():
+async def test_repeated_page_requests_recovery_instead_of_false_exhaustion():
     adapter = await _configure(["one", "two"])
     seen = []
 
@@ -107,12 +132,14 @@ async def test_repeated_page_advances_and_resets_signature():
         return [JobRef(external_id="2", url="https://hh.ru/vacancy/2")]
 
     adapter._collect_search_page = collect
-    assert [r.external_id for r in await adapter.collect_more_job_refs(_Page())] == ["2"]
-    assert seen == ["one", "two"]
+    with pytest.raises(RuntimeError, match="повторяет"):
+        await adapter.collect_more_job_refs(_Page())
+    assert seen == ["one"]
+    assert adapter.search_exhausted is False
 
 
 @pytest.mark.asyncio
-async def test_total_navigation_budget_is_100():
+async def test_search_continues_beyond_100_pages():
     adapter = await _configure(["one", "two"])
     calls = 0
 
@@ -124,6 +151,69 @@ async def test_total_navigation_budget_is_100():
     adapter._collect_search_page = collect
     for _ in range(100):
         assert await adapter.collect_more_job_refs(_Page())
-    assert await adapter.collect_more_job_refs(_Page()) == []
-    assert calls == 100
-    assert adapter.search_exhausted is True
+    assert await adapter.collect_more_job_refs(_Page())
+    assert calls == 101
+    assert adapter.search_exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_navigation_failure_does_not_advance_search_cursor():
+    adapter = await _configure(["one"])
+
+    async def fail(*args):
+        raise TimeoutError("page timed out")
+
+    adapter._collect_search_page = fail
+    with pytest.raises(TimeoutError):
+        await adapter.collect_more_job_refs(_Page())
+    assert adapter._search_page_number == 0
+    assert adapter.search_exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_search_checkpoint_resumes_next_page_with_seen_refs():
+    adapter = await _configure(["one"])
+    pages = []
+
+    async def collect(page, url, number):
+        pages.append(number)
+        return [JobRef(external_id=str(number), url=f"https://hh.ru/vacancy/{number}")]
+
+    adapter._collect_search_page = collect
+    await adapter.collect_more_job_refs(_Page())
+    checkpoint = adapter.search_checkpoint()
+    restarted = await _configure(["one"])
+    restarted.restore_search_checkpoint(checkpoint)
+    restarted._collect_search_page = collect
+    assert [ref.external_id for ref in await restarted.collect_more_job_refs(_Page())] == ["1"]
+    assert pages == [0, 1]
+    assert restarted._search_seen_ids == {"0", "1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed_empty", [False, True])
+async def test_only_explicit_empty_page_confirms_exhaustion(confirmed_empty):
+    adapter = await _configure(["one"])
+
+    async def no_links(*args, **kwargs):
+        return []
+
+    class EmptyMarker(_EmptyLocator):
+        async def count(self):
+            return int(confirmed_empty)
+
+        async def is_visible(self):
+            return confirmed_empty
+
+    class EmptyPage(_Page):
+        def locator(self, *args, **kwargs):
+            return EmptyMarker()
+
+    adapter._visible_job_refs = no_links
+    if confirmed_empty:
+        assert await adapter.collect_more_job_refs(EmptyPage()) == []
+        assert adapter.search_exhausted
+    else:
+        with pytest.raises(RuntimeError, match="не загрузилась"):
+            await adapter.collect_more_job_refs(EmptyPage())
+        assert not adapter.search_exhausted

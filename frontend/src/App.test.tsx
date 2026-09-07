@@ -268,12 +268,13 @@ test('sorts vacancies by a criterion and resets loaded pagination', async () => 
 test.each([
   ['unavailable', { connected: false, model_available: false }],
   ['http failure', null],
-] as const)('blocks session creation when model preflight is %s', async (_name, status) => {
+] as const)('starts a recoverable session when model is %s', async (_name, status) => {
   const requests: Array<{ url: string; method?: string }> = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input); requests.push({ url, method: init?.method })
     if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 99, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
     if (url.endsWith('/api/model/status')) return status ? Promise.resolve({ ok: true, json: async () => status }) : Promise.resolve({ ok: false, statusText: 'down', json: async () => ({}) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
@@ -281,13 +282,11 @@ test.each([
   const launch = await screen.findByRole('button', { name: 'Создать и запустить' })
   await waitFor(() => expect(launch).toBeEnabled())
   fireEvent.click(launch)
-  expect(await screen.findByRole('alert')).toHaveTextContent('API модели не доступен')
-  await waitFor(() => expect(document.querySelector('[data-sonner-toast][data-type="error"]')).toHaveTextContent('API модели не доступен'))
-  expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))).toBe(false)
-  expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/start'))).toBe(false)
+  await waitFor(() => expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/sessions/99/start'))).toBe(true))
+  expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))).toBe(true)
 })
 
-test('runs model preflight before creating and starting a session', async () => {
+test('creates and starts a session without a blocking model preflight', async () => {
   const requests: string[] = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input); requests.push(`${init?.method ?? 'GET'} ${url}`)
@@ -301,7 +300,6 @@ test('runs model preflight before creating and starting a session', async () => 
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
   const launch = await screen.findByRole('button', { name: 'Создать и запустить' }); await waitFor(() => expect(launch).toBeEnabled()); fireEvent.click(launch)
   await waitFor(() => expect(requests).toContain('POST /api/sessions/99/start'))
-  expect(requests.indexOf('GET /api/model/status')).toBeLessThan(requests.indexOf('POST /api/sessions'))
   expect(requests.indexOf('POST /api/sessions')).toBeLessThan(requests.indexOf('POST /api/sessions/99/start'))
 })
 

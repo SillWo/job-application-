@@ -1,6 +1,8 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+& .\.venv\Scripts\python.exe -m alembic upgrade head
+if ($LASTEXITCODE -ne 0) { throw 'Database migration failed' }
 $backend = Start-Process -FilePath '.\.venv\Scripts\python.exe' -ArgumentList '-m','uvicorn','backend.main:app','--host','127.0.0.1','--port','8000','--reload' -PassThru -WindowStyle Hidden
 try {
     Push-Location frontend

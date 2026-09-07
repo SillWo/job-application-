@@ -734,15 +734,6 @@ function SessionPage() {
   const limitsAreValid = validLimit(applicationLimit, unlimitedApplications);
   const create = useMutation({
     mutationFn: async () => {
-      let status: { connected: boolean; model_available: boolean };
-      try {
-        status = await api<{ connected: boolean; model_available: boolean }>("/model/status");
-      } catch {
-        throw new Error("API модели не доступен");
-      }
-      if (status.connected !== true || status.model_available !== true) {
-        throw new Error("API модели не доступен");
-      }
       const session = await api<JobSession>("/sessions", {
         method: "POST",
         body: JSON.stringify({
@@ -759,11 +750,7 @@ function SessionPage() {
     onSuccess: (session) => {
       setMessageTone("success");
       setMessage(
-        session.adapter_id === "hh"
-          ? `Сессия #${session.id} запущена. Откройте браузер и войдите в HH.ru.`
-          : session.adapter_id === "zarplata"
-            ? `Сессия #${session.id} запущена. Откройте браузер и войдите в Zarplata.ru.`
-          : `Сессия #${session.id} запущена.`,
+        `Сессия #${session.id} запущена. Временные сбои будут обработаны автоматически.`,
       );
       toast.success(`Сессия #${session.id} запущена`);
       void qc.invalidateQueries({ queryKey: ["sessions"] });

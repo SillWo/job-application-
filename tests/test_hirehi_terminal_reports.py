@@ -63,6 +63,7 @@ async def test_stop_hh_does_not_trigger_report(monkeypatch):
 def test_finalize_stopped_hirehi_keeps_status_and_reports(monkeypatch):
     item = session("hirehi")
     item.status = SessionStatus.STOPPED
+    item.recovery = {"pending_refs": [{"external_id": "fixture", "url": "https://hirehi.ru/fixture"}]}
     item.stop_reason = "Остановлено пользователем"
     db = DB(item)
     calls = []

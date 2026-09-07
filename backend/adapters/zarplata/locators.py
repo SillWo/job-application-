@@ -21,3 +21,6 @@ ALREADY_APPLIED = "[data-qa='vacancy-response-link-view-topic']"
 SUBMISSION_CONFIRMED = "[data-qa='vacancy-response-success'], [data-qa='vacancy-response-popup-success']"
 SUBMISSION_TEXT_MARKERS = ("вы откликнулись", "отклик отправлен", "отклик успешно отправлен", "ваш отклик отправлен")
 CAPTCHA_MARKERS = ("captcha", "Подтвердите, что вы не робот", "проверку безопасности")
+
+# Explicit empty-result UI; a blank/error page is never exhaustion.
+SEARCH_EMPTY = "[data-qa='vacancy-serp__vacancy-not-found'], [data-qa='vacancy-serp__no-results']"
