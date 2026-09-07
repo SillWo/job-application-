@@ -52,3 +52,23 @@ def test_relevance_counts_before_application_and_duplicates_do_not_inflate(runti
         assert report["relevant_per_judged"] == 1
         assert report["sources"]["rec"]["relevant"] == 1
         assert report["applications"]["submitted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stopping_paused_session_freezes_measurements_without_a_running_task(runtime, monkeypatch):
+    from backend.api import router
+
+    async def close(_):
+        pass
+
+    monkeypatch.setattr(router, "close_browser", close)
+    factory, ident = runtime
+    with factory() as db:
+        item = db.get(JobSession, ident)
+        metrics.initialize(db, item, {}, [])
+        item.status = "PAUSED"
+        db.commit()
+        await router.stop_session(ident, db)
+        db.refresh(item)
+        assert item.recovery["measurement_report"]["status"] == "STOPPED"
+        assert item.recovery["measurement_report"]["finished_at"] is not None
