@@ -142,6 +142,20 @@ async def run_workflow(runtime, monkeypatch, adapter, evaluate_impl=None):
     return sessions, session_id
 
 
+def test_internal_form_transition_is_not_persisted_as_a_terminal_state(runtime):
+    sessions, session_id = runtime
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        vacancy = Vacancy(session_id=session_id, source="hh", external_id="form", url="u", title="T", state="SUBMITTING", data={})
+        db.add(vacancy); db.commit()
+        workflow.WorkflowManager()._record_submission(
+            db, item, vacancy, SubmissionResult(status="needs_input", message="HH.ru ожидает ответа"),
+        )
+        db.commit()
+        assert vacancy.state == "UNKNOWN"
+        assert item.counters["errors"] == 1
+
+
 @pytest.mark.asyncio
 async def test_high_viewed_count_does_not_stop_session_but_application_limit_does(runtime, monkeypatch):
     sessions, session_id = runtime

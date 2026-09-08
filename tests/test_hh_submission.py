@@ -15,6 +15,9 @@ class FakeLocator:
     async def count(self):
         return int(self.page.visible.get(self.selector, False))
 
+    async def is_visible(self):
+        return bool(await self.count())
+
     async def click(self):
         self.page.clicks.append(self.selector)
         if self.selector == locators.RESPONSE_BUTTON:
@@ -40,6 +43,9 @@ class FakePage:
 
     def locator(self, selector):
         return FakeLocator(self, selector)
+
+    def get_by_text(self, text, **kwargs):
+        return FakeLocator(self, text)
 
     async def wait_for_timeout(self, _ms):
         return None

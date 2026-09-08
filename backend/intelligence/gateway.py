@@ -378,6 +378,15 @@ class ModelGateway:
             return db.get(AIModelSettings, 1)
 
     def _mock(self, role: str, payload: dict, schema: type[T]) -> T:
+        if role == "application_answers":
+            # Offline mock never invents candidate facts or silently solves assessments.
+            return schema.model_validate({"answers": []})
+        if role == "application_salary_rules":
+            return schema.model_validate({"has_salary_rules": False, "rules": []})
+        if role == "application_salary_selection":
+            return schema.model_validate({"rule_index": None, "context_complete": False,
+                                          "confidence": 0, "vacancy_evidence": [],
+                                          "reason": "Mock не интерпретирует условия зарплаты"})
         if role == "adaptive_search_planner":
             return schema.model_validate({"queries": []})
         from backend.schemas.domain import (

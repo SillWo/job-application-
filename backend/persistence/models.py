@@ -138,13 +138,15 @@ _VACANCY_NOTIFICATION_STATES = {"ERROR", "UNKNOWN", "NEEDS_REVIEW"}
 def _vacancy_notification(vacancy: Vacancy) -> Notification:
     status = vacancy.state
     company = f" — {vacancy.company}" if vacancy.company else ""
+    reasons = (vacancy.data or {}).get("application_review_reasons", [])
+    detail = "; ".join(reason for reason in reasons[:3] if isinstance(reason, str)) if isinstance(reasons, list) else ""
     return Notification(
         source_type="vacancy",
         source_id=str(vacancy.id),
         target_path="/vacancies",
         kind=f"vacancy_{status.lower()}",
         title=f"Вакансия: {vacancy.title}",
-        message=f"Вакансия «{vacancy.title}»{company}: статус {status}",
+        message=f"Вакансия «{vacancy.title}»{company}: статус {status}" + (f". {detail[:1000]}" if detail else ""),
     )
 
 

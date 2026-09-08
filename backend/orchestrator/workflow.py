@@ -21,6 +21,7 @@ from backend.intelligence.preference_policy import compile_preference_policy
 from backend.intelligence.search_planner import plan_search_queries
 from backend.orchestrator.adaptive_search import AdaptiveSearch
 from backend.orchestrator.application_guard import unresolved_application_questions
+from backend.orchestrator.hh_application import complete_application
 from backend.orchestrator.recovery import (
     AuthenticationPending,
     CaptchaRequired,
@@ -472,6 +473,9 @@ class WorkflowManager:
             return [JobRef.model_validate(ref) for ref in recovery["pending_refs"]]
 
     def _record_submission(self, db, item, vacancy, submission) -> None:
+        if submission.status == "needs_input":
+            # needs_input is an internal form transition, never a terminal DB state.
+            submission = submission.model_copy(update={"status": "unknown"})
         vacancy.state = submission.status.upper()
         existing = db.scalar(select(Application).where(Application.vacancy_id == vacancy.id))
         if existing is None:
@@ -968,6 +972,7 @@ class WorkflowManager:
                     if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
                         return
                     plan.cover_letter = letter
+                    plan.allow_foreign_application = adapter_id == "hh"
                     plan_record.data = plan.model_dump()
                     if cover_record is None:
                         db.add(CoverLetter(vacancy_id=vacancy.id, text=letter))
@@ -1050,6 +1055,35 @@ class WorkflowManager:
                                 "Неизвестный маршрут отклика",
                                 {"vacancy_id": vacancy.id},
                             )
+                            db.commit()
+                            continue
+                        if adapter_id == "hh":
+                            def checkpoint(current_plan, item=item, plan_record=plan_record):
+                                db.refresh(item)
+                                if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
+                                    return False
+                                plan_record.data = current_plan.model_dump()
+                                db.commit()
+                                return True
+
+                            outcome = await complete_application(
+                                adapter, executor.page, plan, posting, profile, selected_resumes,
+                                preference_description, gateway, checkpoint,
+                            )
+                            if outcome.stopped:
+                                return
+                            if outcome.pending:
+                                vacancy.data = {**(vacancy.data or {}), "application_review_reasons": outcome.pending}
+                                vacancy.state = "NEEDS_REVIEW"
+                                _increment_counter(db, item, "errors")
+                                self.emit(db, session_id, "human_required", "; ".join(outcome.pending),
+                                          {"vacancy_id": vacancy.id, "kind": "application_questions"})
+                                db.commit()
+                                continue
+                            submission = outcome.submission
+                            if submission.status in {"unknown", "blocked"}:
+                                raise RecoverableFailure("Ожидание подтверждения отклика")
+                            self._record_submission(db, item, vacancy, submission)
                             db.commit()
                             continue
                         result = await adapter.fill_application(executor.page, plan)
