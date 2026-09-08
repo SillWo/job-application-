@@ -345,6 +345,7 @@ class ApplicationPlan(BaseModel):
     known_answers: dict[str, str] = Field(default_factory=dict)
     form_answers: dict[str, FormAnswer] = Field(default_factory=dict)
     unanswered_fields: dict[str, str] = Field(default_factory=dict)
+    form_fields: dict[str, ApplicationField] = Field(default_factory=dict)
     allow_foreign_application: bool = False
     unknown_question_policy: Literal["manual_review", "skip"] = "manual_review"
     submission_allowed: bool = False

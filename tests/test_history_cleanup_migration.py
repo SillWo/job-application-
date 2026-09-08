@@ -2,6 +2,7 @@ import sqlite3
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 
 def _upgrade(path, revision):
@@ -84,7 +85,7 @@ def test_database_url_environment_override_wins_without_touching_default(tmp_pat
     command.upgrade(config, "head")
 
     target_db = sqlite3.connect(target)
-    assert target_db.execute("select version_num from alembic_version").fetchone()[0] == "0022"
+    assert target_db.execute("select version_num from alembic_version").fetchone()[0] == ScriptDirectory.from_config(config).get_current_head()
     assert "vacancies" in {row[0] for row in target_db.execute("select name from sqlite_master where type='table'")}
     target_db.close()
     assert not decoy.exists()

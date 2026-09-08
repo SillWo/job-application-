@@ -54,6 +54,7 @@ from backend.persistence.models import (
     JobSession,
     Notification,
     Resume,
+    SessionQuestion,
     Vacancy,
 )
 from backend.schemas.domain import (
@@ -277,6 +278,7 @@ class SessionCreate(BaseModel):
     minimum_scores: dict[str, int | bool] | None = None
     adapter_id: str
     application_limit: int | None = Field(default=5, ge=1)
+    guaranteed_application: bool = False
 
     @classmethod
     def _minimum_limits(cls) -> dict[str, int]:
@@ -490,6 +492,60 @@ def get_profile(profile_id: int, db: Session = Depends(get_db)) -> dict:
     return serialize_profile(item, db)
 
 
+class QuestionAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    answer: str = Field(default="", max_length=4000)
+    skip: bool = False
+
+    @model_validator(mode="after")
+    def validate_answer(self):
+        self.answer = self.answer.strip()
+        if self.skip and self.answer or not self.skip and not self.answer:
+            raise ValueError("Введите ответ или пропустите вопрос")
+        return self
+
+
+@router.get("/profiles/{profile_id}/pending-questions")
+def pending_profile_questions(profile_id: int, db: Session = Depends(get_db)) -> list[dict]:
+    from backend.services.profile_memory import TERMINAL, can_remember
+
+    if not db.get(CandidateProfile, profile_id):
+        raise HTTPException(404, "Профиль не найден")
+    rows = db.execute(select(SessionQuestion, JobSession, Vacancy).join(JobSession, JobSession.id == SessionQuestion.session_id)
+                      .outerjoin(Vacancy, Vacancy.id == SessionQuestion.vacancy_id)
+                      .where(SessionQuestion.profile_id == profile_id, SessionQuestion.status == "pending", JobSession.status.in_(TERMINAL))
+                      .order_by(SessionQuestion.session_id.desc(), SessionQuestion.id)).all()
+    # Only unanswered interview prompts are public. Confirmed memory has no list/read route.
+    return [{"id": question.id, "session_id": session.id, "question": question.question,
+             "reason": question.reason, "options": question.options, "context": question.context,
+             "site": session.adapter_id, "vacancy_title": vacancy.title if vacancy else None,
+             "can_answer": can_remember(question.question)} for question, session, vacancy in rows]
+
+
+@router.post("/profiles/{profile_id}/questions/{question_id}/answer")
+def answer_profile_question(profile_id: int, question_id: int, payload: QuestionAnswer, db: Session = Depends(get_db)) -> dict:
+    from backend.services.profile_memory import TERMINAL, save_user_answer
+
+    question = db.get(SessionQuestion, question_id)
+    if not question or question.profile_id != profile_id:
+        raise HTTPException(404, "Вопрос не найден")
+    session = db.get(JobSession, question.session_id)
+    if not session or session.status not in TERMINAL:
+        raise HTTPException(409, "Ответить можно после завершения сессии")
+    if question.status != "pending":
+        raise HTTPException(409, "Этот вопрос уже обработан")
+    if payload.skip:
+        question.status = "skipped"
+        question.answered_at = datetime.now(timezone.utc)
+    else:
+        try:
+            save_user_answer(db, question, payload.answer)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+    db.commit()
+    return {"ok": True}
+
+
 @router.patch("/profiles/{profile_id}")
 def patch_profile(
     profile_id: int, data: CandidateProfileData, db: Session = Depends(get_db)
@@ -593,6 +649,7 @@ def session_dict(item: JobSession) -> dict:
         "minimum_scores": item.minimum_scores or None,
         "adapter_id": item.adapter_id,
         "application_limit": item.application_limit,
+        "guaranteed_application": bool(item.guaranteed_application),
         "status": item.status,
         "counters": item.counters or {},
         "started_at": item.started_at.isoformat() if item.started_at else None,
@@ -615,6 +672,7 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         minimum_scores=payload.minimum_scores or None,
         adapter_id=payload.adapter_id,
         application_limit=payload.application_limit,
+        guaranteed_application=payload.guaranteed_application,
         status=SessionStatus.CREATED,
         counters={},
     )
@@ -679,6 +737,11 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     await close_browser(session_id)
+    from backend.services.profile_memory import collect_session_questions
+
+    db.refresh(item)
+    collect_session_questions(db, item)
+    db.commit()
     if item.adapter_id == "hirehi":
         workflow_manager.write_hirehi_report(session_id)
     if (getattr(item, "recovery", None) or {}).get("measurement_identity"):

@@ -18,6 +18,12 @@ from backend.persistence.database import init_database
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_database()
+    from backend.persistence.database import SessionLocal
+    from backend.services.profile_memory import collect_finished_sessions
+
+    with SessionLocal() as db:
+        collect_finished_sessions(db)
+        db.commit()
     recover_orphaned_sessions()
     try:
         yield

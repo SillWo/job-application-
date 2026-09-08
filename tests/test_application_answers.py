@@ -76,6 +76,22 @@ async def test_conditional_salary_receives_full_job_and_unflattened_rules(format
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("experience", "condition", "accepted"), [
+    ("Опыт работы: 3–6 лет", "офис, требуемый опыт более 3 лет", False),
+    ("Опыт работы: 3–6 лет", "офис, требуемый опыт 3 года и меньше", False),
+    ("Опыт работы: 1–3 года", "офис, требуемый опыт 3 года и меньше", True),
+    ("Опыт работы: 4–6 лет", "офис, требуемый опыт более 3 лет", True),
+    ("Опыт работы: 3–6 лет", "офис, для диапазона 3–6 лет", True),
+])
+async def test_model_cannot_select_salary_across_experience_boundary(experience, condition, accepted):
+    text = f"120000 RUB — {condition}"
+    gateway = Gateway(dict(has_salary_rules=True, rules=[rule(120000, text, condition)]),
+                      dict(rule_index=0, context_complete=True, confidence=1, vacancy_evidence=[experience], reason="Условия подходят"))
+    result = await resolve_salary(gateway, job(required_experience=experience), [], text)
+    assert (result.rule is not None) is accepted
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("selection", [
     dict(rule_index=None, context_complete=False, confidence=0, vacancy_evidence=[], reason="Город неизвестен"),
     dict(rule_index=0, context_complete=True, confidence=1, vacancy_evidence=["Москва"], reason="Город выдуман"),
@@ -155,6 +171,25 @@ async def test_sensitive_unknown_and_invalid_controls_require_review(field):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("label", "profile", "value", "source"), [
+    ("Будет здорово, если вы оставите свой ник в tg", {"contacts": {"telegram": "@example"}}, "@example", "profile.contacts.telegram"),
+    ("Имеете ли Вы опыт в финтехе, эквайринге, платёжных или банковских системах?",
+     {"about": "Разрабатывал банковские системы"}, "Разрабатывал банковские системы", "profile.about"),
+])
+async def test_banking_experience_and_colloquial_health_word_are_not_sensitive(label, profile, value, source):
+    answer = {**proposal(values=[value]), "evidence": [{"source": source, "quote": value}]}
+    plan = await answer_form(ApplicationField(id="q1", label=label), [answer], profile=profile)
+    assert plan.form_answers["q1"].values == [value]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label", ["Ваши банковские реквизиты", "Номер банковского счёта", "Номер карты", "Состояние здоровья", "Ваш диагноз", "Your bank account number"])
+async def test_actual_health_and_banking_details_remain_sensitive(label):
+    plan = await answer_form(ApplicationField(id="q1", label=label), [proposal()])
+    assert not plan.form_answers
+
+
+@pytest.mark.asyncio
 async def test_duplicate_model_answer_ids_fail_closed():
     plan = await answer_form(ApplicationField(id="q1", label="Ваш город?"), [proposal(), proposal()])
     assert not plan.form_answers
@@ -207,7 +242,49 @@ async def test_salary_compiler_cannot_invent_tax_basis():
     salary_rule = {**rule(), "gross": False}
     gateway = Gateway(dict(has_salary_rules=True, rules=[salary_rule]))
     result = await resolve_salary(gateway, job(), [{"desired_salary": "150000 RUB"}], "")
+    assert result.rule.amount == 150000
+    assert result.rule.gross is None
+    assert "на руки" not in result.display()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("label", "accepted"), [("Желаемая зарплата", True), ("Желаемая зарплата на руки", False)])
+async def test_normalized_unknown_taxes_allow_only_unspecified_tax_question(label, accepted):
+    answer = {**proposal("salary", ["150000 RUB"]), "evidence": [{"source": "salary", "quote": "150000 RUB"}]}
+    gateway = Gateway(dict(has_salary_rules=True, rules=[{**rule(), "gross": False}]), dict(answers=[answer]))
+    plan = await answer_form(ApplicationField(id="q1", label=label), [], gateway=gateway,
+                             resumes=[{"desired_salary": "150000 RUB"}])
+    assert bool(plan.form_answers) is accepted
+
+
+@pytest.mark.asyncio
+async def test_explicit_form_rules_exclude_filter_floor_and_keep_full_description():
+    description = "Не рассматривать ниже 60к RUB. При заполнении вопросов о ЗП указывай: офис 80к RUB; удалённо 70к RUB"
+    gateway = Gateway(dict(has_salary_rules=True, rules=[
+        rule(60000, "Не рассматривать ниже 60к RUB"),
+        rule(80000, "офис 80к RUB", "офис"),
+        rule(70000, "удалённо 70к RUB", "удалённо"),
+    ]), dict(rule_index=0, context_complete=True, confidence=1, vacancy_evidence=["офис"], reason="Офис"))
+    result = await resolve_salary(gateway, job(work_format="офис"), [{"desired_salary": "999999 RUB"}], description)
+    assert result.rule.amount == 80000
+    assert gateway.calls[0][1]["text"] == description
+    assert [r["amount"] for r in gateway.calls[1][1]["rules"]] == [80000, 70000]
+
+
+@pytest.mark.asyncio
+async def test_empty_form_rule_section_never_falls_back_to_filter_or_resume():
+    gateway = Gateway(dict(has_salary_rules=True, rules=[rule(60000, "ниже 60к RUB")]))
+    result = await resolve_salary(gateway, job(), [{"desired_salary": "999999 RUB"}],
+                                  "Не брать ниже 60к RUB. При заполнении вопросов о ЗП указывай:")
     assert result.rule is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_tax_basis_is_preserved_and_conflicting_basis_rejected():
+    for gross, expected in [(True, False), (False, True), (None, True)]:
+        gateway = Gateway(dict(has_salary_rules=True, rules=[{**rule(150000, "150000 RUB на руки"), "gross": gross}]))
+        result = await resolve_salary(gateway, job(), [], "150000 RUB на руки")
+        assert (result.rule is not None) is expected
 
 
 @pytest.mark.asyncio

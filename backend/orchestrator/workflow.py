@@ -352,6 +352,9 @@ class WorkflowManager:
                 item.stop_reason = completion_reason
             item.recovery = {**(item.recovery or {}), "pending_refs": [], "retry_at": None, "message": None}
             item.finished_at = datetime.now(timezone.utc)
+            from backend.services.profile_memory import collect_session_questions
+
+            collect_session_questions(db, item)
             db.commit()
             self.emit(db, session_id, "session", "Сессия завершена")
 
@@ -382,6 +385,9 @@ class WorkflowManager:
                 final_item = db.get(JobSession, session_id)
                 final_status = final_item.status if final_item else SessionStatus.FAILED
                 if final_item and final_status in {SessionStatus.COMPLETED, SessionStatus.STOPPED, SessionStatus.FAILED}:
+                    from backend.services.profile_memory import collect_session_questions
+
+                    collect_session_questions(db, final_item)
                     search_metrics.freeze(db, final_item)
             search_metrics.end(metric_token)
             if final_status in {SessionStatus.COMPLETED, SessionStatus.STOPPED, SessionStatus.FAILED}:

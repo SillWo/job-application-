@@ -5,6 +5,13 @@ import pytest
 from backend.api import router
 from backend.orchestrator import workflow
 from backend.schemas.domain import SessionStatus
+from backend.services import profile_memory
+
+
+@pytest.fixture(autouse=True)
+def isolate_profile_memory(monkeypatch):
+    # These tests exercise browser ownership, independently of question persistence.
+    monkeypatch.setattr(profile_memory, "collect_session_questions", lambda db, item: 0)
 
 
 class _DB:
@@ -15,6 +22,9 @@ class _DB:
         return self.item
 
     def commit(self):
+        pass
+
+    def refresh(self, item):
         pass
 
 

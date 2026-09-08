@@ -13,7 +13,7 @@ from backend.schemas.domain import ApplicationPlan, FormAnswer, JobPosting
 
 SALARY_MARKERS = re.compile(r"зарплат|\bзп\b|з/п|доход|оплат|оклад|финансов\w*\s+ожидан|вознагражд|salary|compensation|pay\b|income|wage|от какой суммы рассматрива|какую сумму (?:ожида|рассматрива|хотите)", re.I)
 MONEY = re.compile(r"\d[\d\s.,]*\s*(?:тыс|[кk]\b|руб|₽|\$|€|rub|usd|eur)", re.I)
-SENSITIVE = re.compile(r"паспорт|снилс|инн\b|банковск|номер карт|парол|код из|здоров|религи|судим|политическ|согласие на|согласен с|passport|password|bank account|social security|agree to", re.I)
+SENSITIVE = re.compile(r"паспорт|снилс|инн\b|банковск\w*\s+реквизит|(?:номер|реквизит)\w*\s+(?:банковск\w*\s+)?(?:карт|сч[её]т)|парол|код из|здоровь|заболеван|диагноз|религи|судим|политическ|согласие на|согласен с|passport|password|bank account\s+(?:number|details)|social security|agree to", re.I)
 PERSONAL = re.compile(r"\b(?:вы|ваш\w*|вам|вас|ты|твой|your|you)\b|опыт|прожив|готовност|готовы|гражданств|портфолио|резюме|experience|relocat", re.I)
 CURRENCIES = {
     "RUB": r"руб|₽|\brub\b|\brur\b", "USD": r"доллар|\$|\busd\b", "EUR": r"евро|€|\beur\b",
@@ -131,6 +131,33 @@ def _valid_rule(source: str, rule: SalaryRule) -> bool:
             and (not periods or rule.period in periods))
 
 
+def _answer_salary_scope(description: str) -> str | None:
+    """An explicit questionnaire section overrides earlier vacancy filter floors."""
+    heading = re.search(
+        r"при\s+заполнении\s+(?:вопросов|анкеты|анкет)\s+о\s+"
+        r"(?:зп|з/п|зарплате|зарплатных\s+ожиданиях)\s+указыва[йт][^:]*:",
+        description, re.I,
+    )
+    return description[heading.end():].strip() if heading else None
+
+
+def _experience_range_supported(required_experience: str | None, rule: SalaryRule) -> bool:
+    """A site's experience range must fit the selected explicit numeric condition."""
+    interval = re.fullmatch(r"(?:опыт\s+работы:\s*)?(\d+)\s*[-–—]\s*(\d+)\s*(?:лет|года?)",
+                            (required_experience or "").strip(), re.I)
+    if not interval:
+        return True
+    lower, upper = map(int, interval.groups())
+    condition = _normalized(rule.condition)
+    # An explicit user rule for this very range takes precedence over general bounds.
+    named_range = re.search(rf"(?<!\d){lower}\s*[-–—]\s*{upper}\s*(?:лет|года?)", rule.quote, re.I)
+    if named_range:
+        return True
+    more = re.search(r"(?<!не )\b(?:более|больше|свыше)\s+(\d+)\s*(?:лет|года?)", condition)
+    at_most = re.search(r"(\d+)\s*(?:лет|года?)\s+и\s+(?:меньше|менее)", condition)
+    return lower <= upper and (not more or lower > int(more[1])) and (not at_most or upper <= int(at_most[1]))
+
+
 def _salary_matches(field, values: list[str], rule: SalaryRule) -> bool:
     text = " ".join(values)
     # The selected amount cannot be replaced or supplemented with another monetary amount.
@@ -169,10 +196,14 @@ async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], descript
     """User text is authoritative; conditional rules are never flattened to a minimum."""
     rules = SalaryRules(has_salary_rules=False, rules=[])
     source_text = description.strip()
+    answer_scope = _answer_salary_scope(source_text)
     if source_text:
-        rules = await gateway.structured("application_salary_rules", {"text": source_text}, SalaryRules)
+        payload = {"text": source_text}
+        if answer_scope is not None:
+            payload["answer_rules_text"] = answer_scope
+        rules = await gateway.structured("application_salary_rules", payload, SalaryRules)
     # A mention of paid training or company revenue is not a candidate salary rule.
-    preference_salary = rules.has_salary_rules or bool(rules.rules)
+    preference_salary = answer_scope is not None or rules.has_salary_rules or bool(rules.rules)
     source = "preferences"
     if not preference_salary:
         salaries = list(dict.fromkeys(str(resume.get("desired_salary") or "").strip() for resume in resumes))
@@ -182,6 +213,15 @@ async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], descript
         source_text = salaries[0]
         source = "resume"
         rules = await gateway.structured("application_salary_rules", {"text": source_text}, SalaryRules)
+    if answer_scope is not None:
+        # Only discard grounded rules from outside the explicitly selected section.
+        # Invented quotes still fail validation below, rather than hiding bad extraction.
+        rules.rules = [rule for rule in rules.rules
+                       if _contains(answer_scope, rule.quote) or not _contains(source_text, rule.quote)]
+        source_text = answer_scope
+    if not _taxes(source_text):
+        # Missing tax basis is unknown, even when the compiler supplies a default.
+        rules.rules = [rule.model_copy(update={"gross": None}) for rule in rules.rules]
     # An invalid rule poisons the rule set: silently dropping it could select a wrong fallback.
     if not rules.rules or any(not _valid_rule(source_text, rule) for rule in rules.rules):
         return ResolvedSalary(reason="Не удалось однозначно прочитать зарплатные условия пользователя")
@@ -201,6 +241,8 @@ async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], descript
             or selected.confidence < .95 or not selected.vacancy_evidence
             or any(not _contains(evidence_text, quote) for quote in selected.vacancy_evidence)):
         return ResolvedSalary(reason=selected.reason or "Условия зарплатного правила не подтверждены вакансией")
+    if not _experience_range_supported(job.required_experience, rules.rules[index]):
+        return ResolvedSalary(reason="Диапазон требуемого опыта пересекает границу зарплатного правила; требуется уточнение")
     return ResolvedSalary(rule=rules.rules[index], source=source, reason=selected.reason)
 
 
