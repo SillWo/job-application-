@@ -141,6 +141,30 @@ async def _models(base_url: str, key: str) -> list[str]:
     return sorted(models)
 
 
+def _model_connection(
+    payload: ModelModelsIn | ModelSettingsIn, item: AIModelSettings | None,
+) -> tuple[str, str]:
+    try:
+        base = validate_base_url(
+            payload.base_url,
+            (settings.openai_base_url, item.base_url if item else ""),
+        )
+    except ValueError as exc:
+        # Validation messages are authored locally and contain no key/server body.
+        raise HTTPException(400, str(exc)) from exc
+    key = payload.api_key
+    if not key and item:
+        try:
+            key = decrypt_secret(item.encrypted_api_key)
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                400, "Не удалось прочитать сохранённый API ключ. Введите ключ заново на этом компьютере.",
+            ) from exc
+    if not key:
+        raise HTTPException(400, "API ключ не задан")
+    return base, key
+
+
 @router.post("/model/models")
 async def list_model_models(
     payload: ModelModelsIn, request: Request, db: Session = Depends(get_db)
@@ -148,16 +172,10 @@ async def list_model_models(
     _check_model_origin(request)
     try:
         item = db.get(AIModelSettings, 1)
-        base = validate_base_url(
-            payload.base_url,
-            (settings.openai_base_url, item.base_url if item else ""),
-        )
-        key = payload.api_key or (
-            decrypt_secret(item.encrypted_api_key) if item else ""
-        )
-        if not key:
-            raise ValueError("API ключ не задан")
+        base, key = _model_connection(payload, item)
         return _no_store({"models": await _models(base, key)})
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(400, "Не удалось получить список моделей") from exc
 
@@ -169,13 +187,7 @@ async def save_model_settings(
     _check_model_origin(request)
     try:
         item = db.get(AIModelSettings, 1)
-        base = validate_base_url(
-            payload.base_url,
-            (settings.openai_base_url, item.base_url if item else ""),
-        )
-        key = payload.api_key or (decrypt_secret(item.encrypted_api_key) if item else "")
-        if not key:
-            raise ValueError("API ключ не задан")
+        base, key = _model_connection(payload, item)
         models = await _models(base, key)
         if payload.model not in models:
             raise ValueError("Выбранная модель недоступна")

@@ -25,9 +25,17 @@ def validate_base_url(value: str, allowed_local_urls: Collection[str] = ()) -> s
     except (OSError, ValueError) as exc:
         raise ValueError("Не удалось проверить адрес модели") from exc
     ips = [ipaddress.ip_address(item[4][0]) for item in addresses]
+    if not ips:
+        raise ValueError("Не удалось проверить адрес модели")
     normalized = parsed.geturl()
     allowed_local = {url.strip().rstrip("/") for url in allowed_local_urls if url.strip()}
-    if normalized in allowed_local and ips and all(ip.is_loopback for ip in ips):
+    try:
+        explicit_loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        explicit_loopback = parsed.hostname.rstrip(".").lower() == "localhost"
+    # A fresh installation must be able to configure a local gateway from the UI.
+    # Arbitrary DNS names still cannot opt into loopback/private destinations.
+    if (explicit_loopback or normalized in allowed_local) and all(ip.is_loopback for ip in ips):
         return normalized
     if parsed.scheme != "https" or any(
         ip.is_private

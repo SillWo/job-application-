@@ -1,5 +1,8 @@
 import asyncio
 import base64
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.api import router as api
-from backend.intelligence import gateway
+from backend.intelligence import gateway, model_config
 from backend.persistence import crypto
 from backend.persistence.database import Base
 from backend.persistence.models import AIModelSettings
@@ -135,16 +138,118 @@ def test_private_url_rejected():
     from backend.intelligence.model_config import validate_base_url
 
     with pytest.raises(ValueError):
-        validate_base_url("https://localhost/v1")
+        validate_base_url("https://192.168.1.20/v1")
 
 
-def test_only_configured_loopback_gateway_allows_local_http():
+def test_loopback_gateway_can_be_configured_for_the_first_time():
     from backend.intelligence.model_config import validate_base_url
 
     url = "http://127.0.0.1:8045/v1"
+    assert validate_base_url("http://127.0.0.1/v1") == "http://127.0.0.1/v1"
+    assert validate_base_url(url) == url
     assert validate_base_url(url, (url,)) == url
-    with pytest.raises(ValueError):
-        validate_base_url("http://127.0.0.1:8046/v1", (url,))
+    assert validate_base_url("http://127.0.0.1:8046/v1", (url,)).endswith(":8046/v1")
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_first_setup_contacts_local_model_server(app_db, monkeypatch, host):
+    app, sessions = app_db
+    monkeypatch.setattr(api, "validate_base_url", model_config.validate_base_url)
+    monkeypatch.setattr(api.settings, "openai_base_url", "https://api.openai.com/v1")
+    monkeypatch.setattr(api, "encrypt_secret", lambda key: "fixture:" + key)
+    monkeypatch.setattr(api, "decrypt_secret", lambda value: value.removeprefix("fixture:"))
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            requests.append((self.path, self.headers.get("Authorization")))
+            body = json.dumps({"data": [{"id": "fixture-model"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://{host}:{server.server_port}/v1"
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/model/models", json={"base_url": base + "/", "api_key": "fixture-key"})
+            assert response.status_code == 200, response.text
+            assert response.json() == {"models": ["fixture-model"]}
+            response = client.put("/api/model/settings", json={
+                "base_url": base, "api_key": "fixture-key", "model": "fixture-model",
+            })
+            assert response.status_code == 200, response.text
+            assert response.json()["base_url"] == base
+            assert "fixture-key" not in response.text
+            assert client.post("/api/model/models", json={"base_url": base}).status_code == 200
+        assert requests == [("/v1/models", "Bearer fixture-key")] * 3
+        with sessions() as db:
+            assert db.get(AIModelSettings, 1).model == "fixture-model"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("host, addresses, accepted", [
+    ("localhost", ["127.0.0.1", "::1"], True),
+    ("[::1]", ["::1"], True),
+    ("localhost", ["127.0.0.1", "192.168.1.20"], False),
+    ("outside.example", ["127.0.0.1"], False),
+    ("outside.example", [], False),
+])
+def test_local_url_requires_explicit_loopback_host(monkeypatch, host, addresses, accepted):
+    monkeypatch.setattr(model_config.socket, "getaddrinfo", lambda *args, **kwargs: [
+        (0, 0, 0, "", (address, 8045)) for address in addresses
+    ])
+    url = f"http://{host}:8045/v1"
+    if accepted:
+        assert model_config.validate_base_url(url) == url
+    else:
+        with pytest.raises(ValueError):
+            model_config.validate_base_url(url)
+
+
+@pytest.mark.parametrize("save", [False, True])
+@pytest.mark.parametrize("problem", ["address", "missing_key", "unreadable_key"])
+def test_model_setup_reports_local_failure_without_contacting_server(app_db, monkeypatch, save, problem):
+    app, sessions = app_db
+    monkeypatch.setattr(api, "validate_base_url", model_config.validate_base_url)
+    payload = {"base_url": "http://127.0.0.1:8045/v1"}
+    if problem == "address":
+        payload.update(base_url="http://192.168.1.20/v1", api_key="fixture-key")
+        expected = "Адрес модели"
+    elif problem == "missing_key":
+        expected = "API ключ не задан"
+    else:
+        with sessions() as db:
+            db.add(AIModelSettings(id=1, base_url=payload["base_url"], model="fixture-model", encrypted_api_key="fixture-cipher"))
+            db.commit()
+        def fail(_value):
+            raise RuntimeError("private decryption details")
+        monkeypatch.setattr(api, "decrypt_secret", fail)
+        expected = "Введите ключ заново"
+
+    async def unexpected_request(*args):
+        pytest.fail("Invalid configuration must fail before sending a request")
+
+    monkeypatch.setattr(api, "_models", unexpected_request)
+    with TestClient(app) as client:
+        if save:
+            response = client.put("/api/model/settings", json={**payload, "model": "fixture-model"})
+        else:
+            response = client.post("/api/model/models", json=payload)
+    assert response.status_code == 400
+    assert expected in response.json()["detail"]
+    assert "private decryption details" not in response.text
+    assert "fixture-key" not in response.text
 
 
 def test_gateway_loads_persisted_config(monkeypatch):
