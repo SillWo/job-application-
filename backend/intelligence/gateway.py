@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import TypeVar
+from types import SimpleNamespace
+from typing import Literal, TypeVar
 
 import httpx
 from openai import APIError, AsyncOpenAI
@@ -15,6 +16,8 @@ from backend.persistence.database import SessionLocal
 from backend.persistence.models import AIModelSettings
 from backend.services.search_metrics import measure, record
 
+from .model_config import auth_headers, is_local_url, model_http_client, normalize_base_url
+from .openai_compat import create_completion
 from .prompts import ROLE_OPTIONS, ROLE_PROMPTS
 
 T = TypeVar("T", bound=BaseModel)
@@ -33,9 +36,15 @@ class ModelUnavailable(RuntimeError):
     pass
 
 
-def _safe_api_error_text(error: APIError) -> str:
+class ConnectionCheck(BaseModel):
+    result: Literal["ok"]
+
+
+def _safe_api_error_text(error: APIError, secret: str = "") -> str:
     """Return useful provider detail without exposing credentials."""
     detail = str(error).strip() or error.__class__.__name__
+    if secret:
+        detail = detail.replace(secret, "[REDACTED]")
     detail = re.sub(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+", r"\1[REDACTED]", detail)
     detail = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[REDACTED]", detail)
     detail = re.sub(r"\b(?:sk|sess|key)-[A-Za-z0-9_-]+\b", "[REDACTED]", detail)
@@ -184,11 +193,17 @@ class ModelGateway:
                     "message": "Модель не настроена",
                 }
             try:
-                async with httpx.AsyncClient(timeout=3, follow_redirects=False) as client:
-                    key = decrypt_secret(config.encrypted_api_key)
+                async with model_http_client(config.base_url, 3) as client:
+                    key = decrypt_secret(config.encrypted_api_key) if config.encrypted_api_key else ""
                     response = await client.get(
-                        f"{config.base_url}/models", headers={"Authorization": f"Bearer {key}"},
+                        f"{normalize_base_url(config.base_url)}/models", headers=auth_headers(key),
                     )
+                    if response.status_code in {404, 405}:
+                        return {
+                            "connected": True, "model_available": False,
+                            "provider": "openai_compat", "model": config.model,
+                            "message": "Сервер не предоставляет список моделей. Для проверки ответа сохраните настройки.",
+                        }
                     response.raise_for_status()
                     data = response.json()
                     available = {
@@ -222,27 +237,46 @@ class ModelGateway:
             return await self._structured_openai(role, payload, schema)
         raise ValueError(f"Unsupported AI provider: {self.provider}")
 
-    async def _structured_openai(self, role: str, payload: dict, schema: type[T]) -> T:
+    async def check_connection(self, base_url: str, key: str, model: str) -> None:
+        await self._structured_openai(
+            "connection_check", {"request": "Return result ok."}, ConnectionCheck,
+            connection=(base_url, key, model),
+        )
+
+    async def _structured_openai(
+        self, role: str, payload: dict, schema: type[T],
+        *, connection: tuple[str, str, str] | None = None,
+    ) -> T:
         """Call an OpenAI-compatible API endpoint to get a structured response."""
         try:
-            config = self._saved_config()
-            key = decrypt_secret(config.encrypted_api_key) if config else ""
+            if connection is not None:
+                base_url, key, model = connection
+                config = SimpleNamespace(base_url=base_url, model=model)
+            else:
+                config = self._saved_config()
+                key = decrypt_secret(config.encrypted_api_key) if config and config.encrypted_api_key else ""
         except (RuntimeError, ValueError):
             config, key = None, ""
-        if config is None or not key:
+        if config is None or (not key and not is_local_url(config.base_url)):
             raise ModelUnavailable("Модель не настроена или ключ недоступен")
+        transport = model_http_client(config.base_url, settings.openai_timeout)
         client = AsyncOpenAI(
-            base_url=config.base_url,
+            base_url=normalize_base_url(config.base_url),
             api_key=key,
             timeout=settings.openai_timeout,
+            http_client=transport,
+            max_retries=0,
         )
         json_schema = _schema_without_preference_matches(role, schema, payload)
-        system_prompt = _system_prompt_for_role(role, payload)
-        opts = ROLE_OPTIONS[role]
+        system_prompt = (
+            'Return only JSON: {"result":"ok"}.' if role == "connection_check"
+            else _system_prompt_for_role(role, payload)
+        )
+        opts = {"num_predict": 128} if role == "connection_check" else ROLE_OPTIONS[role]
         attempts = 4 if role == "resume_analyst" else (
             4 if role == "profile" and schema.__name__ == "ResumeImportData" else 2
         )
-        request_timeout = 300 if role == "profile" else 180
+        request_timeout = 45 if role == "connection_check" else (300 if role == "profile" else 180)
 
         async with self._lock:
             messages: list[dict] = [
@@ -253,7 +287,8 @@ class ModelGateway:
             validation_error = "unknown validation error"
             try:
                 for attempt in range(attempts):
-                    response = await client.chat.completions.create(
+                    response = await create_completion(
+                        client,
                         model=config.model,
                         messages=messages,  # type: ignore[arg-type]
                         temperature=opts.get("temperature", 0.1),
@@ -369,8 +404,10 @@ class ModelGateway:
                 raise
             except APIError as exc:
                 raise ModelUnavailable(
-                    f"OpenAI-compat API недоступен: {_safe_api_error_text(exc)}"
+                    f"OpenAI-compat API недоступен: {_safe_api_error_text(exc, key)}"
                 ) from exc
+            finally:
+                await transport.aclose()
 
     @staticmethod
     def _saved_config():

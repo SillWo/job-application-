@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse, urlunparse
 
-import httpx
 from fastapi import (
     APIRouter,
     Depends,
@@ -37,7 +36,13 @@ from backend.browser.sessions import (
 )
 from backend.config import settings
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
-from backend.intelligence.model_config import validate_base_url
+from backend.intelligence.model_config import (
+    auth_headers,
+    is_local_url,
+    model_http_client,
+    normalize_base_url,
+    validate_base_url,
+)
 from backend.orchestrator.workflow import workflow_manager
 from backend.persistence.crypto import decrypt_secret, encrypt_secret
 from backend.persistence.database import get_db
@@ -115,9 +120,9 @@ def get_model_settings(db: Session = Depends(get_db)):
 
 
 async def _models(base_url: str, key: str) -> list[str]:
-    async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+    async with model_http_client(base_url, 15) as client:
         response = await client.get(
-            base_url.rstrip("/") + "/models", headers={"Authorization": "Bearer " + key}
+            normalize_base_url(base_url) + "/models", headers=auth_headers(key)
         )
         response.raise_for_status()
         if (
@@ -153,16 +158,16 @@ def _model_connection(
         # Validation messages are authored locally and contain no key/server body.
         raise HTTPException(400, str(exc)) from exc
     key = payload.api_key
-    if not key and item:
+    if not key and item and item.encrypted_api_key and normalize_base_url(item.base_url) == base:
         try:
             key = decrypt_secret(item.encrypted_api_key)
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(
                 400, "Не удалось прочитать сохранённый API ключ. Введите ключ заново на этом компьютере.",
             ) from exc
-    if not key:
+    if not key and not is_local_url(base):
         raise HTTPException(400, "API ключ не задан")
-    return base, key
+    return base, key or ""
 
 
 @router.post("/model/models")
@@ -188,22 +193,23 @@ async def save_model_settings(
     try:
         item = db.get(AIModelSettings, 1)
         base, key = _model_connection(payload, item)
-        models = await _models(base, key)
-        if payload.model not in models:
-            raise ValueError("Выбранная модель недоступна")
+        await ModelGateway(provider="openai_compat").check_connection(base, key, payload.model)
         if item is None:
             item = AIModelSettings(
-                id=1, base_url=base, model=payload.model, encrypted_api_key=encrypt_secret(key)
+                id=1, base_url=base, model=payload.model, encrypted_api_key=encrypt_secret(key) if key else ""
             )
             db.add(item)
         else:
+            if payload.api_key or normalize_base_url(item.base_url) != base:
+                item.encrypted_api_key = encrypt_secret(key) if key else ""
             item.base_url, item.model = base, payload.model
-            if payload.api_key:
-                item.encrypted_api_key = encrypt_secret(key)
         db.commit()
         return get_model_settings(db)
     except HTTPException:
         raise
+    except ModelUnavailable as exc:
+        db.rollback()
+        raise HTTPException(400, "Проверка генерации не пройдена. Проверьте адрес, ключ, имя модели и поддержку Chat Completions. " + str(exc)) from exc
     except Exception as exc:
         db.rollback()
         raise HTTPException(400, "Не удалось сохранить настройки модели") from exc

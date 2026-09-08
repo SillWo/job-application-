@@ -327,6 +327,28 @@ test('configures a new cloud model key and clears it after saving', async () => 
   expect(JSON.parse(String(saveRequest?.init?.body))).toMatchObject({ model: 'cloud-b', api_key: 'secret-value' })
 })
 
+test('allows manual local model setup and shows generation failure without clearing the key', async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push({ url, init })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: false, model_available: false }) })
+    if (init?.method === 'PUT') return Promise.resolve({ ok: false, json: async () => ({ detail: 'Проверка генерации не пройдена' }) })
+    if (url.endsWith('/api/model/settings')) return Promise.resolve({ ok: true, json: async () => ({ base_url: 'https://api.openai.com/v1', model: '', has_api_key: false, masked_key: '' }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/model']}><App /></MemoryRouter></QueryClientProvider>)
+  await waitFor(() => expect(screen.getByLabelText(/Base URL/)).toHaveValue('https://api.openai.com/v1'))
+  fireEvent.change(screen.getByLabelText(/Base URL/), { target: { value: 'http://0.0.0.0:8045/v1' } })
+  fireEvent.change(screen.getByLabelText('Модель'), { target: { value: 'local-model' } })
+  fireEvent.change(screen.getByLabelText('API-ключ'), { target: { value: 'local-key' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Сохранить изменения' }))
+  await waitFor(() => expect(screen.getAllByText('Проверка генерации не пройдена').length).toBeGreaterThan(0))
+  expect(screen.getByLabelText('API-ключ')).toHaveValue('local-key')
+  expect(requests.some((request) => request.url.endsWith('/api/model/models'))).toBe(false)
+  const save = requests.find((request) => request.init?.method === 'PUT')
+  expect(JSON.parse(String(save?.init?.body))).toEqual({ base_url: 'http://0.0.0.0:8045/v1', model: 'local-model', api_key: 'local-key' })
+})
+
 test('does not send a masked saved key back to the API', async () => {
   const requests: Array<{ url: string; init?: RequestInit }> = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {

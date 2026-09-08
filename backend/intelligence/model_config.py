@@ -5,11 +5,37 @@ import socket
 from collections.abc import Collection
 from urllib.parse import urlparse
 
+import httpx
+
+
+def normalize_base_url(value: str) -> str:
+    parsed = urlparse(value.strip().rstrip("/"))
+    if parsed.hostname == "0.0.0.0":
+        # Bind-all is a server setting; clients must connect to a concrete host.
+        parsed = parsed._replace(netloc=parsed.netloc.replace("0.0.0.0", "127.0.0.1", 1))
+    return parsed.geturl()
+
+
+def is_local_url(value: str) -> bool:
+    host = urlparse(normalize_base_url(value)).hostname or ""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.rstrip(".").lower() == "localhost"
+
+
+def model_http_client(base_url: str, timeout: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=not is_local_url(base_url))
+
+
+def auth_headers(key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
 
 def validate_base_url(value: str, allowed_local_urls: Collection[str] = ()) -> str:
     if len(value.strip()) > 2048:
         raise ValueError("Недопустимый адрес модели")
-    parsed = urlparse(value.strip().rstrip("/"))
+    parsed = urlparse(normalize_base_url(value))
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.hostname
