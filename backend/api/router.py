@@ -457,7 +457,6 @@ def create_profile(data: CandidateProfileData, db: Session = Depends(get_db)) ->
         education=[entry.model_dump() for entry in data.education],
         languages=[entry.model_dump() for entry in data.languages],
         driver_license=data.driver_license,
-        data=data.model_dump(),
     )
     db.add(item)
     db.commit()

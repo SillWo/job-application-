@@ -477,7 +477,8 @@ async def test_open_search_ignores_keyword_queries_and_uses_category_filter():
 async def test_category_filter_opener_and_scoped_management_link_are_clicked():
     page = _SearchPage()
     await HireHiAdapter().open_search(page, {"category": "менеджмент"})
-    assert page.goto_urls == ["https://hirehi.ru/"]
+    assert page.category_links["менеджмент"].clicked
+    assert page.url == "https://hirehi.ru/vacancies/management"
 
 
 @pytest.mark.asyncio
@@ -714,3 +715,116 @@ async def test_direct_pagination_preserves_filtered_listing_query_across_four_pa
     assert await adapter.collect_more_job_refs(page) == []
     assert adapter.search_exhausted is True
     assert page.url == f"{_DirectPagingPage.base}&page=5"
+
+
+@pytest.mark.asyncio
+async def test_filters_cannot_replace_category_with_home_listing(monkeypatch):
+    page = _SearchPage()
+    adapter = HireHiAdapter()
+
+    async def grades(page, requested):
+        assert requested == ["intern", "junior", "middle"]
+        page.url = "https://hirehi.ru/?level=intern&level=junior&level=middle&page=9"
+
+    monkeypatch.setattr(adapter, "_apply_grade_filters", grades)
+    await adapter.open_search(page, {"category": "менеджмент", "grades": ["intern", "junior", "middle"]})
+    assert page.url == "https://hirehi.ru/vacancies/management?level=intern&level=junior&level=middle"
+    assert adapter._listing_url == page.url
+    assert adapter._is_listing_page(page)
+
+
+@pytest.mark.asyncio
+async def test_pagination_retries_failed_page_without_skipping_it():
+    adapter = HireHiAdapter()
+    adapter._category = "менеджмент"
+    page = _DirectPagingPage()
+    await adapter.collect_job_refs(page)
+    original_goto = page.goto
+
+    async def fail(*args, **kwargs):
+        raise TimeoutError("fixture navigation failure")
+
+    page.goto = fail
+    with pytest.raises(TimeoutError):
+        await adapter.collect_more_job_refs(page)
+    page.goto = original_goto
+    refs = await adapter.collect_more_job_refs(page)
+    assert refs[0].external_id == "52"
+    assert page.url.endswith("page=2")
+
+
+@pytest.mark.asyncio
+async def test_restart_resumes_pagination_and_keeps_seen_ids():
+    adapter = HireHiAdapter()
+    adapter._category = "менеджмент"
+    page = _DirectPagingPage()
+    await adapter.collect_job_refs(page)
+    await adapter.collect_more_job_refs(page)
+    restored = HireHiAdapter()
+    restored.restore_search_checkpoint(adapter.search_checkpoint())
+    refs = await restored.collect_more_job_refs(page)
+    assert refs[0].external_id == "103"
+    assert len(restored._seen) == 153
+    assert page.url == f"{page.base}&page=3"
+
+
+@pytest.mark.asyncio
+async def test_repeated_vacancies_with_rotating_blog_links_end_search():
+    class RepeatingPage(_DirectPagingPage):
+        def _hrefs(self):
+            return ["/management/job-1", f"/blog/article-{self.page}"]
+
+    page = RepeatingPage()
+    adapter = HireHiAdapter()
+    adapter._category = "менеджмент"
+    assert [ref.external_id for ref in await adapter.collect_job_refs(page)] == ["1"]
+    assert await adapter.collect_more_job_refs(page) == []
+    assert adapter.search_exhausted
+    assert await adapter.collect_more_job_refs(page) == []
+    assert len(page.goto_urls) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_anchor_read_does_not_lose_partial_batch():
+    adapter = HireHiAdapter()
+    page = _RefsPage(["/management/job-1", "/management/job-2"])
+    links = _Links(page.hrefs)
+
+    async def fail(_name):
+        raise TimeoutError("fixture anchor disappeared")
+
+    links.items[1].get_attribute = fail
+    original_locator = page.locator
+    page.locator = lambda _: links
+    with pytest.raises(TimeoutError):
+        await adapter.collect_job_refs(page)
+    page.locator = original_locator
+    assert [ref.external_id for ref in await adapter.collect_job_refs(page)] == ["1", "2"]
+
+
+@pytest.mark.parametrize("url", [
+    "https://outside.example/vacancies/management",
+    "https://hirehi.ru/management/job-1",
+    "https://hirehi.ru/vacancies/design",
+    "https://user:password@hirehi.ru/vacancies/management",
+    "http://hirehi.ru/vacancies/management",
+])
+def test_checkpoint_rejects_urls_outside_selected_listing(url):
+    with pytest.raises(ValueError):
+        HireHiAdapter().restore_search_checkpoint({
+            "algorithm": "hirehi_v1", "category": "менеджмент",
+            "listing_url": url, "listing_page": 2, "seen": [], "exhausted": False,
+        })
+
+
+@pytest.mark.asyncio
+async def test_open_search_tracks_page_reached_by_ui(monkeypatch):
+    adapter = HireHiAdapter()
+    page = _SearchPage()
+
+    async def grades(page, requested):
+        page.url = "https://hirehi.ru/vacancies/management?level=middle&page=3"
+
+    monkeypatch.setattr(adapter, "_apply_grade_filters", grades)
+    await adapter.open_search(page, {"category": "менеджмент"})
+    assert adapter.search_checkpoint()["listing_page"] == 3
