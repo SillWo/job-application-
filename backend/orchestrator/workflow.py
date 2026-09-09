@@ -870,9 +870,21 @@ class WorkflowManager:
                 evaluation_record = db.scalar(
                     select(Evaluation).where(Evaluation.vacancy_id == vacancy.id)
                 )
+                refresh_cached_evaluation = False
                 if evaluation_record:
                     result = JobEvaluation.model_validate(evaluation_record.data)
-                else:
+                    # A legacy cached apply result may contain the evaluator's
+                    # defaulted all-zero red matches.  It predates the strict
+                    # preference contract and must be re-evaluated before any
+                    # submission can be prepared.
+                    if (
+                        result.decision == "apply"
+                        and preference_policy
+                        and preference_policy.red_flags
+                        and not result.preference_flags_verified
+                    ):
+                        refresh_cached_evaluation = True
+                if evaluation_record is None or refresh_cached_evaluation:
                     try:
                         # Keep an auditable, PII-free copy of exactly the job object
                         # supplied to the evaluator (profile/resume stay out of it).
@@ -900,6 +912,9 @@ class WorkflowManager:
                     return
                 if evaluation_record is None:
                     db.add(Evaluation(vacancy_id=vacancy.id, data=result.model_dump()))
+                elif refresh_cached_evaluation:
+                    evaluation_record.data = result.model_dump()
+                if evaluation_record is None or refresh_cached_evaluation:
                     self.emit(
                         db,
                         session_id,
@@ -940,7 +955,7 @@ class WorkflowManager:
                         {"vacancy_id": vacancy.id},
                     )
                 else:
-                    if evaluation_record is None:
+                    if evaluation_record is None and not refresh_cached_evaluation:
                         _increment_counter(db, item, "matched", persist=True)
                     # Persist before awaiting the model. A later refresh would
                     # otherwise discard the dirty JSON counter value.

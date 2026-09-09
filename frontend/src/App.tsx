@@ -150,7 +150,7 @@ function vacancyExportUrl(filters: VacancyFilters, format: "csv" | "xlsx" | "xml
 }
 function humanStatus(value: string) { return STATUS_META[value]?.label ?? value.replaceAll("_", " ").toLowerCase(); }
 const VACANCY_STATUS_OPTIONS = [
-  { value: "EVALUATING", label: "Оценка вакансии" }, { value: "REJECTED_BY_MODEL", label: "Отклонена моделью" }, { value: "REPORTED", label: "В отчёте" }, { value: "ERROR", label: "Ошибка" },
+  { value: "EVALUATING", label: "Оценка вакансии" }, { value: "REJECTED_BY_MODEL", label: "Отклонена моделью" }, { value: "SUBMITTED", label: "Отклик отправлен" }, { value: "REPORTED", label: "В отчёте" }, { value: "ERROR", label: "Ошибка" },
 ] as const;
 function vacancyOutcome(value: string) {
   if (value === "SUBMITTED") return "Отклик действительно отправлен после положительной оценки вакансии.";

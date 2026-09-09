@@ -64,6 +64,25 @@ def _schema_for_role(role: str, schema: type[BaseModel]) -> dict:
 
 def _schema_without_preference_matches(role: str, schema: type[BaseModel], payload: dict) -> dict:
     result = _schema_for_role(role, schema)
+    has_preferences = (
+        role == "resume_analyst"
+        and schema.__name__ == "ResumeAnalysis"
+        and isinstance(payload.get("preference_policy"), dict)
+    )
+    if has_preferences:
+        # FlagMatch has permissive Pydantic defaults for backwards-compatible
+        # persisted evaluations.  Model responses must use the complete
+        # contract, otherwise a missing confidence/evidence is silently
+        # converted into a negative match by the evaluator.
+        if "required" in result:
+            result["required"] = [
+                *result["required"],
+                *(["flag_matches"] if "flag_matches" not in result["required"] else []),
+            ]
+        flag_match = result.get("$defs", {}).get("FlagMatch")
+        if isinstance(flag_match, dict):
+            properties = flag_match.get("properties", {})
+            flag_match["required"] = list(properties)
     if role == "resume_analyst" and not payload.get("preference_policy"):
         result.get("properties", {}).pop("flag_matches", None)
         if "required" in result:
@@ -92,7 +111,26 @@ def _system_prompt_for_role(role: str, payload: dict) -> str:
     return prompt
 
 
-def _resume_analysis_missing_fields(parsed: BaseModel, require_flag_matches: bool = False) -> list[str]:
+def _preference_flag_ids(payload: dict) -> list[str]:
+    policy = payload.get("preference_policy")
+    if not isinstance(policy, dict):
+        return []
+    result: list[str] = []
+    for group in ("green_flags", "red_flags"):
+        flags = policy.get(group, [])
+        if not isinstance(flags, list):
+            continue
+        for flag in flags:
+            if isinstance(flag, dict) and isinstance(flag.get("id"), str):
+                result.append(flag["id"])
+    return result
+
+
+def _resume_analysis_missing_fields(
+    parsed: BaseModel,
+    require_flag_matches: bool = False,
+    expected_flag_ids: list[str] | None = None,
+) -> list[str]:
     if parsed.__class__.__name__ != "ResumeAnalysis":
         return []
     criteria = _RESUME_ANALYSIS_CRITERIA
@@ -119,8 +157,26 @@ def _resume_analysis_missing_fields(parsed: BaseModel, require_flag_matches: boo
             assessment.confidence <= 0 or not assessment.evidence
         ):
             missing.append(f"{field_name}.grounding")
-    if require_flag_matches and "flag_matches" not in parsed.model_fields_set:
-        missing.append("flag_matches")
+    if require_flag_matches:
+        if "flag_matches" not in parsed.model_fields_set:
+            missing.append("flag_matches")
+        else:
+            matches = getattr(parsed, "flag_matches", [])
+            expected = list(expected_flag_ids or [])
+            actual = [item.flag_id for item in matches]
+            duplicates = sorted({flag_id for flag_id in actual if actual.count(flag_id) > 1})
+            unknown = sorted(set(actual) - set(expected))
+            absent = [flag_id for flag_id in expected if flag_id not in actual]
+            if duplicates:
+                missing.append("flag_matches.duplicate=" + ",".join(duplicates))
+            if unknown:
+                missing.append("flag_matches.unknown=" + ",".join(unknown))
+            if absent:
+                missing.append("flag_matches.missing=" + ",".join(absent))
+            for index, item in enumerate(matches):
+                for field_name in ("flag_id", "matched", "confidence", "evidence", "explanation"):
+                    if field_name not in item.model_fields_set:
+                        missing.append(f"flag_matches[{index}].{field_name}")
     return missing
 
 
@@ -329,6 +385,7 @@ class ModelGateway:
                             missing_analysis = _resume_analysis_missing_fields(
                                 parsed,
                                 require_flag_matches=("preference_policy" in payload and isinstance(payload.get("preference_policy"), dict)),
+                                expected_flag_ids=_preference_flag_ids(payload),
                             )
                             if missing_analysis:
                                 raise ValueError(

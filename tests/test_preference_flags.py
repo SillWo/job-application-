@@ -13,6 +13,7 @@ from backend.schemas.domain import (
     ResumeAnalysis,
     Salary,
     SalaryPreference,
+    SkillAssessment,
 )
 
 
@@ -48,6 +49,15 @@ def test_empty_preference_schema_has_no_flag_contract():
     rendered = str(schema)
     assert "flag_matches" not in rendered
     assert "FlagMatch" not in rendered
+
+
+def test_preference_schema_requires_complete_flag_matches():
+    payload = {"preference_policy": policy(red=True).model_dump(mode="json")}
+    schema = _schema_without_preference_matches("resume_analyst", ResumeAnalysis, payload)
+    assert "flag_matches" in schema["required"]
+    assert set(schema["$defs"]["FlagMatch"]["required"]) == {
+        "flag_id", "matched", "confidence", "evidence", "explanation",
+    }
 
 
 class FakeGateway:
@@ -106,6 +116,61 @@ async def test_red_threshold(confidence, expected):
     assert ("preference_red_flag" in result.hard_rule_violations) is expected
     if expected:
         assert result.decision == "skip"
+
+
+@pytest.mark.asyncio
+async def test_unverified_red_match_requires_manual_review():
+    p = policy(red=True)
+    complete = analysis(
+        [FlagMatch(flag_id="red-1", matched=True)],
+        task_score=2,
+    )
+    complete.experience_depth = assessment(1, .8, ["Продажи"])
+    complete.role_match = assessment(1, .8, ["Продажи"])
+    complete.industry = assessment(2, .8, ["Продажи"])
+    complete.special_requirements = assessment(1, .8, ["Продажи"])
+    complete.skills = [SkillAssessment(skill="product", importance="required", score=1, evidence=["product"], explanation="x")]
+    result = await evaluate(
+        job(text="Продажи и работа с клиентами"), {}, [{}], FakeGateway(complete), preference_policy=p,
+    )
+    assert result.decision == "manual_review"
+    assert result.requires_manual_review is True
+    assert "preference_red_flag_unverified" in result.hard_rule_violations
+
+
+@pytest.mark.asyncio
+async def test_hiring_format_is_grounded_for_red_flags():
+    p = DesiredJobPolicy(
+        red_flags=[PreferenceFlag(id="red-1", text="ГПХ", category="other")],
+    )
+    matches = [FlagMatch(flag_id="red-1", matched=True, confidence=1, evidence=["Оформление: Договор ГПХ"])]
+    complete = analysis(matches, task_score=2)
+    for field in ("experience_depth", "role_match", "industry", "special_requirements"):
+        setattr(complete, field, assessment(1 if field != "industry" else 2, .8, ["Оформление: Договор ГПХ"]))
+    result = await evaluate(
+        JobPosting(
+            source="hh", url="https://hh.ru/vacancy/8607", title="Technical Product Manager",
+            description="Управление продуктом", hiring_format="Оформление: Договор ГПХ",
+        ), {}, [{}], FakeGateway(complete), preference_policy=p,
+    )
+    assert result.decision == "skip"
+    assert "preference_red_flag" in result.hard_rule_violations
+
+
+@pytest.mark.asyncio
+async def test_confirmed_negative_red_match_can_apply():
+    complete = analysis(
+        [FlagMatch(flag_id="red-1", matched=False, confidence=.8, evidence=[])],
+        task_score=2,
+    )
+    for field in ("experience_depth", "role_match", "industry", "special_requirements"):
+        setattr(complete, field, assessment(1 if field != "industry" else 2, .8, ["Продажи"]))
+    complete.skills = [SkillAssessment(skill="product", importance="required", score=1, evidence=["product"], explanation="x")]
+    result = await evaluate(
+        job(text="Разработка продукта"), {}, [{}], FakeGateway(complete), preference_policy=policy(red=True),
+    )
+    assert result.decision == "apply"
+    assert "preference_red_flag" not in result.hard_rule_violations
 
 
 @pytest.mark.asyncio

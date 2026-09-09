@@ -9,8 +9,14 @@ from test_workflow_non_captcha_continuation import runtime as recovery_runtime
 
 from backend.adapters.base.protocol import ApplicationForm, Blocker, JobRef, SubmissionResult
 from backend.orchestrator import workflow
-from backend.persistence.models import Application, BrowserEvent, JobSession, Vacancy
-from backend.schemas.domain import SessionStatus
+from backend.persistence.models import Application, BrowserEvent, Evaluation, JobSession, Vacancy
+from backend.schemas.domain import (
+    DesiredJobPolicy,
+    FlagMatch,
+    JobEvaluation,
+    PreferenceFlag,
+    SessionStatus,
+)
 
 runtime = recovery_runtime
 
@@ -207,6 +213,63 @@ async def test_browser_is_automatically_restored(runtime, monkeypatch):
     monkeypatch.setattr(workflow, "restore_browser", restore)
     await workflow.WorkflowManager().run(runtime[1])
     assert restored == [runtime[1]]
+
+
+@pytest.mark.asyncio
+async def test_legacy_cached_apply_with_red_flags_is_re_evaluated_without_submission(runtime, monkeypatch):
+    sessions, session_id = runtime
+    submitted = []
+    calls = []
+
+    class Adapter(FakeAdapter):
+        async def submit_application(self, page):
+            submitted.append(self.current_ref.external_id)
+            return await super().submit_application(page)
+
+    adapter = Adapter(refs("legacy"))
+    policy = DesiredJobPolicy(
+        red_flags=[PreferenceFlag(id="red-1", text="ГПХ", category="other")],
+    )
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.status = SessionStatus.RUNNING
+        item.started_at = workflow.datetime.now(workflow.timezone.utc)
+        item.preference_policy = policy.model_dump(mode="json")
+        item.desired_job_description = "Не рассматриваю ГПХ"
+        item.counters = {"viewed": 0, "filtered": 0, "matched": 3, "submitted": 0, "reported": 0, "errors": 0}
+        vacancy = Vacancy(
+            session_id=session_id, source="fake", external_id="legacy", url="https://fake/legacy",
+            title="Vacancy legacy", state="EXTRACTED",
+            data={"source": "fake", "external_id": "legacy", "url": "https://fake/legacy",
+                  "title": "Vacancy legacy", "description": "Description", "responsibilities": [],
+                  "required_skills": [], "optional_skills": []},
+        )
+        db.add(vacancy)
+        db.flush()
+        old_result = JobEvaluation(
+            decision="apply", score=90, confidence=0.9, category="legacy", reason="legacy",
+            flag_matches=[FlagMatch(flag_id="red-1", matched=False, confidence=0, evidence=[])],
+        )
+        db.add(Evaluation(vacancy_id=vacancy.id, data=old_result.model_dump()))
+        db.commit()
+
+    async def re_evaluate(*args, **kwargs):
+        calls.append(args[-1] if len(args) >= 6 else kwargs.get("preference_policy"))
+        return JobEvaluation(decision="skip", score=10, confidence=1, category="legacy", reason="red flag")
+
+    monkeypatch.setattr(workflow.adapter_registry, "get", lambda _: adapter)
+    monkeypatch.setattr(workflow, "evaluate", re_evaluate)
+    monkeypatch.setattr(workflow, "ModelGateway", lambda: object())
+    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=5)
+
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        saved = db.scalar(select(Evaluation).join(Vacancy).where(Vacancy.external_id == "legacy"))
+        assert item.counters["matched"] == 3
+        assert db.scalar(select(Vacancy).where(Vacancy.external_id == "legacy")).state == "REJECTED_BY_MODEL"
+        assert JobEvaluation.model_validate(saved.data).decision == "skip"
+    assert calls and calls[0].red_flags[0].id == "red-1"
+    assert submitted == []
 
 
 @pytest.mark.asyncio

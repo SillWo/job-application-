@@ -144,17 +144,29 @@ test('renders vacancy site and exact status timestamp while legacy has no dangli
 })
 
 test('status filter shows unique Russian labels while preserving state values', async () => {
-  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).includes('/api/vacancies')
-    ? Promise.resolve({ ok: true, json: async () => ({ items: [], total: 0, limit: 30, offset: 0, has_more: false }) })
-    : Promise.resolve({ ok: true, json: async () => [] })))
+  const requests: string[] = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    requests.push(url)
+    return url.includes('/api/vacancies')
+      ? Promise.resolve({ ok: true, json: async () => ({ items: [], total: 0, limit: 30, offset: 0, has_more: false }) })
+      : Promise.resolve({ ok: true, json: async () => [] })
+  }))
   render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
   const select = await screen.findByRole('combobox', { name: 'Статус' })
   const options = within(select).getAllByRole('option')
   const labels = options.map((option) => option.textContent ?? '')
   expect(new Set(labels).size).toBe(labels.length)
   expect(labels.every((label) => !/[A-Za-z]/.test(label))).toBe(true)
-  expect(labels).toEqual(['Все', 'Оценка вакансии', 'Отклонена моделью', 'В отчёте', 'Ошибка'])
+  expect(labels).toEqual(['Все', 'Оценка вакансии', 'Отклонена моделью', 'Отклик отправлен', 'В отчёте', 'Ошибка'])
   expect(within(select).getByRole('option', { name: 'Отклонена моделью' })).toHaveValue('REJECTED_BY_MODEL')
+  expect(within(select).getByRole('option', { name: 'Отклик отправлен' })).toHaveValue('SUBMITTED')
+  fireEvent.change(select, { target: { value: 'SUBMITTED' } })
+  await waitFor(() => {
+    const latest = requests.filter((url) => url.includes('/api/vacancies?')).at(-1)
+    expect(latest).toBeTruthy()
+    expect(new URL(latest!, 'http://local').searchParams.get('state')).toBe('SUBMITTED')
+  })
 })
 
 test('builds CSV XLSX XML export links without pagination', async () => {

@@ -326,6 +326,9 @@ class JobEvaluation(BaseModel):
     negative_evidence: list[Evidence] = Field(default_factory=list)
     missing_requirements: list[str] = Field(default_factory=list)
     flag_matches: list[FlagMatch] = Field(default_factory=list)
+    # Persisted evaluations created before strict preference validation omit
+    # this field and therefore cannot authorize a cached apply decision.
+    preference_flags_verified: bool = False
     has_test_assignment: bool = False
     requires_manual_review: bool = False
     reason: str
