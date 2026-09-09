@@ -5,11 +5,37 @@ import socket
 from collections.abc import Collection
 from urllib.parse import urlparse
 
+import httpx
+
+
+def normalize_base_url(value: str) -> str:
+    parsed = urlparse(value.strip().rstrip("/"))
+    if parsed.hostname == "0.0.0.0":
+        # Bind-all is a server setting; clients must connect to a concrete host.
+        parsed = parsed._replace(netloc=parsed.netloc.replace("0.0.0.0", "127.0.0.1", 1))
+    return parsed.geturl()
+
+
+def is_local_url(value: str) -> bool:
+    host = urlparse(normalize_base_url(value)).hostname or ""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.rstrip(".").lower() == "localhost"
+
+
+def model_http_client(base_url: str, timeout: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=not is_local_url(base_url))
+
+
+def auth_headers(key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
 
 def validate_base_url(value: str, allowed_local_urls: Collection[str] = ()) -> str:
     if len(value.strip()) > 2048:
         raise ValueError("Недопустимый адрес модели")
-    parsed = urlparse(value.strip().rstrip("/"))
+    parsed = urlparse(normalize_base_url(value))
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.hostname
@@ -25,9 +51,17 @@ def validate_base_url(value: str, allowed_local_urls: Collection[str] = ()) -> s
     except (OSError, ValueError) as exc:
         raise ValueError("Не удалось проверить адрес модели") from exc
     ips = [ipaddress.ip_address(item[4][0]) for item in addresses]
+    if not ips:
+        raise ValueError("Не удалось проверить адрес модели")
     normalized = parsed.geturl()
     allowed_local = {url.strip().rstrip("/") for url in allowed_local_urls if url.strip()}
-    if normalized in allowed_local and ips and all(ip.is_loopback for ip in ips):
+    try:
+        explicit_loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        explicit_loopback = parsed.hostname.rstrip(".").lower() == "localhost"
+    # A fresh installation must be able to configure a local gateway from the UI.
+    # Arbitrary DNS names still cannot opt into loopback/private destinations.
+    if (explicit_loopback or normalized in allowed_local) and all(ip.is_loopback for ip in ips):
         return normalized
     if parsed.scheme != "https" or any(
         ip.is_private

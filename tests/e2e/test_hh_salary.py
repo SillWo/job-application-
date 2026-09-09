@@ -32,11 +32,13 @@ async def test_visible_salary_reaches_model_and_blocks_low_paid_job(tmp_path, mo
             '<h1 data-qa="vacancy-title">Стажёр</h1>'
             '<div data-qa="vacancy-company-name">Компания</div>'
             '<div data-qa="vacancy-description">Координация проектов</div>'
+            '<div data-qa="vacancy-view-raw-address">Москва, улица Вавилова, 19</div>'
             f'<div data-qa="{salary_qa}" style="display:none">от 100 000 ₽</div>'
             f'<div data-qa="{salary_qa}"><span>до 36&nbsp;000 ₽</span>'
             '<span> за месяц, на руки</span></div>'
         )
         job = await HHAdapter().extract_job(page)
+        assert job.location == "Москва, улица Вавилова, 19"
         result = await evaluate(job, {}, [], Gateway(), preference_policy={
             "desired_salary": {"minimum_monthly_amount": 60000, "currency": "RUB"},
         })

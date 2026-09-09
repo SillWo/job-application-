@@ -10,6 +10,7 @@ from backend.intelligence import gateway as gateway_module
 from backend.intelligence.gateway import (
     ModelGateway,
     ModelUnavailable,
+    _resume_analysis_missing_fields,
     _safe_api_error_text,
     _schema_for_role,
 )
@@ -53,6 +54,23 @@ def _valid_analysis() -> dict:
     result["skills"] = []
     result["skills_summary"] = "Навыки соответствуют требованиям вакансии."
     result["reason"] = "Краткое саммари релевантности вакансии."
+    return result
+
+
+def _preference_payload() -> dict:
+    return {
+        "job": {},
+        "resumes": [],
+        "preference_policy": {
+            "green_flags": [{"id": "green-1", "text": "продукт", "category": "other"}],
+            "red_flags": [{"id": "red-1", "text": "ГПХ", "category": "other"}],
+        },
+    }
+
+
+def _analysis_with_flags(flag_matches: list[dict]) -> dict:
+    result = _valid_analysis()
+    result["flag_matches"] = flag_matches
     return result
 
 
@@ -144,6 +162,80 @@ async def test_resume_analyst_four_invalid_responses_raise_model_unavailable(mon
     with pytest.raises(ModelUnavailable, match="некорректный JSON"):
         await ModelGateway(provider="openai_compat").structured(
             "resume_analyst", {"job": {}, "resumes": []}, ResumeAnalysis
+        )
+    assert len(completions.calls) == 4
+
+
+def test_preference_flag_contract_rejects_incomplete_id_coverage():
+    cases = [
+        [
+            {"flag_id": "red-1", "matched": False, "confidence": 0.8, "evidence": [], "explanation": "нет"},
+        ],
+        [
+            {"flag_id": "green-1", "matched": False, "confidence": 0.8, "evidence": [], "explanation": "нет"},
+            {"flag_id": "green-1", "matched": False, "confidence": 0.8, "evidence": [], "explanation": "нет"},
+            {"flag_id": "red-1", "matched": False, "confidence": 0.8, "evidence": [], "explanation": "нет"},
+        ],
+        [
+            {"flag_id": "green-1", "matched": False, "confidence": 0.8, "evidence": [], "explanation": "нет"},
+            {"flag_id": "unknown", "matched": False, "confidence": 0.8, "evidence": [], "explanation": "нет"},
+        ],
+    ]
+    for flag_matches in cases:
+        missing = _resume_analysis_missing_fields(
+            ResumeAnalysis.model_validate(_analysis_with_flags(flag_matches)),
+            require_flag_matches=True,
+            expected_flag_ids=["green-1", "red-1"],
+        )
+        assert any(item.startswith("flag_matches.") for item in missing)
+
+
+@pytest.mark.asyncio
+async def test_resume_analyst_repairs_truncated_preference_flags(monkeypatch):
+    payload = _preference_payload()
+    truncated = [
+        {"flag_id": "green-1", "matched": False},
+        {"flag_id": "red-1", "matched": True},
+    ]
+    complete = [
+        {"flag_id": "green-1", "matched": False, "confidence": 0.9, "evidence": [], "explanation": "нет"},
+        {"flag_id": "red-1", "matched": True, "confidence": 0.95, "evidence": ["ГПХ"], "explanation": "найдено"},
+    ]
+    completions = _FakeCompletions([
+        _response(_analysis_with_flags(truncated)),
+        _response(_analysis_with_flags(complete)),
+    ])
+    monkeypatch.setattr(gateway_module, "AsyncOpenAI", lambda **_: _FakeClient(completions))
+    saved = SimpleNamespace(
+        base_url="https://api.example.test/v1", model="test-model", encrypted_api_key="ciphertext",
+    )
+    monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
+    monkeypatch.setattr(gateway_module, "decrypt_secret", lambda _: "test-key")
+
+    result = await ModelGateway(provider="openai_compat").structured(
+        "resume_analyst", payload, ResumeAnalysis,
+    )
+
+    assert [item.flag_id for item in result.flag_matches] == ["green-1", "red-1"]
+    assert len(completions.calls) == 2
+    assert "flag_matches" in completions.calls[1]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_resume_analyst_preference_flag_repair_exhaustion_is_unavailable(monkeypatch):
+    payload = _preference_payload()
+    invalid = _analysis_with_flags([{"flag_id": "red-1", "matched": True}])
+    completions = _FakeCompletions([_response(invalid)] * 4)
+    monkeypatch.setattr(gateway_module, "AsyncOpenAI", lambda **_: _FakeClient(completions))
+    saved = SimpleNamespace(
+        base_url="https://api.example.test/v1", model="test-model", encrypted_api_key="ciphertext",
+    )
+    monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
+    monkeypatch.setattr(gateway_module, "decrypt_secret", lambda _: "test-key")
+
+    with pytest.raises(ModelUnavailable, match="некорректный JSON"):
+        await ModelGateway(provider="openai_compat").structured(
+            "resume_analyst", payload, ResumeAnalysis,
         )
     assert len(completions.calls) == 4
 

@@ -251,6 +251,24 @@ class ApplicationQuestion(BaseModel):
     sensitive: bool = False
 
 
+class ApplicationField(BaseModel):
+    """Visible form metadata. IDs are assigned by the adapter, never by the model."""
+    id: str
+    label: str
+    kind: Literal["text", "number", "radio", "checkbox", "select", "multiselect", "unsupported"] = "text"
+    options: list[str] = Field(default_factory=list)
+    required: bool = True
+    max_length: int | None = None
+
+
+class FormAnswer(BaseModel):
+    values: list[str] = Field(default_factory=list)
+    # Binds an answer to a particular question/options, including after reloads.
+    field: ApplicationField
+    source: str = ""
+    explanation: str = ""
+
+
 class JobPosting(BaseModel):
     source: str
     external_id: str | None = None
@@ -308,6 +326,9 @@ class JobEvaluation(BaseModel):
     negative_evidence: list[Evidence] = Field(default_factory=list)
     missing_requirements: list[str] = Field(default_factory=list)
     flag_matches: list[FlagMatch] = Field(default_factory=list)
+    # Persisted evaluations created before strict preference validation omit
+    # this field and therefore cannot authorize a cached apply decision.
+    preference_flags_verified: bool = False
     has_test_assignment: bool = False
     requires_manual_review: bool = False
     reason: str
@@ -325,6 +346,10 @@ class ApplicationPlan(BaseModel):
     resume_file: str
     cover_letter: str | None = None
     known_answers: dict[str, str] = Field(default_factory=dict)
+    form_answers: dict[str, FormAnswer] = Field(default_factory=dict)
+    unanswered_fields: dict[str, str] = Field(default_factory=dict)
+    form_fields: dict[str, ApplicationField] = Field(default_factory=dict)
+    allow_foreign_application: bool = False
     unknown_question_policy: Literal["manual_review", "skip"] = "manual_review"
     submission_allowed: bool = False
 

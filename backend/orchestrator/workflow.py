@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+from time import perf_counter
 from typing import Any
 
 from sqlalchemy import select
@@ -10,6 +11,7 @@ from sqlalchemy import select
 from backend.adapters import adapter_registry
 from backend.adapters.base.protocol import JobRef
 from backend.browser.sessions import close_browser, get_browser, restore_browser
+from backend.intelligence.adaptive_search_planner import plan_portfolio
 from backend.intelligence.evaluator import _payload, evaluate
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
 from backend.intelligence.hirehi_category import JobSummary, choose_hirehi_category
@@ -17,7 +19,9 @@ from backend.intelligence.hirehi_grade import hirehi_grades
 from backend.intelligence.letter_writer import write_cover_letter
 from backend.intelligence.preference_policy import compile_preference_policy
 from backend.intelligence.search_planner import plan_search_queries
+from backend.orchestrator.adaptive_search import AdaptiveSearch
 from backend.orchestrator.application_guard import unresolved_application_questions
+from backend.orchestrator.hh_application import complete_application
 from backend.orchestrator.recovery import (
     AuthenticationPending,
     CaptchaRequired,
@@ -348,6 +352,9 @@ class WorkflowManager:
                 item.stop_reason = completion_reason
             item.recovery = {**(item.recovery or {}), "pending_refs": [], "retry_at": None, "message": None}
             item.finished_at = datetime.now(timezone.utc)
+            from backend.services.profile_memory import collect_session_questions
+
+            collect_session_questions(db, item)
             db.commit()
             self.emit(db, session_id, "session", "Сессия завершена")
 
@@ -378,6 +385,9 @@ class WorkflowManager:
                 final_item = db.get(JobSession, session_id)
                 final_status = final_item.status if final_item else SessionStatus.FAILED
                 if final_item and final_status in {SessionStatus.COMPLETED, SessionStatus.STOPPED, SessionStatus.FAILED}:
+                    from backend.services.profile_memory import collect_session_questions
+
+                    collect_session_questions(db, final_item)
                     search_metrics.freeze(db, final_item)
             search_metrics.end(metric_token)
             if final_status in {SessionStatus.COMPLETED, SessionStatus.STOPPED, SessionStatus.FAILED}:
@@ -469,6 +479,9 @@ class WorkflowManager:
             return [JobRef.model_validate(ref) for ref in recovery["pending_refs"]]
 
     def _record_submission(self, db, item, vacancy, submission) -> None:
+        if submission.status == "needs_input":
+            # needs_input is an internal form transition, never a terminal DB state.
+            submission = submission.model_copy(update={"status": "unknown"})
         vacancy.state = submission.status.upper()
         existing = db.scalar(select(Application).where(Application.vacancy_id == vacancy.id))
         if existing is None:
@@ -554,6 +567,8 @@ class WorkflowManager:
             with SessionLocal() as db:
                 db.get(JobSession, session_id).preference_policy = preference_policy.model_dump(mode="json")
                 db.commit()
+        if adapter_id == "hh":
+            adapter = RecoveryAdapter(AdaptiveSearch(adapter.adapter, gateway, selected_resumes, preference_policy))
         hirehi_category: str | None = None
         hirehi_grade_values: list[str] | None = None
         with SessionLocal() as db:
@@ -574,6 +589,9 @@ class WorkflowManager:
                     {"years": experience_years, "grades": hirehi_grade_values},
                 )
                 event_db.commit()
+        elif adapter_id == "hh":
+            portfolio_queries = await plan_portfolio(gateway, selected_resumes, preference_policy)
+            search_filters = {"portfolio_queries": portfolio_queries}
         else:
             planned_queries = await plan_search_queries(gateway, selected_resumes, preference_policy=preference_policy)
             search_filters = {"queries": planned_queries}
@@ -699,11 +717,15 @@ class WorkflowManager:
                     "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING",
                 }):
                     if existing.session_id != session_id:
+                        observer = getattr(adapter, "observe_overlap", None)
+                        if observer:
+                            observer(ref.external_id)
                         search_metrics.record("overlap", {"external_id": ref.external_id})
                         search_metrics.flush(db, session_id)
                         db.commit()
                     continue
             try:
+                processing_started = perf_counter()
                 await adapter.open_job(executor.page, ref)
                 blockers = await adapter.detect_blockers(executor.page)
                 if blockers:
@@ -848,9 +870,21 @@ class WorkflowManager:
                 evaluation_record = db.scalar(
                     select(Evaluation).where(Evaluation.vacancy_id == vacancy.id)
                 )
+                refresh_cached_evaluation = False
                 if evaluation_record:
                     result = JobEvaluation.model_validate(evaluation_record.data)
-                else:
+                    # A legacy cached apply result may contain the evaluator's
+                    # defaulted all-zero red matches.  It predates the strict
+                    # preference contract and must be re-evaluated before any
+                    # submission can be prepared.
+                    if (
+                        result.decision == "apply"
+                        and preference_policy
+                        and preference_policy.red_flags
+                        and not result.preference_flags_verified
+                    ):
+                        refresh_cached_evaluation = True
+                if evaluation_record is None or refresh_cached_evaluation:
                     try:
                         # Keep an auditable, PII-free copy of exactly the job object
                         # supplied to the evaluator (profile/resume stay out of it).
@@ -878,6 +912,9 @@ class WorkflowManager:
                     return
                 if evaluation_record is None:
                     db.add(Evaluation(vacancy_id=vacancy.id, data=result.model_dump()))
+                elif refresh_cached_evaluation:
+                    evaluation_record.data = result.model_dump()
+                if evaluation_record is None or refresh_cached_evaluation:
                     self.emit(
                         db,
                         session_id,
@@ -892,6 +929,14 @@ class WorkflowManager:
                             "breakdown": [row.model_dump() for row in result.score_breakdown],
                         },
                     )
+                observer = getattr(adapter, "observe", None)
+                if observer:
+                    await observer(executor.page, posting, result.decision, perf_counter() - processing_started)
+                    # Feedback changes the scheduler, not the discovery queue.
+                    # Avoid rescanning all vacancies after every evaluation.
+                    item.recovery = {**(item.recovery or {}), "search_checkpoint": adapter.search_checkpoint()}
+                    search_metrics.flush(db, session_id)
+                    db.commit()
                 if result.decision == "skip":
                     vacancy.state = "REJECTED_BY_MODEL"
                     counters = dict(item.counters)
@@ -910,7 +955,7 @@ class WorkflowManager:
                         {"vacancy_id": vacancy.id},
                     )
                 else:
-                    if evaluation_record is None:
+                    if evaluation_record is None and not refresh_cached_evaluation:
                         _increment_counter(db, item, "matched", persist=True)
                     # Persist before awaiting the model. A later refresh would
                     # otherwise discard the dirty JSON counter value.
@@ -948,6 +993,7 @@ class WorkflowManager:
                     if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
                         return
                     plan.cover_letter = letter
+                    plan.allow_foreign_application = adapter_id == "hh"
                     plan_record.data = plan.model_dump()
                     if cover_record is None:
                         db.add(CoverLetter(vacancy_id=vacancy.id, text=letter))
@@ -1032,6 +1078,52 @@ class WorkflowManager:
                             )
                             db.commit()
                             continue
+                        if adapter_id == "hh":
+                            from backend.services.profile_memory import load_profile_memory
+
+                            def checkpoint(current_plan, item=item, plan_record=plan_record):
+                                db.refresh(item)
+                                if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
+                                    return False
+                                plan_record.data = current_plan.model_dump()
+                                db.commit()
+                                return True
+
+                            outcome = await complete_application(
+                                adapter, executor.page, plan, posting, profile, selected_resumes,
+                                preference_description, gateway, checkpoint,
+                                memory=load_profile_memory(db, item.profile_id),
+                                guaranteed_application=item.guaranteed_application,
+                            )
+                            if outcome.stopped:
+                                return
+                            if outcome.pending:
+                                vacancy.data = {**(vacancy.data or {}), "application_review_reasons": outcome.pending}
+                                vacancy.state = "NEEDS_REVIEW"
+                                _increment_counter(db, item, "errors")
+                                self.emit(db, session_id, "human_required", "; ".join(outcome.pending),
+                                          {"vacancy_id": vacancy.id, "kind": "application_questions"})
+                                db.commit()
+                                continue
+                            submission = outcome.submission
+                            if submission.status in {"unknown", "blocked"}:
+                                raise RecoverableFailure("Ожидание подтверждения отклика")
+                            self._record_submission(db, item, vacancy, submission)
+                            db.commit()
+                            continue
+                        from backend.intelligence.application_answers import prepare_answers
+                        from backend.services.profile_memory import load_profile_memory
+
+                        plan = await prepare_answers(
+                            gateway, form, plan, posting, profile, selected_resumes, preference_description,
+                            memory=load_profile_memory(db, item.profile_id),
+                            guaranteed_application=item.guaranteed_application,
+                        )
+                        plan_record.data = plan.model_dump()
+                        db.commit()
+                        db.refresh(item)
+                        if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
+                            return
                         result = await adapter.fill_application(executor.page, plan)
                     except (ModelUnavailable, CaptchaRequired):
                         raise
@@ -1043,6 +1135,7 @@ class WorkflowManager:
                         raise
                     questions = unresolved_application_questions(form, result)
                     if questions:
+                        vacancy.data = {**(vacancy.data or {}), "application_unanswered_questions": questions}
                         vacancy.state = "UNKNOWN"
                         counters = dict(item.counters)
                         counters["errors"] = counters.get("errors", 0) + 1

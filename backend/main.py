@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.api.router import router as api_router
 from backend.api.router import session_socket
+from backend.api.session_draft import router as session_draft_router
 from backend.browser.sessions import close_browser, open_browsers
 from backend.config import settings
 from backend.orchestrator.workflow import recover_orphaned_sessions, workflow_manager
@@ -18,6 +19,12 @@ from backend.persistence.database import init_database
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_database()
+    from backend.persistence.database import SessionLocal
+    from backend.services.profile_memory import collect_finished_sessions
+
+    with SessionLocal() as db:
+        collect_finished_sessions(db)
+        db.commit()
     recover_orphaned_sessions()
     try:
         yield
@@ -32,6 +39,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Job Application Orchestrator", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
 app.include_router(api_router)
+app.include_router(session_draft_router)
 
 # Keep the SPA fallback from masking misspelled or removed API endpoints.
 @app.get("/api/{path:path}", include_in_schema=False)

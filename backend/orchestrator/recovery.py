@@ -41,7 +41,7 @@ class RecoveryAdapter:
                     await self._captcha(args[0])
                 raise
             if args and (name.startswith("collect_") or name in {
-                "open_application", "fill_application", "submit_application", "verify_submission",
+                "open_application", "prepare_application", "read_application", "fill_application", "submit_application", "verify_submission",
             }):
                 await self._captcha(args[0])
             if name in {"collect_job_refs", "collect_more_job_refs"}:

@@ -126,11 +126,12 @@ async def test_extract_job_reads_hh_structured_attributes():
         locators.WORK_SCHEDULE: "График: 5/2",
         locators.WORKING_HOURS: "Рабочие часы: 8",
         locators.WORK_FORMAT: "Формат работы: удалённо",
+        locators.LOCATION: "Москва, улица Вавилова, 19",
     }
     job = await HHAdapter().extract_job(Page(values))
     assert job.model_dump(include={
         "payment_frequency", "required_experience", "employment_type",
-        "hiring_format", "work_schedule", "working_hours", "work_format",
+        "hiring_format", "work_schedule", "working_hours", "work_format", "location",
     }) == {
         "payment_frequency": "Выплаты: два раза в месяц",
         "required_experience": "Опыт работы: 1–3 года",
@@ -139,6 +140,7 @@ async def test_extract_job_reads_hh_structured_attributes():
         "work_schedule": "График: 5/2",
         "working_hours": "Рабочие часы: 8",
         "work_format": "Формат работы: удалённо",
+        "location": "Москва, улица Вавилова, 19",
     }
 
 

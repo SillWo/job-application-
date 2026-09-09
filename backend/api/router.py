@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse, urlunparse
 
-import httpx
 from fastapi import (
     APIRouter,
     Depends,
@@ -37,7 +36,13 @@ from backend.browser.sessions import (
 )
 from backend.config import settings
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
-from backend.intelligence.model_config import validate_base_url
+from backend.intelligence.model_config import (
+    auth_headers,
+    is_local_url,
+    model_http_client,
+    normalize_base_url,
+    validate_base_url,
+)
 from backend.orchestrator.workflow import workflow_manager
 from backend.persistence.crypto import decrypt_secret, encrypt_secret
 from backend.persistence.database import get_db
@@ -49,6 +54,7 @@ from backend.persistence.models import (
     JobSession,
     Notification,
     Resume,
+    SessionQuestion,
     Vacancy,
 )
 from backend.schemas.domain import (
@@ -115,9 +121,9 @@ def get_model_settings(db: Session = Depends(get_db)):
 
 
 async def _models(base_url: str, key: str) -> list[str]:
-    async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+    async with model_http_client(base_url, 15) as client:
         response = await client.get(
-            base_url.rstrip("/") + "/models", headers={"Authorization": "Bearer " + key}
+            normalize_base_url(base_url) + "/models", headers=auth_headers(key)
         )
         response.raise_for_status()
         if (
@@ -141,6 +147,30 @@ async def _models(base_url: str, key: str) -> list[str]:
     return sorted(models)
 
 
+def _model_connection(
+    payload: ModelModelsIn | ModelSettingsIn, item: AIModelSettings | None,
+) -> tuple[str, str]:
+    try:
+        base = validate_base_url(
+            payload.base_url,
+            (settings.openai_base_url, item.base_url if item else ""),
+        )
+    except ValueError as exc:
+        # Validation messages are authored locally and contain no key/server body.
+        raise HTTPException(400, str(exc)) from exc
+    key = payload.api_key
+    if not key and item and item.encrypted_api_key and normalize_base_url(item.base_url) == base:
+        try:
+            key = decrypt_secret(item.encrypted_api_key)
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                400, "Не удалось прочитать сохранённый API ключ. Введите ключ заново на этом компьютере.",
+            ) from exc
+    if not key and not is_local_url(base):
+        raise HTTPException(400, "API ключ не задан")
+    return base, key or ""
+
+
 @router.post("/model/models")
 async def list_model_models(
     payload: ModelModelsIn, request: Request, db: Session = Depends(get_db)
@@ -148,16 +178,10 @@ async def list_model_models(
     _check_model_origin(request)
     try:
         item = db.get(AIModelSettings, 1)
-        base = validate_base_url(
-            payload.base_url,
-            (settings.openai_base_url, item.base_url if item else ""),
-        )
-        key = payload.api_key or (
-            decrypt_secret(item.encrypted_api_key) if item else ""
-        )
-        if not key:
-            raise ValueError("API ключ не задан")
+        base, key = _model_connection(payload, item)
         return _no_store({"models": await _models(base, key)})
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(400, "Не удалось получить список моделей") from exc
 
@@ -169,29 +193,24 @@ async def save_model_settings(
     _check_model_origin(request)
     try:
         item = db.get(AIModelSettings, 1)
-        base = validate_base_url(
-            payload.base_url,
-            (settings.openai_base_url, item.base_url if item else ""),
-        )
-        key = payload.api_key or (decrypt_secret(item.encrypted_api_key) if item else "")
-        if not key:
-            raise ValueError("API ключ не задан")
-        models = await _models(base, key)
-        if payload.model not in models:
-            raise ValueError("Выбранная модель недоступна")
+        base, key = _model_connection(payload, item)
+        await ModelGateway(provider="openai_compat").check_connection(base, key, payload.model)
         if item is None:
             item = AIModelSettings(
-                id=1, base_url=base, model=payload.model, encrypted_api_key=encrypt_secret(key)
+                id=1, base_url=base, model=payload.model, encrypted_api_key=encrypt_secret(key) if key else ""
             )
             db.add(item)
         else:
+            if payload.api_key or normalize_base_url(item.base_url) != base:
+                item.encrypted_api_key = encrypt_secret(key) if key else ""
             item.base_url, item.model = base, payload.model
-            if payload.api_key:
-                item.encrypted_api_key = encrypt_secret(key)
         db.commit()
         return get_model_settings(db)
     except HTTPException:
         raise
+    except ModelUnavailable as exc:
+        db.rollback()
+        raise HTTPException(400, "Проверка генерации не пройдена. Проверьте адрес, ключ, имя модели и поддержку Chat Completions. " + str(exc)) from exc
     except Exception as exc:
         db.rollback()
         raise HTTPException(400, "Не удалось сохранить настройки модели") from exc
@@ -259,6 +278,7 @@ class SessionCreate(BaseModel):
     minimum_scores: dict[str, int | bool] | None = None
     adapter_id: str
     application_limit: int | None = Field(default=5, ge=1)
+    guaranteed_application: bool = False
 
     @classmethod
     def _minimum_limits(cls) -> dict[str, int]:
@@ -457,7 +477,6 @@ def create_profile(data: CandidateProfileData, db: Session = Depends(get_db)) ->
         education=[entry.model_dump() for entry in data.education],
         languages=[entry.model_dump() for entry in data.languages],
         driver_license=data.driver_license,
-        data=data.model_dump(),
     )
     db.add(item)
     db.commit()
@@ -471,6 +490,61 @@ def get_profile(profile_id: int, db: Session = Depends(get_db)) -> dict:
     if not item:
         raise HTTPException(404, "Профиль не найден")
     return serialize_profile(item, db)
+
+
+class QuestionAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    answer: str = Field(default="", max_length=4000)
+    skip: bool = False
+
+    @model_validator(mode="after")
+    def validate_answer(self):
+        self.answer = self.answer.strip()
+        if self.skip and self.answer or not self.skip and not self.answer:
+            raise ValueError("Введите ответ или пропустите вопрос")
+        return self
+
+
+@router.get("/profiles/{profile_id}/pending-questions")
+def pending_profile_questions(profile_id: int, db: Session = Depends(get_db)) -> list[dict]:
+    from backend.services.profile_memory import TERMINAL, can_remember
+
+    if not db.get(CandidateProfile, profile_id):
+        raise HTTPException(404, "Профиль не найден")
+    rows = db.execute(select(SessionQuestion, JobSession, Vacancy).join(JobSession, JobSession.id == SessionQuestion.session_id)
+                      .outerjoin(Vacancy, Vacancy.id == SessionQuestion.vacancy_id)
+                      .where(SessionQuestion.profile_id == profile_id, SessionQuestion.status == "pending", JobSession.status.in_(TERMINAL))
+                      .order_by(SessionQuestion.session_id.desc(), SessionQuestion.id)).all()
+    # Only unanswered interview prompts are public. Confirmed memory has no list/read route.
+    return [{"id": question.id, "session_id": session.id, "question": question.question,
+             "reason": question.reason, "options": question.options, "context": question.context,
+             "site": session.adapter_id, "vacancy_title": vacancy.title if vacancy else None,
+             "vacancy_url": vacancy.url if vacancy else None,
+             "can_answer": can_remember(question.question)} for question, session, vacancy in rows]
+
+
+@router.post("/profiles/{profile_id}/questions/{question_id}/answer")
+def answer_profile_question(profile_id: int, question_id: int, payload: QuestionAnswer, db: Session = Depends(get_db)) -> dict:
+    from backend.services.profile_memory import TERMINAL, save_user_answer
+
+    question = db.get(SessionQuestion, question_id)
+    if not question or question.profile_id != profile_id:
+        raise HTTPException(404, "Вопрос не найден")
+    session = db.get(JobSession, question.session_id)
+    if not session or session.status not in TERMINAL:
+        raise HTTPException(409, "Ответить можно после завершения сессии")
+    if question.status != "pending":
+        raise HTTPException(409, "Этот вопрос уже обработан")
+    if payload.skip:
+        question.status = "skipped"
+        question.answered_at = datetime.now(timezone.utc)
+    else:
+        try:
+            save_user_answer(db, question, payload.answer)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+    db.commit()
+    return {"ok": True}
 
 
 @router.patch("/profiles/{profile_id}")
@@ -576,6 +650,7 @@ def session_dict(item: JobSession) -> dict:
         "minimum_scores": item.minimum_scores or None,
         "adapter_id": item.adapter_id,
         "application_limit": item.application_limit,
+        "guaranteed_application": bool(item.guaranteed_application),
         "status": item.status,
         "counters": item.counters or {},
         "started_at": item.started_at.isoformat() if item.started_at else None,
@@ -598,6 +673,7 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         minimum_scores=payload.minimum_scores or None,
         adapter_id=payload.adapter_id,
         application_limit=payload.application_limit,
+        guaranteed_application=payload.guaranteed_application,
         status=SessionStatus.CREATED,
         counters={},
     )
@@ -662,6 +738,11 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     await close_browser(session_id)
+    from backend.services.profile_memory import collect_session_questions
+
+    db.refresh(item)
+    collect_session_questions(db, item)
+    db.commit()
     if item.adapter_id == "hirehi":
         workflow_manager.write_hirehi_report(session_id)
     if (getattr(item, "recovery", None) or {}).get("measurement_identity"):

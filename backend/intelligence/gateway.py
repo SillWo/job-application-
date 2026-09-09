@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import TypeVar
+from types import SimpleNamespace
+from typing import Literal, TypeVar
 
 import httpx
 from openai import APIError, AsyncOpenAI
@@ -15,6 +16,8 @@ from backend.persistence.database import SessionLocal
 from backend.persistence.models import AIModelSettings
 from backend.services.search_metrics import measure, record
 
+from .model_config import auth_headers, is_local_url, model_http_client, normalize_base_url
+from .openai_compat import create_completion
 from .prompts import ROLE_OPTIONS, ROLE_PROMPTS
 
 T = TypeVar("T", bound=BaseModel)
@@ -33,9 +36,15 @@ class ModelUnavailable(RuntimeError):
     pass
 
 
-def _safe_api_error_text(error: APIError) -> str:
+class ConnectionCheck(BaseModel):
+    result: Literal["ok"]
+
+
+def _safe_api_error_text(error: APIError, secret: str = "") -> str:
     """Return useful provider detail without exposing credentials."""
     detail = str(error).strip() or error.__class__.__name__
+    if secret:
+        detail = detail.replace(secret, "[REDACTED]")
     detail = re.sub(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+", r"\1[REDACTED]", detail)
     detail = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[REDACTED]", detail)
     detail = re.sub(r"\b(?:sk|sess|key)-[A-Za-z0-9_-]+\b", "[REDACTED]", detail)
@@ -55,6 +64,25 @@ def _schema_for_role(role: str, schema: type[BaseModel]) -> dict:
 
 def _schema_without_preference_matches(role: str, schema: type[BaseModel], payload: dict) -> dict:
     result = _schema_for_role(role, schema)
+    has_preferences = (
+        role == "resume_analyst"
+        and schema.__name__ == "ResumeAnalysis"
+        and isinstance(payload.get("preference_policy"), dict)
+    )
+    if has_preferences:
+        # FlagMatch has permissive Pydantic defaults for backwards-compatible
+        # persisted evaluations.  Model responses must use the complete
+        # contract, otherwise a missing confidence/evidence is silently
+        # converted into a negative match by the evaluator.
+        if "required" in result:
+            result["required"] = [
+                *result["required"],
+                *(["flag_matches"] if "flag_matches" not in result["required"] else []),
+            ]
+        flag_match = result.get("$defs", {}).get("FlagMatch")
+        if isinstance(flag_match, dict):
+            properties = flag_match.get("properties", {})
+            flag_match["required"] = list(properties)
     if role == "resume_analyst" and not payload.get("preference_policy"):
         result.get("properties", {}).pop("flag_matches", None)
         if "required" in result:
@@ -83,7 +111,26 @@ def _system_prompt_for_role(role: str, payload: dict) -> str:
     return prompt
 
 
-def _resume_analysis_missing_fields(parsed: BaseModel, require_flag_matches: bool = False) -> list[str]:
+def _preference_flag_ids(payload: dict) -> list[str]:
+    policy = payload.get("preference_policy")
+    if not isinstance(policy, dict):
+        return []
+    result: list[str] = []
+    for group in ("green_flags", "red_flags"):
+        flags = policy.get(group, [])
+        if not isinstance(flags, list):
+            continue
+        for flag in flags:
+            if isinstance(flag, dict) and isinstance(flag.get("id"), str):
+                result.append(flag["id"])
+    return result
+
+
+def _resume_analysis_missing_fields(
+    parsed: BaseModel,
+    require_flag_matches: bool = False,
+    expected_flag_ids: list[str] | None = None,
+) -> list[str]:
     if parsed.__class__.__name__ != "ResumeAnalysis":
         return []
     criteria = _RESUME_ANALYSIS_CRITERIA
@@ -110,8 +157,26 @@ def _resume_analysis_missing_fields(parsed: BaseModel, require_flag_matches: boo
             assessment.confidence <= 0 or not assessment.evidence
         ):
             missing.append(f"{field_name}.grounding")
-    if require_flag_matches and "flag_matches" not in parsed.model_fields_set:
-        missing.append("flag_matches")
+    if require_flag_matches:
+        if "flag_matches" not in parsed.model_fields_set:
+            missing.append("flag_matches")
+        else:
+            matches = getattr(parsed, "flag_matches", [])
+            expected = list(expected_flag_ids or [])
+            actual = [item.flag_id for item in matches]
+            duplicates = sorted({flag_id for flag_id in actual if actual.count(flag_id) > 1})
+            unknown = sorted(set(actual) - set(expected))
+            absent = [flag_id for flag_id in expected if flag_id not in actual]
+            if duplicates:
+                missing.append("flag_matches.duplicate=" + ",".join(duplicates))
+            if unknown:
+                missing.append("flag_matches.unknown=" + ",".join(unknown))
+            if absent:
+                missing.append("flag_matches.missing=" + ",".join(absent))
+            for index, item in enumerate(matches):
+                for field_name in ("flag_id", "matched", "confidence", "evidence", "explanation"):
+                    if field_name not in item.model_fields_set:
+                        missing.append(f"flag_matches[{index}].{field_name}")
     return missing
 
 
@@ -184,11 +249,17 @@ class ModelGateway:
                     "message": "Модель не настроена",
                 }
             try:
-                async with httpx.AsyncClient(timeout=3, follow_redirects=False) as client:
-                    key = decrypt_secret(config.encrypted_api_key)
+                async with model_http_client(config.base_url, 3) as client:
+                    key = decrypt_secret(config.encrypted_api_key) if config.encrypted_api_key else ""
                     response = await client.get(
-                        f"{config.base_url}/models", headers={"Authorization": f"Bearer {key}"},
+                        f"{normalize_base_url(config.base_url)}/models", headers=auth_headers(key),
                     )
+                    if response.status_code in {404, 405}:
+                        return {
+                            "connected": True, "model_available": False,
+                            "provider": "openai_compat", "model": config.model,
+                            "message": "Сервер не предоставляет список моделей. Для проверки ответа сохраните настройки.",
+                        }
                     response.raise_for_status()
                     data = response.json()
                     available = {
@@ -222,27 +293,46 @@ class ModelGateway:
             return await self._structured_openai(role, payload, schema)
         raise ValueError(f"Unsupported AI provider: {self.provider}")
 
-    async def _structured_openai(self, role: str, payload: dict, schema: type[T]) -> T:
+    async def check_connection(self, base_url: str, key: str, model: str) -> None:
+        await self._structured_openai(
+            "connection_check", {"request": "Return result ok."}, ConnectionCheck,
+            connection=(base_url, key, model),
+        )
+
+    async def _structured_openai(
+        self, role: str, payload: dict, schema: type[T],
+        *, connection: tuple[str, str, str] | None = None,
+    ) -> T:
         """Call an OpenAI-compatible API endpoint to get a structured response."""
         try:
-            config = self._saved_config()
-            key = decrypt_secret(config.encrypted_api_key) if config else ""
+            if connection is not None:
+                base_url, key, model = connection
+                config = SimpleNamespace(base_url=base_url, model=model)
+            else:
+                config = self._saved_config()
+                key = decrypt_secret(config.encrypted_api_key) if config and config.encrypted_api_key else ""
         except (RuntimeError, ValueError):
             config, key = None, ""
-        if config is None or not key:
+        if config is None or (not key and not is_local_url(config.base_url)):
             raise ModelUnavailable("Модель не настроена или ключ недоступен")
+        transport = model_http_client(config.base_url, settings.openai_timeout)
         client = AsyncOpenAI(
-            base_url=config.base_url,
+            base_url=normalize_base_url(config.base_url),
             api_key=key,
             timeout=settings.openai_timeout,
+            http_client=transport,
+            max_retries=0,
         )
         json_schema = _schema_without_preference_matches(role, schema, payload)
-        system_prompt = _system_prompt_for_role(role, payload)
-        opts = ROLE_OPTIONS[role]
+        system_prompt = (
+            'Return only JSON: {"result":"ok"}.' if role == "connection_check"
+            else _system_prompt_for_role(role, payload)
+        )
+        opts = {"num_predict": 128} if role == "connection_check" else ROLE_OPTIONS[role]
         attempts = 4 if role == "resume_analyst" else (
             4 if role == "profile" and schema.__name__ == "ResumeImportData" else 2
         )
-        request_timeout = 300 if role == "profile" else 180
+        request_timeout = 45 if role == "connection_check" else (300 if role == "profile" else 180)
 
         async with self._lock:
             messages: list[dict] = [
@@ -253,7 +343,8 @@ class ModelGateway:
             validation_error = "unknown validation error"
             try:
                 for attempt in range(attempts):
-                    response = await client.chat.completions.create(
+                    response = await create_completion(
+                        client,
                         model=config.model,
                         messages=messages,  # type: ignore[arg-type]
                         temperature=opts.get("temperature", 0.1),
@@ -294,6 +385,7 @@ class ModelGateway:
                             missing_analysis = _resume_analysis_missing_fields(
                                 parsed,
                                 require_flag_matches=("preference_policy" in payload and isinstance(payload.get("preference_policy"), dict)),
+                                expected_flag_ids=_preference_flag_ids(payload),
                             )
                             if missing_analysis:
                                 raise ValueError(
@@ -369,8 +461,10 @@ class ModelGateway:
                 raise
             except APIError as exc:
                 raise ModelUnavailable(
-                    f"OpenAI-compat API недоступен: {_safe_api_error_text(exc)}"
+                    f"OpenAI-compat API недоступен: {_safe_api_error_text(exc, key)}"
                 ) from exc
+            finally:
+                await transport.aclose()
 
     @staticmethod
     def _saved_config():
@@ -378,6 +472,17 @@ class ModelGateway:
             return db.get(AIModelSettings, 1)
 
     def _mock(self, role: str, payload: dict, schema: type[T]) -> T:
+        if role == "application_answers":
+            # Offline mock never invents candidate facts or silently solves assessments.
+            return schema.model_validate({"answers": []})
+        if role == "application_salary_rules":
+            return schema.model_validate({"has_salary_rules": False, "rules": []})
+        if role == "application_salary_selection":
+            return schema.model_validate({"rule_index": None, "context_complete": False,
+                                          "confidence": 0, "vacancy_evidence": [],
+                                          "reason": "Mock не интерпретирует условия зарплаты"})
+        if role == "adaptive_search_planner":
+            return schema.model_validate({"queries": []})
         from backend.schemas.domain import (
             CoverLetterDraft,
             JobEvaluation,

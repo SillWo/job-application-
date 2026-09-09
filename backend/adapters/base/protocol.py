@@ -4,7 +4,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from backend.schemas.domain import ApplicationPlan, JobPosting
+from backend.schemas.domain import ApplicationField, ApplicationPlan, JobPosting
 
 
 class AdapterManifest(BaseModel):
@@ -40,6 +40,8 @@ class ApplicationRoute(BaseModel):
 class ApplicationForm(BaseModel):
     requires_cover_letter: bool = False
     questions: list[str] = Field(default_factory=list)
+    fields: list[ApplicationField] = Field(default_factory=list)
+    confirmation: Literal["foreign_country"] | None = None
     route: ApplicationRoute | None = None
     employer_contact: EmployerContact | None = None
     target_url: str | None = None
@@ -48,10 +50,11 @@ class ApplicationForm(BaseModel):
 class FillResult(BaseModel):
     success: bool
     unknown_questions: list[str] = Field(default_factory=list)
+    answered_fields: list[str] = Field(default_factory=list)
 
 
 class SubmissionResult(BaseModel):
-    status: Literal["submitted", "already_applied", "unknown", "blocked"]
+    status: Literal["submitted", "already_applied", "unknown", "blocked", "needs_input"]
     message: str
 
 

@@ -5,6 +5,8 @@ import { Toaster, toast } from "sonner";
 import { Popover } from "@base-ui/react/popover";
 import { Select } from "@base-ui/react/select";
 import { api } from "./api";
+import { SessionQuestions } from "./SessionQuestions";
+import { useSessionDraft } from "./useSessionDraft";
 import type {
   Adapter,
   Degree,
@@ -40,44 +42,6 @@ const VACANCY_FILTER_CRITERIA = [
   { key: "special_requirements", title: "Особые требования", max: 10 },
 ] as const;
 
-const SESSION_DRAFT_STORAGE_KEY = "job-orchestrator.session-draft";
-type SessionDraft = {
-  adapter: string;
-  applicationLimit: string;
-  desiredJobDescription: string;
-  unlimitedApplications: boolean;
-  influence: Record<string, InfluenceLevel>;
-};
-
-function readSessionDraft(): Partial<SessionDraft> {
-  try {
-    const raw = window.localStorage.getItem(SESSION_DRAFT_STORAGE_KEY);
-    if (!raw) return {};
-    const value: unknown = JSON.parse(raw);
-    if (!value || typeof value !== "object") return {};
-    const candidate = value as Record<string, unknown>;
-    const draft: Partial<SessionDraft> = {};
-    if (candidate.adapter === "hh" || candidate.adapter === "hirehi" || candidate.adapter === "zarplata") draft.adapter = candidate.adapter;
-    for (const key of ["applicationLimit", "desiredJobDescription"] as const) {
-      if (typeof candidate[key] === "string") draft[key] = candidate[key];
-    }
-    for (const key of ["unlimitedApplications"] as const) {
-      if (typeof candidate[key] === "boolean") draft[key] = candidate[key];
-    }
-    if (candidate.influence && typeof candidate.influence === "object") {
-      const influence: Record<string, InfluenceLevel> = {};
-      for (const key of ["tasks", "skills", "experience_depth", "role_match", "industry"]) {
-        const level = (candidate.influence as Record<string, unknown>)[key];
-        if (level === "low" || level === "medium" || level === "high" || level === "maximum") influence[key] = level;
-      }
-      draft.influence = influence;
-    }
-    return draft;
-  } catch {
-    return {};
-  }
-}
-
 const INFLUENCE_CRITERIA = [
   { key: "tasks", title: "Задачи", levels: ["Низкий", "Средний", "Высокий", "Максимальный"], hint: `ИИ оценивает сходство задач и обязанностей из вакансии с вашим резюме. Чем выше фактор — тем выше должно быть сходство, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит` },
   { key: "skills", title: "Навыки", levels: ["Низкий", "Высокий"], hint: `ИИ оценивает насколько ваш набор навыков соответствует требованиям вакансии. Чем выше фактор — тем выше должно быть сходство, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит` },
@@ -86,7 +50,6 @@ const INFLUENCE_CRITERIA = [
   { key: "industry", title: "Сфера", levels: ["Низкий", "Средний", "Высокий", "Максимальный"], hint: `ИИ оценивает сходство вакансии и ваших прошлых мест работы по сфере. Чем выше фактор — тем выше должно быть сходство, иначе REJECT!*\n* — ИИ на вакансию отклик не отправит` },
 ] as const;
 const INFLUENCE_LEVELS = ["low", "medium", "high", "maximum"] as const;
-type InfluenceLevel = (typeof INFLUENCE_LEVELS)[number];
 
 function presentationBreakdown(rows: ScoreComponent[]): ScoreComponent[] {
   return RELEVANCE_CRITERIA.map((criterion) => {
@@ -187,7 +150,7 @@ function vacancyExportUrl(filters: VacancyFilters, format: "csv" | "xlsx" | "xml
 }
 function humanStatus(value: string) { return STATUS_META[value]?.label ?? value.replaceAll("_", " ").toLowerCase(); }
 const VACANCY_STATUS_OPTIONS = [
-  { value: "EVALUATING", label: "Оценка вакансии" }, { value: "REJECTED_BY_MODEL", label: "Отклонена моделью" }, { value: "REPORTED", label: "В отчёте" }, { value: "ERROR", label: "Ошибка" },
+  { value: "EVALUATING", label: "Оценка вакансии" }, { value: "REJECTED_BY_MODEL", label: "Отклонена моделью" }, { value: "SUBMITTED", label: "Отклик отправлен" }, { value: "REPORTED", label: "В отчёте" }, { value: "ERROR", label: "Ошибка" },
 ] as const;
 function vacancyOutcome(value: string) {
   if (value === "SUBMITTED") return "Отклик действительно отправлен после положительной оценки вакансии.";
@@ -692,6 +655,7 @@ function ProfilePage() {
 }
 
 function SessionPage() {
+  const [guaranteedApplication, setGuaranteedApplication] = useState(false);
   const qc = useQueryClient();
   const profiles = useQuery({
     queryKey: ["profiles"],
@@ -714,19 +678,9 @@ function SessionPage() {
     sessionProfile &&
       sessionResumes.data?.some((resume) => resume.selected_for_matching),
   );
-  const [adapter, setAdapter] = useState(() => readSessionDraft().adapter || "hh");
+  const { draft, updateDraft, status: draftStatus, conflict: draftConflict, loadSaved } = useSessionDraft();
+  const { adapter, applicationLimit, desiredJobDescription, unlimitedApplications, influence } = draft;
   const blockedByAdapter = (sessions.data ?? []).some((session) => session.adapter_id === adapter && !terminalStatuses.includes(session.status));
-  const [applicationLimit, setApplicationLimit] = useState(() => readSessionDraft().applicationLimit || "5");
-  const [desiredJobDescription, setDesiredJobDescription] = useState(() => readSessionDraft().desiredJobDescription || "");
-  const [unlimitedApplications, setUnlimitedApplications] = useState(() => readSessionDraft().unlimitedApplications || false);
-  const [influence, setInfluence] = useState<Record<string, InfluenceLevel>>(() => ({ tasks: "medium", skills: "low", experience_depth: "medium", role_match: "medium", industry: "medium", ...readSessionDraft().influence }));
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(SESSION_DRAFT_STORAGE_KEY, JSON.stringify({ adapter, applicationLimit, desiredJobDescription, unlimitedApplications, influence }));
-    } catch {
-      // Storage may be unavailable in private browsing; the form remains usable.
-    }
-  }, [adapter, applicationLimit, desiredJobDescription, unlimitedApplications, influence]);
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"neutral" | "success" | "warning" | "danger" | "info">("neutral");
   const validLimit = (value: string, unlimited: boolean) =>
@@ -739,6 +693,7 @@ function SessionPage() {
         body: JSON.stringify({
           profile_id: profiles.data?.[0]?.id,
           adapter_id: adapter,
+          guaranteed_application: guaranteedApplication,
           application_limit: unlimitedApplications ? null : Number(applicationLimit),
           desired_job_description: desiredJobDescription.trim(),
           minimum_scores: { ...Object.fromEntries(Object.entries(influence).map(([key, level]) => [key, INFLUENCE_LEVELS.indexOf(level) + 1])), special_requirements: 1 },
@@ -791,12 +746,12 @@ function SessionPage() {
         <article className="panel form">
           <span className="eyebrow">НОВАЯ СЕССИЯ</span>
           <div className="row session-top-row">
-            <SingleSelect label="Сайт" options={[['hh', 'HH.ru'], ...(adapters.data ?? []).filter((item) => item.site_id !== "hh").map((item) => [item.site_id, item.display_name] as const)]} value={adapter} onValueChange={setAdapter} />
+            <SingleSelect label="Сайт" options={[['hh', 'HH.ru'], ...(adapters.data ?? []).filter((item) => item.site_id !== "hh").map((item) => [item.site_id, item.display_name] as const)]} value={adapter} onValueChange={(adapter) => updateDraft({ adapter })} />
             <label>
               Лимит вакансий в работе
-              <input aria-label="Лимит вакансий в работе" type="number" min="1" step="1" value={applicationLimit} disabled={unlimitedApplications} onChange={(e) => setApplicationLimit(e.target.value)} />
+              <input aria-label="Лимит вакансий в работе" type="number" min="1" step="1" value={applicationLimit} disabled={unlimitedApplications} onChange={(e) => updateDraft({ applicationLimit: e.target.value })} />
               <small>{adapter === "hirehi" ? "Считаются выбранные вакансии." : "Считаются отклики, подтверждённые выбранной площадкой."}</small>
-              <span className="checkline"><input aria-label={adapter === "hirehi" ? "Без ограничений: выбранные вакансии" : "Без ограничений: отправка откликов"} type="checkbox" checked={unlimitedApplications} onChange={(e) => setUnlimitedApplications(e.target.checked)} />Без ограничений</span>
+              <span className="checkline"><input aria-label={adapter === "hirehi" ? "Без ограничений: выбранные вакансии" : "Без ограничений: отправка откликов"} type="checkbox" checked={unlimitedApplications} onChange={(e) => updateDraft({ unlimitedApplications: e.target.checked })} />Без ограничений</span>
             </label>
           </div>
           <label className="profile-full-field session-description-field">
@@ -806,10 +761,12 @@ function SessionPage() {
               maxLength={2000}
               rows={5}
               value={desiredJobDescription}
-              onChange={(event) => setDesiredJobDescription(event.target.value)}
+              onChange={(event) => updateDraft({ desiredJobDescription: event.target.value })}
               placeholder="Опишите желательные и нежелательные факторы вакансии"
             />
             <small>{desiredJobDescription.length} / 2000 символов</small>
+            <small role="status">{draftStatus}</small>
+            {draftConflict && <button type="button" className="secondary" onClick={() => void loadSaved()}>Заменить форму сохранённой копией</button>}
           </label>
           <section className="influence-section" aria-labelledby="influence-heading">
             <h3 id="influence-heading">Влияние факторов на вакансии</h3>
@@ -822,12 +779,16 @@ function SessionPage() {
               return <div className="influence-control" key={criterion.key}>
                 <div className="influence-control-head"><strong>{criterion.title}</strong><span className="tooltip-wrap"><button type="button" className="question-button" aria-label={`Подсказка: ${criterion.title}`} data-tooltip={criterion.hint}>?</button><span className="tooltip" role="tooltip"><span>{criterion.hint.split('\n')[0]}</span><em>{criterion.hint.split('\n')[1]}</em></span><span className="sr-only">{criterion.hint}</span></span></div>
                 <div className="influence-axis">
-                  <input className="influence-range" style={{ '--range-progress': `${levelIndex / (max - 1) * 100}%` } as React.CSSProperties} type="range" min="1" max={max} step="1" value={levelIndex + 1} aria-label={`Уровень влияния: ${criterion.title}`} aria-valuetext={levels[levelIndex]} onChange={(event) => setInfluence((current) => ({ ...current, [criterion.key]: INFLUENCE_LEVELS[Number(event.target.value) - 1] }))} />
+                  <input className="influence-range" style={{ '--range-progress': `${levelIndex / (max - 1) * 100}%` } as React.CSSProperties} type="range" min="1" max={max} step="1" value={levelIndex + 1} aria-label={`Уровень влияния: ${criterion.title}`} aria-valuetext={levels[levelIndex]} onChange={(event) => updateDraft({ influence: { ...influence, [criterion.key]: INFLUENCE_LEVELS[Number(event.target.value) - 1] } })} />
                   <div className="influence-levels" aria-hidden="true">{levels.map((level, index) => <span key={level} style={{ '--level-position': `${index / (max - 1) * 100}%` } as React.CSSProperties}>{level}</span>)}</div>
                 </div>
               </div>;
             })}
           </section>
+          <div className="guaranteed-mode">
+            <label className="checkline"><input type="checkbox" checked={guaranteedApplication} onChange={(event) => setGuaranteedApplication(event.target.checked)} />Гарантированный отклик</label>
+            <small>ИИ сможет дополнять ответы правдоподобными сведениями, которых нет в резюме. Режим не гарантирует отправку отклика или оффер.</small>
+          </div>
           <button type="button" className="primary"
             onClick={() => create.mutate()}
             disabled={!profileReady || create.isPending || !limitsAreValid || blockedByAdapter}
@@ -873,6 +834,7 @@ function SessionCard({ session, formatSessionLimit, action }: { session: JobSess
               <h2>
                 <Status value={session.status} />
               </h2>
+              {session.guaranteed_application && <p>Гарантированный отклик включён</p>}
               <p>
                 {session.stop_reason ||
                   "Обработка вакансий идёт последовательно"}
@@ -1058,13 +1020,13 @@ function ModelPage() {
   const [loadingModels, setLoadingModels] = useState(false);
   const [saving, setSaving] = useState(false);
   useEffect(() => { if (settings.data) { setBaseUrl(settings.data.base_url || ""); setModel(settings.data.model || ""); } }, [settings.data]);
-  const loadModels = async () => { setLoadingModels(true); setMessageTone("neutral"); setMessage(""); try { const result = await api<{ models: string[] }>("/model/models", { method: "POST", body: JSON.stringify({ base_url: baseUrl, ...(apiKey ? { api_key: apiKey } : {}) }) }); setModels(result.models); setMessageTone("success"); if (result.models.length) setModel(result.models[0]); setMessage(`Доступно моделей: ${result.models.length}`); toast.success(`Доступно моделей: ${result.models.length}`); } catch (error) { const message = error instanceof Error ? error.message : "Не удалось загрузить модели"; setMessageTone("danger"); setMessage(message); toast.error(message); } finally { setLoadingModels(false); } };
-  const save = async () => { setSaving(true); try { await api("/model/settings", { method: "PUT", body: JSON.stringify({ base_url: baseUrl, model, ...(apiKey ? { api_key: apiKey } : {}) }) }); setApiKey(""); setMessageTone("success"); setMessage("Настройки сохранены"); toast.success("Настройки сохранены"); void qc.invalidateQueries({ queryKey: ["model-settings"] }); void qc.invalidateQueries({ queryKey: ["model-status"] }); } catch (error) { const message = error instanceof Error ? error.message : "Не удалось сохранить настройки"; setMessageTone("danger"); setMessage(message); toast.error(message); } finally { setSaving(false); } };
+  const loadModels = async () => { setLoadingModels(true); setMessageTone("neutral"); setMessage(""); try { const result = await api<{ models: string[] }>("/model/models", { method: "POST", body: JSON.stringify({ base_url: baseUrl, ...(apiKey ? { api_key: apiKey } : {}) }) }); setModels(result.models); setMessageTone("success"); if (result.models.length && !result.models.includes(model)) setModel(result.models[0]); setMessage(`Доступно моделей: ${result.models.length}`); toast.success(`Доступно моделей: ${result.models.length}`); } catch (error) { const message = error instanceof Error ? error.message : "Не удалось загрузить модели"; setMessageTone("danger"); setMessage(message); toast.error(message); } finally { setLoadingModels(false); } };
+  const save = async () => { setSaving(true); try { await api("/model/settings", { method: "PUT", body: JSON.stringify({ base_url: baseUrl, model, ...(apiKey ? { api_key: apiKey } : {}) }) }); setApiKey(""); setMessageTone("success"); setMessage("Модель ответила корректно. Настройки сохранены"); toast.success("Настройки сохранены"); void qc.invalidateQueries({ queryKey: ["model-settings"] }); void qc.invalidateQueries({ queryKey: ["model-status"] }); } catch (error) { const message = error instanceof Error ? error.message : "Не удалось сохранить настройки"; setMessageTone("danger"); setMessage(message); toast.error(message); } finally { setSaving(false); } };
   return (
     <section className="page">
       <Title
-        eyebrow="ОБЛАЧНАЯ МОДЕЛЬ"
-        note="Одна облачная модель обслуживает несколько строго типизированных ролей."
+        eyebrow="ПОДКЛЮЧЕНИЕ МОДЕЛИ"
+        note="Подключите OpenAI, совместимый облачный сервис или локальный сервер."
       >
         OpenAI API
       </Title>
@@ -1076,9 +1038,9 @@ function ModelPage() {
           <Status value={q.data?.connected ? "CONNECTED" : "DISCONNECTED"} />
           <h2>{q.data?.model || "Модель не указана"}</h2>
           <p>
-            {q.data?.model_available
-              ? "Модель готова к structured outputs."
-              : "Проверьте OpenAI API URL и ключ в конфигурации приложения."}
+            {q.data?.message || (q.data?.model_available
+              ? "Модель найдена в списке сервера. При сохранении проверяется её ответ."
+              : "Проверьте OpenAI API URL и ключ в конфигурации приложения.")}
           </p>
           <code>Ключ хранится в защищённом хранилище DPAPI</code>
         </div>
@@ -1087,11 +1049,14 @@ function ModelPage() {
         </button>
       </article>
       <article className="panel model-settings">
-        <label>Base URL (HTTPS или настроенный локальный gateway)<input value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setModels([]); setMessage(""); }} placeholder="https://api.openai.com/v1" inputMode="url" /></label>
+        <label>Base URL (HTTPS или локальный сервер)<input value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setModels([]); setMessage(""); }} placeholder="https://api.openai.com/v1" inputMode="url" /></label>
         <label>API-ключ<input type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setModels([]); setMessage(""); }} autoComplete="new-password" placeholder={settings.data?.has_api_key ? "Сохранённый ключ не отображается" : "Введите ключ"} /></label>
         {settings.data?.has_api_key && <small>Сохранён: {settings.data.masked_key}. Ключ не показывается.</small>}
+        {models.length === 0 && <label>Модель<input value={model} onChange={(event) => setModel(event.target.value)} placeholder="Точное имя модели из настроек сервера" /></label>}
         {models.length > 0 && <SingleSelect label="Модель" options={models.map((name) => [name, name] as const)} value={model} onValueChange={setModel} />}
-        <div className="model-settings-actions"><button type="button" className="secondary" onClick={() => void loadModels()} disabled={!baseUrl || loadingModels}>{loadingModels ? "Загрузка…" : "Загрузить модели"}</button><button type="button" className="primary" onClick={() => void save()} disabled={saving || !model || models.length === 0}>{saving ? "Сохранение…" : "Сохранить изменения"}</button></div>
+        <small>Для локального сервера укажите порт и путь API, например http://127.0.0.1:8045/v1. Адрес 0.0.0.0 будет заменён на 127.0.0.1. Если сервер не требует ключа, оставьте поле пустым. При смене сервиса введите его ключ заново.</small>
+        <small>Если список недоступен, введите имя модели вручную. Сохранение отправит короткий тестовый запрос: сервис может списать токены.</small>
+        <div className="model-settings-actions"><button type="button" className="secondary" onClick={() => void loadModels()} disabled={!baseUrl || loadingModels}>{loadingModels ? "Загрузка…" : "Загрузить модели"}</button><button type="button" className="primary" onClick={() => void save()} disabled={saving || !baseUrl || !model.trim()}>{saving ? "Проверка модели…" : "Сохранить изменения"}</button></div>
         {message && <Notice tone={messageTone}>{message}</Notice>}
       </article>
     </section>
@@ -1101,6 +1066,7 @@ function ModelPage() {
 export default function App() {
   return (
     <Shell>
+      <SessionQuestions />
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/profile" element={<ProfilePage />} />

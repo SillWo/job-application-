@@ -142,6 +142,58 @@ def _has_explicit_special_requirements(job: JobPosting) -> bool:
     return bool(_SPECIAL_REQUIREMENT.search(source))
 
 
+def _job_grounding_text(job: JobPosting) -> str:
+    """Return all vacancy text that can support a preference match."""
+    structured_fields = (
+        "payment_frequency", "required_experience", "employment_type",
+        "hiring_format", "work_schedule", "working_hours", "work_format",
+    )
+    return " ".join(
+        [
+            job.title,
+            job.description,
+            *job.responsibilities,
+            *job.required_skills,
+            *job.optional_skills,
+            *(str(getattr(job, field)) for field in structured_fields if getattr(job, field, None)),
+        ]
+    ).casefold()
+
+
+def _red_flag_safety_issue(
+    analysis: ResumeAnalysis,
+    job: JobPosting,
+    policy: DesiredJobPolicy,
+) -> bool:
+    """Detect red flag results that cannot safely clear a vacancy for apply."""
+    red_ids = {flag.id for flag in policy.red_flags}
+    if not red_ids:
+        return False
+    matches = analysis.flag_matches
+    actual_ids = [item.flag_id for item in matches]
+    if any(actual_ids.count(flag_id) > 1 for flag_id in red_ids):
+        return True
+    if any(flag_id not in {flag.id for flag in [*policy.green_flags, *policy.red_flags]} for flag_id in actual_ids):
+        return True
+    by_id = {item.flag_id: item for item in matches if item.flag_id in red_ids}
+    if set(by_id) != red_ids:
+        return True
+    job_text = _job_grounding_text(job)
+    for item in by_id.values():
+        # A false result with confidence 0 is also not a reliable clearance:
+        # old persisted evaluations used exactly that shape after defaulting.
+        if item.confidence < FLAG_CONFIDENCE_THRESHOLD:
+            return True
+        if item.matched and not any(
+            _quote_grounded(str(quote), job_text) for quote in item.evidence
+        ):
+            return True
+        fields = getattr(item, "model_fields_set", set())
+        if not {"flag_id", "matched", "confidence", "evidence"}.issubset(fields):
+            return True
+    return False
+
+
 _FOREIGN_LANGUAGE = (
     r"(?:английск\w*|english|немецк\w*|german|французск\w*|french|"
     r"испанск\w*|spanish|китайск\w*|chinese|итальянск\w*|italian|"
@@ -202,17 +254,7 @@ def _ground_resume_analysis(
     profile: Any,
     resumes: Sequence[Any],
 ) -> ResumeAnalysis:
-    structured_job_fields = [
-        str(getattr(job, field))
-        for field in (
-            "payment_frequency", "required_experience", "employment_type",
-            "hiring_format", "work_schedule", "working_hours", "work_format",
-        )
-        if getattr(job, field, None)
-    ]
-    job_source = " ".join(
-        [job.title, job.description, *job.responsibilities, *job.required_skills, *structured_job_fields]
-    )
+    job_source = _job_grounding_text(job)
     resume_source = " ".join(
         [str(_payload(profile)), *[str(_payload(item)) for item in resumes]]
     )
@@ -290,23 +332,22 @@ async def evaluate(
                 raise ValueError(f"Minimum for {key} must be 1..{maximum}")
             effective_minimums[key] = value
 
+    policy = DesiredJobPolicy.model_validate(preference_policy or {})
     payload = {
         "job": job.model_dump(mode="json"),
         "profile": _payload(profile),
         "resumes": [_payload(resume) for resume in resumes],
     }
     if preference_policy:
-        payload["preference_policy"] = _payload(preference_policy)
+        payload["preference_policy"] = policy.model_dump(mode="json")
 
     analysis = await gateway.structured("resume_analyst", payload, ResumeAnalysis)
 
     # Keep the project's deterministic safety layer unchanged.
     analysis = _ground_resume_analysis(analysis, job, profile, resumes)
-    policy = DesiredJobPolicy.model_validate(preference_policy or {})
-    if preference_policy:
-        payload["preference_policy"] = policy.model_dump(mode="json")
-    job_text = " ".join([job.title, job.description, *job.responsibilities, *job.required_skills]).casefold()
+    job_text = _job_grounding_text(job)
     known = {flag.id: flag for flag in [*policy.green_flags, *policy.red_flags]}
+    red_safety_issue = _red_flag_safety_issue(analysis, job, policy) if preference_policy else False
     matches: list[FlagMatch] = []
     seen_ids: set[str] = set()
     for match in analysis.flag_matches:
@@ -362,12 +403,16 @@ async def evaluate(
             blockers.append("вакансия не соответствует описанию желаемой работы")
         if salary_hit:
             blockers.append("условия оплаты не соответствуют ожиданиям")
+        if red_safety_issue:
+            blockers.append("результат проверки красных флагов требует ручной проверки")
         reason = f"{reason.rstrip('.')} Вакансия не рекомендована: {', '.join(blockers)}."
+    elif red_safety_issue:
+        reason = f"{reason.rstrip('.')} Нужна ручная проверка условий перед откликом."
     else:
         reason = f"{reason.rstrip('.')} Вакансия подходит для отклика."
 
     return JobEvaluation(
-        decision="apply" if not blocked else "skip",
+        decision="skip" if blocked else ("manual_review" if red_safety_issue else "apply"),
         score=score,
         confidence=max((item.confidence for item in assessments), default=0),
         category=analysis.category or job.title,
@@ -375,8 +420,11 @@ async def evaluate(
         minimum_score_violations=minimum_score_violations,
         hard_rule_violations=[f"minimum_score:{item}" for item in minimum_score_violations]
         + (["preference_red_flag"] if red_hit else [])
+        + (["preference_red_flag_unverified"] if red_safety_issue else [])
         + (["salary_below_preference"] if salary_hit else []),
         flag_matches=matches,
+        preference_flags_verified=bool(preference_policy) and not red_safety_issue,
+        requires_manual_review=red_safety_issue and not blocked,
         reason=reason,
         has_test_assignment=bool(job.has_test_assignment),
     )

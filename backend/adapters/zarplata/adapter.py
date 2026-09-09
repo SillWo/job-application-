@@ -13,7 +13,7 @@ from backend.adapters.base.protocol import (
     LoginState,
     SubmissionResult,
 )
-from backend.schemas.domain import ApplicationPlan, JobPosting
+from backend.schemas.domain import ApplicationField, ApplicationPlan, JobPosting
 
 from . import locators
 
@@ -481,6 +481,7 @@ class ZarplataAdapter:
                 or await page.locator(locators.COVER_LETTER_INPUT).count()
             ),
             questions=questions,
+            fields=getattr(self, "_application_fields", []),
         )
 
     async def fill_application(self, page, plan: ApplicationPlan) -> FillResult:
@@ -495,7 +496,20 @@ class ZarplataAdapter:
         if plan.cover_letter and await letter_input.count():
             await letter_input.fill(plan.cover_letter)
         unanswered = await self._application_questions(page)
-        return FillResult(success=not unanswered, unknown_questions=unanswered)
+        answered = []
+        controls = page.locator(locators.APPLICATION_CONTROL)
+        for field in getattr(self, "_application_fields", []):
+            answer = plan.form_answers.get(field.id)
+            if not answer or answer.field != field or len(answer.values) != 1 or field.kind == "unsupported":
+                continue
+            control = controls.nth(int(field.id.removeprefix("zarplata-control-")))
+            await control.fill(answer.values[0])
+            if await control.input_value() == answer.values[0]:
+                answered.append(field.id)
+        pending_fields = [field.label for field in getattr(self, "_application_fields", []) if field.id not in answered]
+        return FillResult(success=not pending_fields and (bool(answered) or not unanswered),
+                          unknown_questions=pending_fields or ([] if answered else unanswered),
+                          answered_fields=answered)
 
     async def _application_questions(self, page) -> list[str]:
         """Return visible employer questions that the agent cannot answer safely.
@@ -532,6 +546,7 @@ class ZarplataAdapter:
         self, page, task_prompts: list[str], label_prompts: list[str]
     ) -> list[str]:
         questions: list[str] = []
+        self._application_fields = []
         task_index = 0
         controls = page.locator(locators.APPLICATION_CONTROL)
         for index in range(await controls.count()):
@@ -578,8 +593,13 @@ class ZarplataAdapter:
                 if not prompt and is_task_control:
                     prompt = f"Обязательный вопрос работодателя ({name})"
 
-            if prompt and "сопровод" not in prompt.lower() and prompt not in questions:
-                questions.append(prompt)
+            if prompt and "сопровод" not in prompt.lower():
+                self._application_fields.append(ApplicationField(
+                    id=f"zarplata-control-{index}", label=prompt,
+                    kind="number" if control_type == "number" else "text" if control_type in {"", "text", "email", "tel", "url"} else "unsupported",
+                ))
+                if prompt not in questions:
+                    questions.append(prompt)
         return questions
 
     async def can_retry_application(self, page) -> bool:

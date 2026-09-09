@@ -15,11 +15,12 @@ from backend.adapters.base.protocol import (
 )
 from backend.schemas.domain import ApplicationPlan, JobPosting
 
-from . import locators
+from . import discovery, forms, locators
 from .salary import parse_salary
 
 
 class HHAdapter:
+    home_url = "https://hh.ru/"
     site_id = "hh"
     display_name = "HH.ru"
     # HH redirects authenticated users to their regional subdomain and emits
@@ -37,6 +38,31 @@ class HHAdapter:
     )
     async def start(self, context, settings: dict) -> None:
         return None
+
+    def query_source(self, query, field="name", cluster=""):
+        return discovery.query_spec(self, query, field, cluster)
+
+    def validate_search_source(self, spec):
+        discovery.validate_url(self, spec["url"])
+
+    async def read_discovery_page(self, page, spec, page_number):
+        # The orchestrator maintains an independent signature for every source.
+        self._last_search_page_signature = None
+        self._repeated_search_pages = 0
+        return await discovery.read_page(self, page, spec, page_number)
+
+    async def collect_visible_sources(self, page, context="listing"):
+        return await discovery.visible_sources(self, page, context=context)
+
+    async def collect_related_refs(self, page):
+        return await discovery.related_refs(self, page)
+
+    async def discovery_listing_terminal(self, page):
+        pager = page.locator(locators.SEARCH_PAGER).first
+        next_page = page.locator(locators.SEARCH_NEXT).first
+        if await pager.count() and await pager.is_visible():
+            return not await next_page.count() or not await next_page.is_visible()
+        return False
 
     @property
     def search_exhausted(self) -> bool:
@@ -368,6 +394,7 @@ class HHAdapter:
         work_schedule = await optional_text(locators.WORK_SCHEDULE)
         working_hours = await optional_text(locators.WORKING_HOURS)
         work_format = await optional_text(locators.WORK_FORMAT)
+        location = await optional_text(locators.LOCATION)
         external_id = page.url.rstrip("/").split("/")[-1].split("?")[0]
         return JobPosting(
             source="hh",
@@ -385,6 +412,7 @@ class HHAdapter:
             work_schedule=work_schedule,
             working_hours=working_hours,
             work_format=work_format,
+            location=location,
         )
 
     async def open_application(self, page) -> ApplicationForm:
@@ -398,16 +426,38 @@ class HHAdapter:
         await response.click()
         self._application_attempt_clicked = True
         await page.wait_for_timeout(800)
-        questions = await self._application_questions(page)
-        return ApplicationForm(
-            requires_cover_letter=bool(
-                await page.locator(locators.COVER_LETTER_TOGGLE).count()
-                or await page.locator(locators.COVER_LETTER_INPUT).count()
-            ),
-            questions=questions,
-        )
+        return await self.read_application(page)
+
+    async def read_application(self, page) -> ApplicationForm:
+        self._validate_application_domain(page)
+        for attempt in range(2):
+            try:
+                return await forms.read_form(page)
+            except PlaywrightError as exc:
+                if attempt or "Execution context was destroyed" not in str(exc):
+                    raise
+                await page.wait_for_timeout(750)
+        return ApplicationForm()
+
+    def _validate_application_domain(self, page) -> None:
+        if (urlparse(page.url).hostname or "") not in self.allowed_domains:
+            raise ValueError("Форма отклика находится вне разрешённых доменов HH.ru")
+
+    async def prepare_application(self, page, plan: ApplicationPlan) -> ApplicationForm:
+        form = await self.read_application(page)
+        if form.confirmation == "foreign_country":
+            if not plan.submission_allowed or not plan.allow_foreign_application:
+                return form.model_copy(update={"questions": ["Подтвердите отклик в другой стране"]})
+            # This notice acknowledges the vacancy's country; it does not assert relocation.
+            button = page.get_by_role("button", name=locators.FOREIGN_CONTINUE, exact=True)
+            if await button.count() == 1 and await button.is_visible():
+                await button.click()
+                await page.wait_for_timeout(800)
+                return await self.read_application(page)
+        return form
 
     async def fill_application(self, page, plan: ApplicationPlan) -> FillResult:
+        self._validate_application_domain(page)
         if not plan.submission_allowed:
             return FillResult(success=False, unknown_questions=["Отправка не разрешена планом"])
         letter_input = page.locator(locators.COVER_LETTER_INPUT)
@@ -418,93 +468,7 @@ class HHAdapter:
                 await page.wait_for_timeout(300)
         if plan.cover_letter and await letter_input.count():
             await letter_input.fill(plan.cover_letter)
-        unanswered = await self._application_questions(page)
-        return FillResult(success=not unanswered, unknown_questions=unanswered)
-
-    async def _application_questions(self, page) -> list[str]:
-        """Return visible employer questions that the agent cannot answer safely.
-
-        HH's standalone response page renders test questions as bare textareas,
-        not as labels matching the popup selector. Detect controls first and
-        attach HH's nearby task prompts by order; metadata is a conservative
-        fallback for other form variants.
-        """
-        for attempt in range(2):
-            try:
-                task_prompts = [
-                    text.strip()
-                    for text in await page.locator(locators.TASK_QUESTION).all_text_contents()
-                    if text.strip()
-                ]
-                label_prompts = [
-                    text.strip()
-                    for text in await page.locator(
-                        locators.APPLICATION_QUESTION
-                    ).all_text_contents()
-                    if text.strip() and "сопровод" not in text.lower()
-                ]
-                return await self._questions_from_controls(
-                    page, task_prompts, label_prompts
-                )
-            except PlaywrightError as exc:
-                if attempt or "Execution context was destroyed" not in str(exc):
-                    raise
-                await page.wait_for_timeout(750)
-        return []
-
-    async def _questions_from_controls(
-        self, page, task_prompts: list[str], label_prompts: list[str]
-    ) -> list[str]:
-        questions: list[str] = []
-        task_index = 0
-        controls = page.locator(locators.APPLICATION_CONTROL)
-        for index in range(await controls.count()):
-            control = controls.nth(index)
-            if not await control.is_visible():
-                continue
-            control_type = ((await control.get_attribute("type")) or "").lower()
-            if control_type in {
-                "hidden",
-                "submit",
-                "button",
-                "reset",
-                "file",
-                "image",
-                "checkbox",
-                "radio",
-            }:
-                continue
-            data_qa = ((await control.get_attribute("data-qa")) or "").lower()
-            name = ((await control.get_attribute("name")) or "").strip()
-            lowered_name = name.lower()
-            if (
-                data_qa == "vacancy-response-popup-form-letter-input"
-                or "letter" in data_qa
-                or "cover" in data_qa
-                or "сопровод" in data_qa
-                or any(
-                    marker in lowered_name
-                    for marker in ("cover_letter", "coverletter", "csrf", "xsrf", "captcha")
-                )
-            ):
-                continue
-
-            is_task_control = lowered_name.startswith("task_")
-            if is_task_control and task_index < len(task_prompts):
-                prompt = task_prompts[task_index]
-                task_index += 1
-            else:
-                aria = ((await control.get_attribute("aria-label")) or "").strip()
-                placeholder = ((await control.get_attribute("placeholder")) or "").strip()
-                prompt = aria or placeholder
-                if prompt.lower() in {"", "писать тут", "ответ", "ваш ответ"}:
-                    prompt = label_prompts[len(questions)] if len(questions) < len(label_prompts) else ""
-                if not prompt and is_task_control:
-                    prompt = f"Обязательный вопрос работодателя ({name})"
-
-            if prompt and "сопровод" not in prompt.lower() and prompt not in questions:
-                questions.append(prompt)
-        return questions
+        return await forms.fill_fields(page, plan)
 
     async def can_retry_application(self, page) -> bool:
         """The loaded vacancy explicitly offers a new application, with no prior response."""
@@ -516,10 +480,11 @@ class HHAdapter:
         return bool(await response.count() and await response.is_visible())
 
     async def submit_application(self, page) -> SubmissionResult:
-        submit = page.locator(locators.RESPONSE_SUBMIT)
+        self._validate_application_domain(page)
+        submit = page.locator(locators.RESPONSE_SUBMIT).first
         # HH can render the topic link while the response popup is still
         # active. The active submit control is authoritative in that state.
-        if await submit.count():
+        if await submit.count() and await submit.is_visible():
             await submit.click()
             return await self.verify_submission(page, just_submitted=True)
 
@@ -540,6 +505,17 @@ class HHAdapter:
         # as errors. Poll the visible state without a second click: repeating
         # the submit action would risk a duplicate application.
         for attempt in range(10):
+            self._validate_application_domain(page)
+            notice = page.get_by_text(locators.FOREIGN_NOTICE, exact=False)
+            if await notice.count() and await notice.first.is_visible():
+                return SubmissionResult(status="needs_input", message="HH.ru запросил подтверждение страны")
+            submit = page.locator(locators.RESPONSE_SUBMIT).first
+            active_form = bool(await submit.count() and await submit.is_visible())
+            if active_form:
+                if attempt < 9:
+                    await page.wait_for_timeout(500)
+                    continue
+                return SubmissionResult(status="needs_input", message="HH.ru ожидает заполнения формы")
             if await page.locator(locators.ALREADY_APPLIED).count():
                 if just_submitted:
                     return SubmissionResult(
@@ -560,6 +536,9 @@ class HHAdapter:
                 )
             if attempt < 9:
                 await page.wait_for_timeout(500)
+        form = await self.read_application(page)
+        if form.fields or form.confirmation:
+            return SubmissionResult(status="needs_input", message="HH.ru запросил дополнительную информацию")
         return SubmissionResult(
             status="unknown", message="hh.ru не показал однозначное подтверждение отправки"
         )

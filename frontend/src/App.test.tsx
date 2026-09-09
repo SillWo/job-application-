@@ -89,11 +89,15 @@ test('configures influence sliders, accessible hints, and minimum score payload'
   fireEvent.change(sliders[2], { target: { value: '3' } })
   expect(sliders[0]).toHaveAttribute('aria-valuetext', 'Низкий')
   expect(sliders[2]).toHaveAttribute('aria-valuetext', 'Высокий')
+  const guaranteed = screen.getByRole('checkbox', { name: 'Гарантированный отклик' });
+  expect(guaranteed).not.toBeChecked();
+  fireEvent.click(guaranteed);
   const launch = await screen.findByRole('button', { name: 'Создать и запустить' }); await waitFor(() => expect(launch).toBeEnabled()); fireEvent.click(launch)
   await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/77/start'))).toBe(true))
   const payload = JSON.parse(requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))?.body ?? '{}')
   expect(payload.minimum_scores).toEqual({ tasks: 1, skills: 1, experience_depth: 3, role_match: 2, industry: 2, special_requirements: 1 })
   expect(payload.minimum_scores).not.toHaveProperty('work_conditions')
+  expect(payload.guaranteed_application).toBe(true);
   expect(JSON.stringify(payload)).not.toMatch(/secondary|общий|вторичн|threshold|проходн|балл/i)
 })
 
@@ -140,17 +144,29 @@ test('renders vacancy site and exact status timestamp while legacy has no dangli
 })
 
 test('status filter shows unique Russian labels while preserving state values', async () => {
-  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).includes('/api/vacancies')
-    ? Promise.resolve({ ok: true, json: async () => ({ items: [], total: 0, limit: 30, offset: 0, has_more: false }) })
-    : Promise.resolve({ ok: true, json: async () => [] })))
+  const requests: string[] = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    requests.push(url)
+    return url.includes('/api/vacancies')
+      ? Promise.resolve({ ok: true, json: async () => ({ items: [], total: 0, limit: 30, offset: 0, has_more: false }) })
+      : Promise.resolve({ ok: true, json: async () => [] })
+  }))
   render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
   const select = await screen.findByRole('combobox', { name: 'Статус' })
   const options = within(select).getAllByRole('option')
   const labels = options.map((option) => option.textContent ?? '')
   expect(new Set(labels).size).toBe(labels.length)
   expect(labels.every((label) => !/[A-Za-z]/.test(label))).toBe(true)
-  expect(labels).toEqual(['Все', 'Оценка вакансии', 'Отклонена моделью', 'В отчёте', 'Ошибка'])
+  expect(labels).toEqual(['Все', 'Оценка вакансии', 'Отклонена моделью', 'Отклик отправлен', 'В отчёте', 'Ошибка'])
   expect(within(select).getByRole('option', { name: 'Отклонена моделью' })).toHaveValue('REJECTED_BY_MODEL')
+  expect(within(select).getByRole('option', { name: 'Отклик отправлен' })).toHaveValue('SUBMITTED')
+  fireEvent.change(select, { target: { value: 'SUBMITTED' } })
+  await waitFor(() => {
+    const latest = requests.filter((url) => url.includes('/api/vacancies?')).at(-1)
+    expect(latest).toBeTruthy()
+    expect(new URL(latest!, 'http://local').searchParams.get('state')).toBe('SUBMITTED')
+  })
 })
 
 test('builds CSV XLSX XML export links without pagination', async () => {
@@ -325,6 +341,28 @@ test('configures a new cloud model key and clears it after saving', async () => 
   const saveRequest = requests.find((request) => request.url.endsWith('/api/model/settings') && request.init?.method === 'PUT')
   expect(JSON.parse(String(modelRequest?.init?.body))).toMatchObject({ api_key: 'secret-value' })
   expect(JSON.parse(String(saveRequest?.init?.body))).toMatchObject({ model: 'cloud-b', api_key: 'secret-value' })
+})
+
+test('allows manual local model setup and shows generation failure without clearing the key', async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push({ url, init })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: false, model_available: false }) })
+    if (init?.method === 'PUT') return Promise.resolve({ ok: false, json: async () => ({ detail: 'Проверка генерации не пройдена' }) })
+    if (url.endsWith('/api/model/settings')) return Promise.resolve({ ok: true, json: async () => ({ base_url: 'https://api.openai.com/v1', model: '', has_api_key: false, masked_key: '' }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/model']}><App /></MemoryRouter></QueryClientProvider>)
+  await waitFor(() => expect(screen.getByLabelText(/Base URL/)).toHaveValue('https://api.openai.com/v1'))
+  fireEvent.change(screen.getByLabelText(/Base URL/), { target: { value: 'http://0.0.0.0:8045/v1' } })
+  fireEvent.change(screen.getByLabelText('Модель'), { target: { value: 'local-model' } })
+  fireEvent.change(screen.getByLabelText('API-ключ'), { target: { value: 'local-key' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Сохранить изменения' }))
+  await waitFor(() => expect(screen.getAllByText('Проверка генерации не пройдена').length).toBeGreaterThan(0))
+  expect(screen.getByLabelText('API-ключ')).toHaveValue('local-key')
+  expect(requests.some((request) => request.url.endsWith('/api/model/models'))).toBe(false)
+  const save = requests.find((request) => request.init?.method === 'PUT')
+  expect(JSON.parse(String(save?.init?.body))).toEqual({ base_url: 'http://0.0.0.0:8045/v1', model: 'local-model', api_key: 'local-key' })
 })
 
 test('does not send a masked saved key back to the API', async () => {

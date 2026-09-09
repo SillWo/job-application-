@@ -104,6 +104,18 @@ def test_vacancy_transitions_notify_once_and_skip_non_target_states():
         assert len(db.scalars(select(Notification).where(Notification.source_type == "vacancy")).all()) == 2
 
 
+def test_questionnaire_review_notification_includes_the_missing_information():
+    Sessions = _db()
+    with Sessions() as db:
+        vacancy = Vacancy(source="hh", external_id="q", url="u", title="T", state="SUBMITTING", data={})
+        db.add(vacancy); db.commit()
+        vacancy.data = {"application_review_reasons": ["Зарплата: не указан формат работы"]}
+        vacancy.state = "NEEDS_REVIEW"
+        db.commit()
+        row = db.scalar(select(Notification).where(Notification.source_type == "vacancy"))
+        assert "Зарплата: не указан формат работы" in row.message
+
+
 def test_vacancy_insert_flush_then_same_state_no_duplicate():
     Sessions = _db()
     with Sessions() as db:

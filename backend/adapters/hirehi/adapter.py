@@ -12,6 +12,7 @@ from backend.adapters.base.protocol import (
     JobRef,
     LoginState,
 )
+from backend.adapters.hirehi import locators
 from backend.schemas.domain import JobPosting
 
 
@@ -32,6 +33,7 @@ class HireHiAdapter:
     }
     CATEGORIES = frozenset(CATEGORY_PATHS)
     site_id = "hirehi"
+    home_url = "https://hirehi.ru/"
     display_name = "HireHi"
     allowed_domains = ("hirehi.ru", "www.hirehi.ru")
     manifest = AdapterManifest(
@@ -44,6 +46,38 @@ class HireHiAdapter:
     @property
     def search_exhausted(self) -> bool:
         return getattr(self, "_exhausted", False)
+
+    def search_checkpoint(self) -> dict:
+        """The workflow saves this cursor together with its pending vacancy queue."""
+        return {
+            "algorithm": "hirehi_v1",
+            "category": self._category,
+            "listing_url": self._listing_url,
+            "listing_page": self._listing_page,
+            "seen": sorted(self._seen),
+            "exhausted": self.search_exhausted,
+        }
+
+    def restore_search_checkpoint(self, checkpoint: dict) -> None:
+        category = checkpoint.get("category")
+        parsed = urlparse(checkpoint.get("listing_url", ""))
+        if (
+            checkpoint.get("algorithm") != "hirehi_v1"
+            or category not in self.CATEGORY_PATHS
+            or parsed.hostname not in self.allowed_domains
+            or parsed.scheme != urlparse(self.home_url).scheme
+            or parsed.username or parsed.password
+            or parsed.path.rstrip("/") != self.CATEGORY_PATHS[category].rstrip("/")
+        ):
+            raise ValueError("Сохранённый поиск HireHi содержит недопустимый адрес или категорию")
+        listing_page = int(checkpoint["listing_page"])
+        if listing_page < 1:
+            raise ValueError("Недопустимая страница поиска HireHi")
+        self._category = category
+        self._listing_url = checkpoint["listing_url"]
+        self._listing_page = listing_page
+        self._seen = set(checkpoint["seen"])
+        self._exhausted = bool(checkpoint["exhausted"])
 
     async def start(self, context, settings: dict) -> None:
         return None
@@ -102,7 +136,9 @@ class HireHiAdapter:
         self._category = category
         self._seen: set[str] = set()
         self._exhausted = False
-        await page.goto("https://hirehi.ru/", wait_until="commit", timeout=15_000)
+        self._listing_url = ""
+        self._listing_page = 1
+        await page.goto(self.home_url, wait_until="domcontentloaded", timeout=15_000)
         await self._wait_for_search_dom(page)
         category_pattern = re.compile(r"^" + re.escape(category) + r"$", re.I)
         expected_path = self.CATEGORY_PATHS[category]
@@ -111,7 +147,7 @@ class HireHiAdapter:
             # Some layouts expose the category sidebar directly, without the
             # category picker button. Prefer a visible link with the exact
             # category route to avoid hidden/mobile duplicate matches.
-            links = page.locator("a[href]")
+            links = page.locator(locators.LINKS)
             for index in range(await links.count()):
                 link = links.nth(index)
                 href = await link.get_attribute("href")
@@ -122,6 +158,10 @@ class HireHiAdapter:
                 opener = await self._first_visible(
                     page.get_by_role("button", name="Выбрать категорию вакансий")
                 )
+                if opener is None:
+                    opener = await self._first_visible(
+                        page.get_by_role("button", name=re.compile(r"^Категория\s", re.I))
+                    )
                 if opener is not None:
                     await opener.click()
                     await page.wait_for_timeout(100)
@@ -153,8 +193,9 @@ class HireHiAdapter:
             )
             if await item.count() and await item.first.is_visible():
                 await item.first.click()
+        await self._ensure_category_listing(page)
         self._listing_url = page.url
-        self._listing_page = 1
+        self._listing_page = self._page_number(page.url)
 
     async def _apply_grade_filters(self, page, grades) -> None:
         """Select requested HireHi grade chips without toggling unrelated ones."""
@@ -237,7 +278,7 @@ class HireHiAdapter:
         except Exception:
             pass
         try:
-            await page.locator("a[href]").first.wait_for(
+            await page.locator(locators.LINKS).first.wait_for(
                 state="attached", timeout=8_000
             )
         except Exception:
@@ -246,13 +287,14 @@ class HireHiAdapter:
     async def _wait_for_results(self, page, category: str) -> None:
         expected_path = self.CATEGORY_PATHS[category]
         expected_url = re.compile(
-            rf"https://(?:www\.)?hirehi\.ru{re.escape(expected_path)}(?:[?#].*)?$",
+            rf"{re.escape(urljoin(self.home_url, expected_path))}(?:[?#].*)?$",
             re.I,
         )
         with suppress(Exception):
             await page.wait_for_url(expected_url, timeout=8_000)
+        await self._ensure_category_listing(page)
         try:
-            await page.locator("a[href]").first.wait_for(
+            await page.locator(locators.LINKS).first.wait_for(
                 state="attached", timeout=8_000
             )
         except Exception:
@@ -260,13 +302,31 @@ class HireHiAdapter:
 
     def _is_listing_page(self, page) -> bool:
         """Reject vacancy detail pages when unwinding browser history."""
-        path = urlparse(page.url).path.rstrip("/") or "/"
+        parsed = urlparse(page.url)
+        path = parsed.path.rstrip("/") or "/"
         expected = self.CATEGORY_PATHS.get(getattr(self, "_category", "все вакансии"), "/").rstrip("/") or "/"
-        return path == expected
+        return parsed.hostname in self.allowed_domains and path == expected
+
+    async def _ensure_category_listing(self, page) -> None:
+        """A category click/filter may leave the UI on the unscoped home feed."""
+        if self._is_listing_page(page):
+            return
+        parsed = urlparse(page.url)
+        if parsed.hostname not in self.allowed_domains or (parsed.path.rstrip("/") or "/") not in self.CATEGORY_PATHS.values():
+            raise RuntimeError("HireHi не открыла страницу выдачи")
+        query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key != "page"]
+        target = urlparse(urljoin(self.home_url, self.CATEGORY_PATHS[self._category]))
+        await page.goto(
+            urlunparse(target._replace(query=urlencode(query))),
+            wait_until="domcontentloaded", timeout=15_000,
+        )
+        await self._wait_for_search_dom(page)
+        if not self._is_listing_page(page):
+            raise RuntimeError("HireHi не сохранила выбранную категорию")
 
     async def _refs(self, page) -> list[JobRef]:
-        links = page.locator("a[href]")
-        refs = []
+        links = page.locator(locators.LINKS)
+        refs = {}
         # The results page is an infinite list; do not truncate the DOM after
         # 200 anchors (navigation and footer links are filtered below).
         for i in range(await links.count()):
@@ -277,11 +337,13 @@ class HireHiAdapter:
             if (
                 parsed.hostname in self.allowed_domains
                 and match
+                and f"/vacancies/{parsed.path.split('/')[1]}" in self.CATEGORY_PATHS.values()
                 and match.group(1) not in self._seen
             ):
-                self._seen.add(match.group(1))
-                refs.append(JobRef(external_id=match.group(1), url=url))
-        return refs
+                refs[match.group(1)] = JobRef(external_id=match.group(1), url=url)
+        # Do not lose a partial batch when reading an anchor fails mid-page.
+        self._seen.update(refs)
+        return list(refs.values())
 
     async def collect_job_refs(self, page) -> list[JobRef]:
         if not hasattr(self, "_seen"):
@@ -291,25 +353,29 @@ class HireHiAdapter:
             raise RuntimeError("Сбор вакансий HireHi вызван не на странице выдачи")
         if not getattr(self, "_listing_url", ""):
             self._listing_url = page.url
-            raw_page = dict(parse_qsl(urlparse(page.url).query)).get("page", "1")
-            try:
-                self._listing_page = max(1, int(raw_page))
-            except ValueError:
-                self._listing_page = 1
+            self._listing_page = self._page_number(page.url)
         return await self._refs(page)
 
+    @staticmethod
+    def _page_number(url: str) -> int:
+        raw_page = dict(parse_qsl(urlparse(url).query)).get("page", "1")
+        try:
+            return max(1, int(raw_page))
+        except ValueError:
+            return 1
+
     async def collect_more_job_refs(self, page) -> list[JobRef]:
-        if self._exhausted:
+        if self.search_exhausted:
             return []
         listing_url = getattr(self, "_listing_url", "")
         if not listing_url:
             raise RuntimeError("Не сохранена URL выдачи HireHi")
-        self._listing_page = getattr(self, "_listing_page", 1) + 1
+        next_page = getattr(self, "_listing_page", 1) + 1
         parsed = urlparse(listing_url)
         query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key != "page"]
-        query.append(("page", str(self._listing_page)))
+        query.append(("page", str(next_page)))
         next_url = urlunparse(parsed._replace(query=urlencode(query)))
-        await page.goto(next_url, wait_until="commit", timeout=15_000)
+        await page.goto(next_url, wait_until="domcontentloaded", timeout=15_000)
         if not self._is_listing_page(page):
             raise RuntimeError("HireHi не открыла страницу выдачи")
         await self._wait_for_search_dom(page)
@@ -317,9 +383,12 @@ class HireHiAdapter:
             refs = await self._refs(page)
             if refs:
                 self._listing_url = next_url
+                self._listing_page = next_page
                 return refs
             await page.wait_for_timeout(250)
         self._exhausted = True
+        self._listing_url = next_url
+        self._listing_page = next_page
         return []
 
 

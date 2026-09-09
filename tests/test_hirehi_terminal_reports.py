@@ -6,6 +6,13 @@ import pytest
 from backend.api import router
 from backend.orchestrator import workflow
 from backend.schemas.domain import SessionStatus
+from backend.services import profile_memory
+
+
+@pytest.fixture(autouse=True)
+def isolate_profile_memory(monkeypatch):
+    # Report dispatch is independent of the profile question persistence service.
+    monkeypatch.setattr(profile_memory, "collect_session_questions", lambda db, item: 0)
 
 
 class DB:
@@ -22,13 +29,16 @@ class DB:
     def add(self, value):
         return None
 
+    def refresh(self, item):
+        pass
+
 
 def session(adapter_id):
     return SimpleNamespace(
         id=7, profile_id=1, adapter_id=adapter_id, status=SessionStatus.RUNNING,
         stop_reason=None, finished_at=None, counters={},
         minimum_scores=None, application_limit=1,
-        started_at=None,
+        started_at=None, guaranteed_application=False,
     )
 
 

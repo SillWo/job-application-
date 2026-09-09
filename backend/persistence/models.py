@@ -24,6 +24,15 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class SessionFormDraft(Base):
+    """One shared launch form for this local application, independent of browser origin."""
+
+    __tablename__ = "session_form_draft"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    draft: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
 class CandidateProfile(Base):
     __tablename__ = "candidate_profiles"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -74,6 +83,39 @@ class JobSession(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stop_reason: Mapped[str | None] = mapped_column(String(255))
     recovery: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
+    guaranteed_application: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    questions_collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ProfileMemory(Base):
+    """Private, user-authored facts shared by every adapter; never exposed as a UI catalog."""
+    __tablename__ = "profile_memory"
+    __table_args__ = (UniqueConstraint("profile_id", "memory_key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("candidate_profiles.id"), index=True)
+    memory_key: Mapped[str] = mapped_column(String(64))
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str] = mapped_column(Text)
+    context: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+class SessionQuestion(Base):
+    __tablename__ = "session_questions"
+    __table_args__ = (UniqueConstraint("session_id", "memory_key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("candidate_profiles.id"), index=True)
+    vacancy_id: Mapped[int | None] = mapped_column(ForeignKey("vacancies.id"), nullable=True)
+    memory_key: Mapped[str] = mapped_column(String(64))
+    question: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    options: Mapped[list] = mapped_column(JSON, default=list)
+    context: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Notification(Base):
@@ -138,13 +180,15 @@ _VACANCY_NOTIFICATION_STATES = {"ERROR", "UNKNOWN", "NEEDS_REVIEW"}
 def _vacancy_notification(vacancy: Vacancy) -> Notification:
     status = vacancy.state
     company = f" — {vacancy.company}" if vacancy.company else ""
+    reasons = (vacancy.data or {}).get("application_review_reasons", [])
+    detail = "; ".join(reason for reason in reasons[:3] if isinstance(reason, str)) if isinstance(reasons, list) else ""
     return Notification(
         source_type="vacancy",
         source_id=str(vacancy.id),
         target_path="/vacancies",
         kind=f"vacancy_{status.lower()}",
         title=f"Вакансия: {vacancy.title}",
-        message=f"Вакансия «{vacancy.title}»{company}: статус {status}",
+        message=f"Вакансия «{vacancy.title}»{company}: статус {status}" + (f". {detail[:1000]}" if detail else ""),
     )
 
 
