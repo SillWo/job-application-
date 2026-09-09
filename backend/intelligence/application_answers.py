@@ -51,7 +51,7 @@ class SalarySelection(StrictModel):
 
 class ResolvedSalary(StrictModel):
     rule: SalaryRule | None = None
-    source: Literal["preferences", "resume", "unknown"] = "unknown"
+    source: Literal["preferences", "resume", "memory", "unknown"] = "unknown"
     reason: str = "Зарплатные ожидания не указаны"
 
     def display(self) -> str:
@@ -69,7 +69,7 @@ class AnswerEvidence(StrictModel):
 
 class ProposedAnswer(StrictModel):
     field_id: str
-    category: Literal["fact", "preference", "salary", "knowledge", "sensitive", "task", "unknown"]
+    category: Literal["fact", "preference", "salary", "knowledge", "sensitive", "task", "unknown", "assumption"]
     values: list[str]
     evidence: list[AnswerEvidence]
     confidence: float = Field(ge=0, le=1)
@@ -192,7 +192,7 @@ def _sources(profile, resumes, description: str) -> dict[str, str]:
     return result
 
 
-async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], description: str) -> ResolvedSalary:
+async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], description: str, memory: list[dict] | None = None) -> ResolvedSalary:
     """User text is authoritative; conditional rules are never flattened to a minimum."""
     rules = SalaryRules(has_salary_rules=False, rules=[])
     source_text = description.strip()
@@ -208,10 +208,14 @@ async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], descript
     if not preference_salary:
         salaries = list(dict.fromkeys(str(resume.get("desired_salary") or "").strip() for resume in resumes))
         salaries = [salary for salary in salaries if salary]
+        source = "resume"
+        if not salaries:
+            salaries = list(dict.fromkeys(entry["answer"] for entry in (memory or [])
+                                         if SALARY_MARKERS.search(entry["question"])))
+            source = "memory"
         if len(salaries) != 1:
             return ResolvedSalary(reason="В выбранных резюме зарплата отсутствует или различается")
         source_text = salaries[0]
-        source = "resume"
         rules = await gateway.structured("application_salary_rules", {"text": source_text}, SalaryRules)
     if answer_scope is not None:
         # Only discard grounded rules from outside the explicitly selected section.
@@ -247,13 +251,21 @@ async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], descript
 
 
 async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan, job: JobPosting,
-                          profile, resumes: list[dict], description: str) -> ApplicationPlan:
+                          profile, resumes: list[dict], description: str, *,
+                          memory: list[dict] | None = None, guaranteed_application: bool = False) -> ApplicationPlan:
     """Model output is a proposal; source quotes, IDs, choices and salary are checked locally."""
     if not form.fields:
         return plan
     sources = _sources(profile, resumes, description)
+    # Context-dependent answers travel only to matching vacancies, regardless of site.
+    applicable_memory = [entry for entry in (memory or []) if all(
+        _normalized(str(getattr(job, key, "") or "")) == _normalized(str(value))
+        for key, value in entry.get("context", {}).items()
+    )]
+    for entry in applicable_memory:
+        sources[f"memory.{entry['id']}"] = f"{entry['question']}\n{entry['answer']}"
     salary_fields = {field.id for field in form.fields if SALARY_MARKERS.search(field.label)}
-    salary = await resolve_salary(gateway, job, resumes, description) if salary_fields else ResolvedSalary()
+    salary = await resolve_salary(gateway, job, resumes, description, applicable_memory) if salary_fields else ResolvedSalary()
     # Remove raw salary fields so lower-priority resume amounts cannot leak into a composite answer.
     sources = {key: value for key, value in sources.items() if not key.endswith(".desired_salary")}
     if salary.rule:
@@ -262,6 +274,7 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
         return await gateway.structured("application_answers", {
             "fields": [field.model_dump() for field in form.fields],
             "sources": sources,
+            "guaranteed_application": guaranteed_application,
             "salary": salary.model_dump(),
             "as_of_date": date.today().isoformat(),
             "job": job.model_dump(mode="json"),
@@ -275,15 +288,16 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
         salary_fields = {answer.field_id for answer in proposed.answers
                          if answer.category == "salary" and answer.field_id in known_fields}
         if salary_fields:
-            salary = await resolve_salary(gateway, job, resumes, description)
+            salary = await resolve_salary(gateway, job, resumes, description, applicable_memory)
             if salary.rule:
                 sources["salary"] = salary.display()
             proposed = await propose()
     counts = Counter(answer.field_id for answer in proposed.answers)
     answers = {answer.field_id: answer for answer in proposed.answers if counts[answer.field_id] == 1}
     result = plan.model_copy(deep=True)
-    result.unanswered_fields = {}
+    result.form_fields.update({field.id: field for field in form.fields})
     for field in form.fields:
+        result.unanswered_fields.pop(field.id, None)
         result.form_answers.pop(field.id, None)
         answer = answers.get(field.id)
         reason = "Для ответа недостаточно подтверждённых данных"
@@ -291,7 +305,10 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                         and answer.confidence >= .95 and answer.category not in {"unknown", "sensitive", "task"})
         if answer:
             reason = answer.reason or reason
-            if answer.category == "knowledge":
+            if answer.category == "assumption":
+                accepted = bool(guaranteed_application and answer.values
+                                and all(value.strip() for value in answer.values) and answer.reason.strip())
+            elif answer.category == "knowledge":
                 accepted = accepted and not PERSONAL.search(field.label) and bool(answer.reason.strip())
             else:
                 accepted = accepted and bool(answer.evidence) and all(

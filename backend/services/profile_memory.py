@@ -54,20 +54,22 @@ def _unanswered(plan: dict, vacancy: Vacancy):
             label = next((text[:-len(suffix)] for text in reasons if text.endswith(suffix)), None)
         if label:
             yield label, reason, field.get("options") or []
+    for label in (vacancy.data or {}).get("application_unanswered_questions") or []:
+        yield label, "ИИ не смог ответить на вопрос анкеты", []
 
 
 def collect_session_questions(db, item: JobSession) -> int:
     """Called after terminal transitions; idempotent across stop, recovery and restart."""
     if item.status not in TERMINAL or item.questions_collected_at is not None:
         return 0
-    rows = db.execute(select(Vacancy, ApplicationPlanRecord).join(
+    rows = db.execute(select(Vacancy, ApplicationPlanRecord).outerjoin(
         ApplicationPlanRecord, ApplicationPlanRecord.vacancy_id == Vacancy.id,
     ).where(Vacancy.session_id == item.id)).all()
     known = set(db.scalars(select(SessionQuestion.memory_key).where(SessionQuestion.session_id == item.id)))
     remembered = set(db.scalars(select(ProfileMemory.memory_key).where(ProfileMemory.profile_id == item.profile_id)))
     count = 0
     for vacancy, record in rows:
-        for question, reason, options in _unanswered(record.data, vacancy):
+        for question, reason, options in _unanswered(record.data if record else {}, vacancy):
             context = question_context(question, vacancy.data or {})
             key = _key(question, context)
             if key in known or key in remembered:

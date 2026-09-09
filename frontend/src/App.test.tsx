@@ -89,11 +89,15 @@ test('configures influence sliders, accessible hints, and minimum score payload'
   fireEvent.change(sliders[2], { target: { value: '3' } })
   expect(sliders[0]).toHaveAttribute('aria-valuetext', 'Низкий')
   expect(sliders[2]).toHaveAttribute('aria-valuetext', 'Высокий')
+  const guaranteed = screen.getByRole('checkbox', { name: 'Гарантированный отклик' });
+  expect(guaranteed).not.toBeChecked();
+  fireEvent.click(guaranteed);
   const launch = await screen.findByRole('button', { name: 'Создать и запустить' }); await waitFor(() => expect(launch).toBeEnabled()); fireEvent.click(launch)
   await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/77/start'))).toBe(true))
   const payload = JSON.parse(requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))?.body ?? '{}')
   expect(payload.minimum_scores).toEqual({ tasks: 1, skills: 1, experience_depth: 3, role_match: 2, industry: 2, special_requirements: 1 })
   expect(payload.minimum_scores).not.toHaveProperty('work_conditions')
+  expect(payload.guaranteed_application).toBe(true);
   expect(JSON.stringify(payload)).not.toMatch(/secondary|общий|вторичн|threshold|проходн|балл/i)
 })
 

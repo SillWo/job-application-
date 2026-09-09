@@ -519,6 +519,7 @@ def pending_profile_questions(profile_id: int, db: Session = Depends(get_db)) ->
     return [{"id": question.id, "session_id": session.id, "question": question.question,
              "reason": question.reason, "options": question.options, "context": question.context,
              "site": session.adapter_id, "vacancy_title": vacancy.title if vacancy else None,
+             "vacancy_url": vacancy.url if vacancy else None,
              "can_answer": can_remember(question.question)} for question, session, vacancy in rows]
 
 

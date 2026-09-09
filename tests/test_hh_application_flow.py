@@ -48,7 +48,7 @@ async def test_unchanged_form_after_submit_is_never_submitted_twice():
 async def test_cancellation_after_model_prevents_fill_and_submit(monkeypatch):
     active = True
 
-    async def prepare(gateway, form, plan, *args):
+    async def prepare(gateway, form, plan, *args, **kwargs):
         nonlocal active
         active = False
         return plan
@@ -65,7 +65,7 @@ async def test_answers_are_checkpointed_before_fill(monkeypatch):
     field = ApplicationField(id="q", label="Город")
     saved = []
 
-    async def prepare(gateway, form, plan, *args):
+    async def prepare(gateway, form, plan, *args, **kwargs):
         return plan.model_copy(update={"form_answers": {"q": FormAnswer(field=field, values=["Москва"])}})
 
     class CheckedAdapter(Adapter):
@@ -84,7 +84,7 @@ async def test_new_conditional_control_is_answered_before_submit(monkeypatch):
     first = ApplicationField(id="first", label="Первый вопрос")
     second = ApplicationField(id="second", label="Второй вопрос")
 
-    async def prepare(gateway, form, plan, *args):
+    async def prepare(gateway, form, plan, *args, **kwargs):
         return plan.model_copy(update={"form_answers": {f.id: FormAnswer(field=f, values=["Ответ"]) for f in form.fields}})
 
     class ConditionalAdapter(Adapter):
@@ -103,7 +103,7 @@ async def test_new_conditional_control_is_answered_before_submit(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_step_limit_stops_endless_new_forms(monkeypatch):
-    async def prepare(gateway, form, plan, *args):
+    async def prepare(gateway, form, plan, *args, **kwargs):
         return plan.model_copy(update={"form_answers": {f.id: FormAnswer(field=f, values=["Ответ"]) for f in form.fields}})
 
     monkeypatch.setattr(hh_application, "prepare_answers", prepare)

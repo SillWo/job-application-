@@ -24,6 +24,15 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class SessionFormDraft(Base):
+    """One shared launch form for this local application, independent of browser origin."""
+
+    __tablename__ = "session_form_draft"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    draft: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
 class CandidateProfile(Base):
     __tablename__ = "candidate_profiles"
     id: Mapped[int] = mapped_column(primary_key=True)

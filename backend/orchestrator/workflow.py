@@ -1064,6 +1064,8 @@ class WorkflowManager:
                             db.commit()
                             continue
                         if adapter_id == "hh":
+                            from backend.services.profile_memory import load_profile_memory
+
                             def checkpoint(current_plan, item=item, plan_record=plan_record):
                                 db.refresh(item)
                                 if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
@@ -1075,6 +1077,8 @@ class WorkflowManager:
                             outcome = await complete_application(
                                 adapter, executor.page, plan, posting, profile, selected_resumes,
                                 preference_description, gateway, checkpoint,
+                                memory=load_profile_memory(db, item.profile_id),
+                                guaranteed_application=item.guaranteed_application,
                             )
                             if outcome.stopped:
                                 return
@@ -1092,6 +1096,19 @@ class WorkflowManager:
                             self._record_submission(db, item, vacancy, submission)
                             db.commit()
                             continue
+                        from backend.intelligence.application_answers import prepare_answers
+                        from backend.services.profile_memory import load_profile_memory
+
+                        plan = await prepare_answers(
+                            gateway, form, plan, posting, profile, selected_resumes, preference_description,
+                            memory=load_profile_memory(db, item.profile_id),
+                            guaranteed_application=item.guaranteed_application,
+                        )
+                        plan_record.data = plan.model_dump()
+                        db.commit()
+                        db.refresh(item)
+                        if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
+                            return
                         result = await adapter.fill_application(executor.page, plan)
                     except (ModelUnavailable, CaptchaRequired):
                         raise
@@ -1103,6 +1120,7 @@ class WorkflowManager:
                         raise
                     questions = unresolved_application_questions(form, result)
                     if questions:
+                        vacancy.data = {**(vacancy.data or {}), "application_unanswered_questions": questions}
                         vacancy.state = "UNKNOWN"
                         counters = dict(item.counters)
                         counters["errors"] = counters.get("errors", 0) + 1

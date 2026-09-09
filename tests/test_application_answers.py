@@ -296,3 +296,74 @@ async def test_indirect_salary_question_can_be_identified_by_model():
                              gateway=gateway, resumes=[{"desired_salary": "150000 RUB"}])
     assert plan.form_answers["q1"].values == ["150000 RUB"]
     assert [role for role, _ in gateway.calls] == ["application_answers", "application_salary_rules", "application_answers"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("site", ["hh", "zarplata", "future_site"])
+async def test_confirmed_memory_is_available_to_every_site(site):
+    gateway = Gateway(dict(answers=[dict(field_id="q", category="fact", values=["B2"],
+        evidence=[dict(source="memory.7", quote="B2")], confidence=1, reason="Ответ пользователя")]))
+    field = ApplicationField(id="q", label="Какой у вас английский?")
+    result = await prepare_answers(gateway, ApplicationForm(fields=[field]),
+        ApplicationPlan(vacancy_id=1, resume_file=""), job().model_copy(update={"source": site}), {}, [], "",
+        memory=[dict(id=7, question="Уровень английского", answer="B2", context={})])
+    assert result.form_answers["q"].values == ["B2"]
+    assert result.form_fields["q"] == field
+
+
+@pytest.mark.asyncio
+async def test_memory_context_cannot_leak_to_other_work_format():
+    gateway = Gateway(dict(answers=[]))
+    await prepare_answers(gateway, ApplicationForm(fields=[ApplicationField(id="q", label="Готовы к офису?")]),
+        ApplicationPlan(vacancy_id=1, resume_file=""), job(work_format="удалённо"), {}, [], "",
+        memory=[dict(id=7, question="Готовы к офису?", answer="Да", context={"work_format": "офис"})])
+    assert "memory.7" not in gateway.calls[0][1]["sources"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_assumptions_require_explicit_session_mode_and_retain_provenance(enabled):
+    gateway = Gateway(dict(answers=[dict(field_id="q", category="assumption", values=["Работал со Scrum"],
+        evidence=[], confidence=.6, reason="Предположен опыт Scrum")]))
+    result = await prepare_answers(gateway, ApplicationForm(fields=[ApplicationField(id="q", label="Ваш опыт Scrum?")]),
+        ApplicationPlan(vacancy_id=1, resume_file=""), job(), {}, [], "", guaranteed_application=enabled)
+    assert bool(result.form_answers) is enabled
+    assert gateway.calls[0][1]["guaranteed_application"] is enabled
+    if enabled:
+        assert result.form_answers["q"].source == "assumption"
+    else:
+        assert "q" in result.unanswered_fields
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label", ["Ваш пароль?", "Желаемая зарплата?", "Согласие на обработку данных"])
+async def test_guaranteed_mode_does_not_override_salary_or_sensitive_guards(label):
+    gateway = Gateway(dict(answers=[dict(field_id="q", category="assumption", values=["100000"],
+        evidence=[], confidence=1, reason="Предположено")]))
+    result = await prepare_answers(gateway, ApplicationForm(fields=[ApplicationField(id="q", label=label)]),
+        ApplicationPlan(vacancy_id=1, resume_file=""), job(), {}, [], "", guaranteed_application=True)
+    assert not result.form_answers
+
+
+@pytest.mark.asyncio
+async def test_unanswered_questions_survive_later_form_steps():
+    plan = ApplicationPlan(vacancy_id=1, resume_file="")
+    gateway = Gateway(dict(answers=[]), dict(answers=[]))
+    for ident in ["first", "second"]:
+        plan = await prepare_answers(gateway, ApplicationForm(fields=[ApplicationField(id=ident, label=ident)]),
+            plan, job(), {}, [], "")
+    assert set(plan.unanswered_fields) == {"first", "second"}
+    assert set(plan.form_fields) == {"first", "second"}
+
+
+@pytest.mark.asyncio
+async def test_saved_salary_fills_missing_expectations_but_never_overrides_resume():
+    memory = [dict(id=1, question="Желаемая зарплата?", answer="150000 RUB", context={})]
+    gateway = Gateway(dict(has_salary_rules=True, rules=[rule()]))
+    result = await resolve_salary(gateway, job(), [], "", memory)
+    assert result.source == "memory"
+    assert result.rule.amount == 150000
+    gateway = Gateway(dict(has_salary_rules=True, rules=[rule(200000, "200000 RUB")]))
+    result = await resolve_salary(gateway, job(), [{"desired_salary": "200000 RUB"}], "", memory)
+    assert result.source == "resume"
+    assert result.rule.amount == 200000

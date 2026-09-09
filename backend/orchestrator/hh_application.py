@@ -20,7 +20,8 @@ def _signature(form) -> str:
 
 
 async def complete_application(adapter, page, plan, job, profile, resumes, description,
-                               gateway, checkpoint, max_steps=5) -> ApplicationOutcome:
+                               gateway, checkpoint, max_steps=5, *, memory=None,
+                               guaranteed_application=False) -> ApplicationOutcome:
     submitted_forms: set[str] = set()
     for _ in range(max_steps):
         if not checkpoint(plan):
@@ -31,7 +32,8 @@ async def complete_application(adapter, page, plan, job, profile, resumes, descr
         signature = _signature(form)
         if signature in submitted_forms:
             return ApplicationOutcome(pending=["HH.ru оставил ту же форму после отправки; проверьте ответы и сообщения об ошибках"])
-        plan = await prepare_answers(gateway, form, plan, job, profile, resumes, description)
+        plan = await prepare_answers(gateway, form, plan, job, profile, resumes, description,
+                                     memory=memory, guaranteed_application=guaranteed_application)
         # Persist the generated answers before any field is changed, and recheck cancellation
         # after waiting for a model. A restart still reconciles SUBMITTING first.
         if not checkpoint(plan):
