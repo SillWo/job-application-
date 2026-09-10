@@ -20,7 +20,7 @@ test('persists every new-session parameter across remounts', async () => {
   localStorage.setItem('job-orchestrator.session-draft', JSON.stringify({ viewedLimit: '41', unlimitedViewed: true }))
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' } }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru', allowed_domains: ['hh.ru'] }, { site_id: 'hirehi', display_name: 'HireHi', allowed_domains: ['hirehi.ru'] }] })
@@ -57,7 +57,7 @@ test('configures influence sliders, accessible hints, and minimum score payload'
   const requests: Array<{ url: string; method?: string; body?: string }> = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input); requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' } }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 77, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
@@ -106,7 +106,7 @@ test('captures only the user job description with a 2000-character limit', async
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' } }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 78, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
@@ -288,7 +288,7 @@ test.each([
   const requests: Array<{ url: string; method?: string }> = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input); requests.push({ url, method: init?.method })
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' } }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 99, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
     if (url.endsWith('/api/model/status')) return status ? Promise.resolve({ ok: true, json: async () => status }) : Promise.resolve({ ok: false, statusText: 'down', json: async () => ({}) })
@@ -306,7 +306,7 @@ test('creates and starts a session without a blocking model preflight', async ()
   const requests: string[] = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input); requests.push(`${init?.method ?? 'GET'} ${url}`)
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' } }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true }) })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 99, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
@@ -524,7 +524,7 @@ test('RUNNING HH does not block launching HireHi', async () => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input); requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
     if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru' }, { site_id: 'hirehi', display_name: 'HireHi' }] })
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' } }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 22, profile_id: 1, adapter_id: 'hirehi', status: 'CREATED', counters: {} }) })
@@ -566,7 +566,7 @@ test('HH launch has no per-session resume controls', async () => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     requests.push({ url, body: init?.body ? String(init.body) : undefined })
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' } }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 2, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
@@ -650,13 +650,42 @@ test('does not show terminal history when there are no terminal sessions', async
   expect(screen.queryByText(/Завершённые сессии/)).not.toBeInTheDocument()
 })
 
+test('NEEDS_REVIEW session exposes resume and stop actions', async () => {
+  const requests: string[] = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    requests.push(`${init?.method ?? 'GET'} ${url}`)
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [{ id: 42, profile_id: 1, adapter_id: 'hh', status: 'NEEDS_REVIEW', counters: {}, started_at: null, finished_at: null, stop_reason: null }] })
+    if (url.endsWith('/api/sessions/42/resume')) return Promise.resolve({ ok: true, json: async () => ({ status: 'RUNNING' }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  const session = await screen.findByTestId('session-42')
+  expect(within(session).getByRole('button', { name: 'Продолжить' })).toBeInTheDocument()
+  expect(within(session).getByRole('button', { name: 'Остановить' })).toBeInTheDocument()
+  fireEvent.click(within(session).getByRole('button', { name: 'Продолжить' }))
+  await waitFor(() => expect(requests).toContain('POST /api/sessions/42/resume'))
+})
+
+test('missing profile gender links to profile editor from session setup', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: null } }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByRole('link', { name: 'Открыть профиль' })).toHaveAttribute('href', '/profile')
+})
+
 test('HireHi launch hides per-session resume controls', async () => {
   const requests: Array<{ url: string; body?: string }> = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     requests.push({ url, body: init?.body ? String(init.body) : undefined })
     if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru', allowed_domains: ['hh.ru'] }, { site_id: 'hirehi', display_name: 'HireHi', allowed_domains: ['hirehi.ru'] }] })
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {}, created_at: '2026-08-13T00:00:00Z' }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' }, created_at: '2026-08-13T00:00:00Z' }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, profile_id: 1, name: 'Resume', selected_for_matching: true, skills: [], experiences: [] }] })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 3, profile_id: 1, adapter_id: 'hirehi', status: 'CREATED', counters: {} }) })
@@ -722,7 +751,7 @@ test('shows resume import progress and creates a separate resume', async () => {
     if (url.endsWith('/api/model/status')) {
       return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     }
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: 'Sample Candidate', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male', full_name: 'Sample Candidate', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [] })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
@@ -742,7 +771,7 @@ test('shows resume import progress and creates a separate resume', async () => {
   finishUpload({
     ok: true,
     json: async () => ({
-      profile: { id: 1, data: { full_name: 'Sample Candidate', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' },
+      profile: { id: 1, data: { gender: 'male', full_name: 'Sample Candidate', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' },
       resume: { id: 42, profile_id: 1, name: 'Product Manager', desired_title: 'Product Manager', desired_salary: '', employment_types: [], work_formats: [], business_trips: null, experiences: [], skills: [], about: '', selected_for_matching: false, original_filename: 'resume.txt' },
     }),
   })
@@ -758,14 +787,14 @@ test('renders structured personal profile and makes selected resumes explicit', 
     const url = String(input)
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 4, profile_id: 1, name: 'Product role', desired_title: 'Product Manager', desired_salary: '180000', employment_types: ['permanent'], work_formats: ['remote'], business_trips: false, experiences: [], skills: ['CustDev', 'Scrum'], about: 'Product work', selected_for_matching: true }] })
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: 'Test Candidate', residence: 'Test City', job_search_locations: ['Remote'], contacts: { phone: null, email: 'candidate@example.test', messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male', full_name: 'Test Candidate', residence: 'Test City', job_search_locations: ['Remote'], contacts: { phone: null, email: 'candidate@example.test', messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
     return Promise.resolve({ ok: true, json: async () => [] })
   })
   vi.stubGlobal('fetch', fetchMock)
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/profile']}><App /></MemoryRouter></QueryClientProvider>)
 
   expect(await screen.findByText('Личная информация')).toBeInTheDocument()
-  expect(screen.getByDisplayValue('Test Candidate')).toBeInTheDocument()
+  expect(await screen.findByDisplayValue('Test Candidate')).toBeInTheDocument()
   expect(screen.getByRole('checkbox', { name: 'Передавать модели' })).toBeChecked()
   expect(screen.getAllByText('Product role').length).toBeGreaterThan(0)
 
@@ -820,7 +849,7 @@ test('renders structured personal profile and makes selected resumes explicit', 
 test('profile resume toggle failure is surfaced as danger notice', async () => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: 'Кандидат', contacts: { messengers: [] }, education: [], languages: [], job_search_locations: [] } }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male', full_name: 'Кандидат', contacts: { messengers: [] }, education: [], languages: [], job_search_locations: [] } }] })
     if (url.endsWith('/api/profiles/1/resumes') && !init?.method) return Promise.resolve({ ok: true, json: async () => [{ id: 4, profile_id: 1, name: 'Резюме', selected_for_matching: true, employment_types: [], work_formats: [], experiences: [], skills: [], about: '' }] })
     if (url.includes('/resumes/4') && init?.method === 'PATCH') return Promise.resolve({ ok: false, status: 500, text: async () => 'Не удалось сохранить', json: async () => ({ detail: 'Не удалось сохранить' }) })
     return Promise.resolve({ ok: true, json: async () => [] })
@@ -847,7 +876,7 @@ test('allows creating an HH session after a stopped session', async () => {
     if (url.endsWith('/api/model/status')) {
       return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     }
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: '', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male', full_name: '', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: [] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 7, profile_id: 1, name: 'Selected', desired_title: 'Role', desired_salary: null, employment_types: [], work_formats: [], business_trips: null, experiences: [], skills: [], about: '', selected_for_matching: true }] })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') {
       return Promise.resolve({ ok: true, json: async () => ({ ...stoppedSession, id: 2, adapter_id: 'hh', status: 'CREATED' }) })
@@ -1182,7 +1211,7 @@ test('deletes the selected dynamic profile row while preserving its neighbor', a
   window.matchMedia = ((query: string) => ({ matches: query.includes('prefers-reduced-motion'), media: query, onchange: null, addListener: () => undefined, removeListener: () => undefined, addEventListener: () => undefined, removeEventListener: () => undefined, dispatchEvent: () => false })) as typeof window.matchMedia
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: 'Кандидат', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: ['Первый', 'Второй'] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male', full_name: 'Кандидат', residence: '', job_search_locations: [], contacts: { phone: null, email: null, messengers: ['Первый', 'Второй'] }, education: [], languages: [], driver_license: false }, created_at: '2026-08-13T00:00:00Z' }] })
     if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [] })
     return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
   }))
@@ -1217,7 +1246,7 @@ test('SingleSelect opens, selects an option, and closes on Escape', async () => 
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
     if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru' }, { site_id: 'hirehi', display_name: 'HireHi' }] })
-    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: {} }] })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' } }] })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
@@ -1263,13 +1292,81 @@ test.each([
   expect(status).toHaveAttribute('data-status', dataStatus)
 })
 
-test('empty profile state reuses Empty component and icon controls expose SVGs', async () => {
-  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/api/profiles')
-    ? Promise.resolve({ ok: true, json: async () => [] })
-    : Promise.resolve({ ok: true, json: async () => [] })))
+test('new profile cannot be saved before gender is selected', async () => {
+  const requests: Array<{ url: string; method?: string }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    requests.push({ url: String(input), method: init?.method })
+    return String(input).endsWith('/api/profiles')
+      ? Promise.resolve({ ok: true, json: async () => [] })
+      : Promise.resolve({ ok: true, json: async () => [] })
+  }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/profile']}><App /></MemoryRouter></QueryClientProvider>)
-  expect(await screen.findByText('Создайте личный профиль')).toBeInTheDocument()
+  expect(await screen.findByRole('heading', { name: 'Личная информация' })).toBeInTheDocument()
   const create = screen.getByRole('button', { name: 'Создать профиль' })
-  expect(create.closest('.empty')).toBeInTheDocument()
-  expect(screen.queryByText('×')).not.toBeInTheDocument()
+  expect(create).toBeDisabled()
+  fireEvent.click(create)
+  expect(requests.filter((request) => request.url.endsWith('/api/profiles') && request.method === 'POST')).toHaveLength(0)
+  await chooseOption('Пол соискателя', 'Женский')
+  expect(create).toBeEnabled()
+  fireEvent.click(create)
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/profiles') && request.method === 'POST')).toBe(true))
+})
+
+test('profile gender is required and included in the profile payload', async () => {
+  const requests: Array<{ url: string; method?: string; body?: string }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { full_name: 'Кандидат', gender: null, contacts: { messengers: [] }, education: [], languages: [], job_search_locations: [] } }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [] })
+    return Promise.resolve({ ok: true, json: async () => ({}) })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/profile']}><App /></MemoryRouter></QueryClientProvider>)
+  await screen.findByDisplayValue('Кандидат')
+  const gender = await screen.findByRole('combobox', { name: 'Пол соискателя' })
+  expect(gender).toHaveTextContent('Выберите пол')
+  expect(screen.getByRole('button', { name: 'Сохранить личный профиль' })).toBeDisabled()
+  await chooseOption('Пол соискателя', 'Мужской')
+  expect(screen.getByRole('button', { name: 'Сохранить личный профиль' })).toBeEnabled()
+  fireEvent.click(screen.getByRole('button', { name: 'Сохранить личный профиль' }))
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/profiles/1') && request.method === 'PATCH')).toBe(true))
+  const payload = JSON.parse(requests.find((request) => request.url.endsWith('/api/profiles/1') && request.method === 'PATCH')?.body ?? '{}')
+  expect(payload.gender).toBe('male')
+})
+
+test('custom cover letter structure survives toggling and is sent on launch', async () => {
+  const requests: Array<{ url: string; method?: string; body?: string }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
+    if (url.endsWith('/api/profiles')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, data: { gender: 'male' } }] })
+    if (url.endsWith('/api/profiles/1/resumes')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, selected_for_matching: true }] })
+    if (url.endsWith('/api/session-draft')) return Promise.resolve({ ok: true, json: async () => ({ revision: 1, draft: null }) })
+    if (url.endsWith('/api/sessions') && !init?.method) return Promise.resolve({ ok: true, json: async () => [] })
+    if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 81, profile_id: 1, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
+    if (url.endsWith('/api/sessions/81/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
+    return Promise.resolve({ ok: true, json: async () => ({}) })
+  }))
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const mounted = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByRole('heading', { name: 'Влияние факторов на вакансии' })).toBeInTheDocument()
+  const auto = screen.getByRole('checkbox', { name: 'ИИ самостоятельно определяет структуру сопроводительного письма' })
+  const template = screen.getByRole('textbox', { name: 'Своя структура сопроводительного письма' })
+  expect(auto).toBeChecked()
+  expect(template).toBeDisabled()
+  fireEvent.click(auto)
+  expect(screen.getByRole('button', { name: 'Создать и запустить' })).toBeDisabled()
+  expect(screen.getByRole('alert')).toHaveTextContent('Добавьте структуру сопроводительного письма')
+  fireEvent.change(template, { target: { value: 'Здравствуйте, я [ФИО].' } })
+  expect(template).toHaveValue('Здравствуйте, я [ФИО].')
+  expect(screen.getByRole('button', { name: 'Создать и запустить' })).toBeEnabled()
+  mounted.unmount()
+  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByRole('textbox', { name: 'Своя структура сопроводительного письма' })).toHaveValue('Здравствуйте, я [ФИО].')
+  const launch = screen.getByRole('button', { name: 'Создать и запустить' })
+  fireEvent.click(launch)
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/81/start'))).toBe(true))
+  const payload = JSON.parse(requests.find((request) => request.url.endsWith('/api/sessions') && request.method === 'POST')?.body ?? '{}')
+  expect(payload.cover_letter_auto).toBe(false)
+  expect(payload.cover_letter_template).toBe('Здравствуйте, я [ФИО].')
 })

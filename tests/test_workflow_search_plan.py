@@ -53,7 +53,7 @@ def search_runtime(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     with sessions() as db:
-        profile = CandidateProfile(full_name="Test", contacts={}, education=[], languages=[])
+        profile = CandidateProfile(full_name="Test", gender="male", contacts={}, education=[], languages=[])
         db.add(profile)
         db.flush()
         db.add(Resume(profile_id=profile.id, name="Resume", desired_title="Python developer",

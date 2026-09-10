@@ -42,6 +42,21 @@ def test_round_trip_without_browser_and_stale_tab_protection(client):
     assert browser.get('/api/session-draft').json()['draft']['desiredJobDescription'] == 'Новое'
 
 
+def test_cover_letter_settings_round_trip(client):
+    browser, _ = client
+    payload = {
+        "revision": 0,
+        "draft": {
+            "coverLetterAuto": False,
+            "coverLetterTemplate": "Здравствуйте, я [ФИО]...",
+        },
+    }
+    saved = browser.put('/api/session-draft', json=payload)
+    assert saved.status_code == 200
+    assert saved.json()["draft"]["coverLetterAuto"] is False
+    assert saved.json()["draft"]["coverLetterTemplate"] == "Здравствуйте, я [ФИО]..."
+
+
 def test_recovers_latest_description_but_respects_saved_empty_text(client):
     browser, engine = client
     with Session(engine) as db:

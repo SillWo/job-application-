@@ -83,7 +83,7 @@ async def test_chromium_recovers_page_model_and_lost_submission_response(tmp_pat
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        profile = CandidateProfile(full_name="Fixture")
+        profile = CandidateProfile(full_name="Fixture", gender="male")
         db.add(profile)
         db.flush()
         db.add(Resume(profile_id=profile.id, name="Fixture resume", selected_for_matching=True))

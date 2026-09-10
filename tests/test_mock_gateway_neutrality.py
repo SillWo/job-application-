@@ -1,7 +1,11 @@
 import pytest
 
 from backend.intelligence.gateway import ModelGateway
-from backend.intelligence.letter_writer import _finish_cover_letter, write_cover_letter
+from backend.intelligence.letter_writer import (
+    CoverLetterValidationError,
+    _finish_cover_letter,
+    write_cover_letter,
+)
 from backend.schemas.domain import CoverLetterDraft, JobPosting, ResumeImportData
 
 
@@ -27,52 +31,40 @@ async def test_mock_cover_letter_is_neutral_and_uses_vacancy_title():
     assert "продукт" not in result.text.lower()
 
 
-def test_cover_letter_closing_uses_only_profile_messengers_and_stays_within_limit():
-    draft = " ".join(["слово"] * 130)
-    result = _finish_cover_letter(
-        draft,
-        {"contacts": {"messengers": ["https://t.me/example", "@example"]}},
-    )
-    assert result.endswith(
-        "Буду рад продолжить общение с вами в этом чате или в мессенджерах - "
-        "https://t.me/example, @example"
-    )
-    assert result.startswith("Здравствуйте!")
-    assert len(result.split()) <= 110
+def test_cover_letter_validation_does_not_flatten_or_invent_closing():
+    draft = " ".join(["слово"] * 160)
+    with pytest.raises(CoverLetterValidationError):
+        _finish_cover_letter(draft, {"contacts": {"messengers": ["https://t.me/example"]}})
 
 
 def test_cover_letter_does_not_invent_messenger_link_when_contacts_are_empty():
     result = _finish_cover_letter("Короткий текст.", {"contacts": {"messengers": []}})
-    assert result.endswith(
-        "Буду рад продолжить общение с вами в этом чате или в мессенджерах -"
-    )
-    assert "t.me" not in result
+    assert result == "Короткий текст."
 
 
 @pytest.mark.asyncio
-async def test_write_cover_letter_passes_three_blocks_and_adds_contractual_closing():
+async def test_write_cover_letter_passes_new_generation_contract():
     class FakeGateway:
         async def structured(self, role, payload, response_model):
+            if role == "special_conditions":
+                return response_model(conditions=[])
             assert role == "writer"
             requirements = payload["requirements"]
-            assert "не более 80 слов" in requirements
-            assert "без приветствия" in requirements
-            assert "почему понравилась вакансия" in requirements
-            assert "почему понравилась компания" in requirements
-            assert "преимущества кандидата" in requirements
-            return response_model(text="Мне интересна вакансия и задачи. Компания близка по подходу. Мой опыт подходит.")
+            assert "не более 150 слов" in requirements
+            assert "квадратные скобки" in requirements
+            assert "Особые условия работодателя" in requirements
+            return response_model(
+                text="Мне интересна вакансия и задачи. Компания близка по подходу. Мой опыт подходит.",
+                fulfilled_special_conditions=[],
+            )
 
     result = await write_cover_letter(
         JobPosting(source="mock", url="https://example.test/job", title="Тестировщик", company="Компания", description="Задачи"),
-        {"full_name": "Иван Иванов", "contacts": {"messengers": ["https://t.me/ivan"]}},
+        {"full_name": "Иван Иванов", "gender": "male", "contacts": {"messengers": ["https://t.me/ivan"]}},
         [{"name": "Резюме"}],
         FakeGateway(),
     )
-    assert result.endswith(
-        "Буду рад продолжить общение с вами в этом чате или в мессенджерах - https://t.me/ivan"
-    )
-    assert result.startswith("Здравствуйте!")
-    assert len(result.split()) <= 110
+    assert result == "Мне интересна вакансия и задачи. Компания близка по подходу. Мой опыт подходит."
 
 
 def test_cover_letter_does_not_duplicate_greeting():

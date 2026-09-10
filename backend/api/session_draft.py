@@ -30,6 +30,8 @@ class LaunchDraft(BaseModel):
     desiredJobDescription: str = Field(default="", max_length=2000)
     unlimitedApplications: bool = False
     influence: Influence = Field(default_factory=Influence)
+    coverLetterAuto: bool = True
+    coverLetterTemplate: str = Field(default="", max_length=12000)
 
 
 class DraftUpdate(BaseModel):
@@ -55,6 +57,8 @@ def read_draft(db: Session = Depends(get_db)) -> dict:
         desiredJobDescription=previous.desired_job_description,
         applicationLimit=str(previous.application_limit or 5),
         unlimitedApplications=previous.application_limit is None,
+        coverLetterAuto=previous.cover_letter_auto,
+        coverLetterTemplate=previous.cover_letter_template,
     )
     levels = ("low", "medium", "high", "maximum")
     for key, score in (previous.minimum_scores or {}).items():

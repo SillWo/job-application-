@@ -16,7 +16,7 @@ from backend.intelligence.evaluator import _payload, evaluate
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
 from backend.intelligence.hirehi_category import JobSummary, choose_hirehi_category
 from backend.intelligence.hirehi_grade import hirehi_grades
-from backend.intelligence.letter_writer import write_cover_letter
+from backend.intelligence.letter_writer import CoverLetterValidationError, write_cover_letter
 from backend.intelligence.preference_policy import compile_preference_policy
 from backend.intelligence.search_planner import plan_search_queries
 from backend.orchestrator.adaptive_search import AdaptiveSearch
@@ -171,6 +171,7 @@ def _record_payload(record: Any) -> dict:
 def _profile_payload(record: Any) -> dict:
     profile_keys = (
         "full_name",
+        "gender",
         "residence",
         "job_search_locations",
         "contacts",
@@ -184,6 +185,10 @@ def _profile_payload(record: Any) -> dict:
         if value is not None:
             payload[key] = value
     return payload
+
+
+_PROFILE_GENDER_REQUIRED_MESSAGE = "Укажите пол соискателя в профиле перед запуском сессии"
+_COVER_LETTER_RETRY_LIMIT = 3
 
 
 def _selected_resume_records(db, profile_record: Any) -> list[Any]:
@@ -530,6 +535,18 @@ class WorkflowManager:
             profile_record = db.get(CandidateProfile, item.profile_id)
             if profile_record is None:
                 raise ValueError(f"Профиль {item.profile_id} не найден")
+            if profile_record.gender not in {"male", "female"}:
+                item.status = SessionStatus.NEEDS_REVIEW
+                item.stop_reason = _PROFILE_GENDER_REQUIRED_MESSAGE
+                item.finished_at = None
+                self.emit(
+                    db,
+                    session_id,
+                    "human_required",
+                    _PROFILE_GENDER_REQUIRED_MESSAGE,
+                    {"kind": "profile", "field": "gender"},
+                )
+                return
             profile = _profile_schema().model_validate(_profile_payload(profile_record))
             selected_records = _selected_resume_records(db, profile_record)
             selected_resumes = [_record_payload(resume) for resume in selected_records]
@@ -985,14 +1002,63 @@ class WorkflowManager:
                     else:
                         try:
                             letter = await write_cover_letter(
-                                posting, profile, selected_resumes, gateway, preference_policy
+                                posting,
+                                profile,
+                                selected_resumes,
+                                gateway,
+                                preference_policy,
+                                cover_letter_auto=item.cover_letter_auto,
+                                cover_letter_template=item.cover_letter_template,
                             )
+                        except CoverLetterValidationError as exc:
+                            data = dict(vacancy.data or {})
+                            try:
+                                previous_attempts = int(data.get("cover_letter_attempts", 0))
+                            except (TypeError, ValueError):
+                                previous_attempts = 0
+                            attempts = max(0, previous_attempts) + 1
+                            data["cover_letter_attempts"] = attempts
+                            data["cover_letter_error"] = str(exc)
+                            vacancy.data = data
+                            if attempts < _COVER_LETTER_RETRY_LIMIT:
+                                vacancy.state = "EVALUATING"
+                                retry_needed = True
+                                self.emit(
+                                    db,
+                                    session_id,
+                                    "vacancy_retry",
+                                    "Сопроводительное письмо будет сгенерировано повторно",
+                                    {
+                                        "kind": "cover_letter",
+                                        "vacancy_id": vacancy.id,
+                                        "attempt": attempts,
+                                        "error": str(exc),
+                                    },
+                                )
+                            else:
+                                vacancy.state = "NEEDS_REVIEW"
+                                counters = dict(item.counters)
+                                counters["review"] = counters.get("review", 0) + 1
+                                item.counters = counters
+                                self.emit(
+                                    db,
+                                    session_id,
+                                    "human_required",
+                                    str(exc),
+                                    {"kind": "cover_letter", "vacancy_id": vacancy.id, "attempts": attempts},
+                                )
+                            continue
                         except ModelUnavailable:
                             raise
                     db.refresh(item)
                     if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
                         return
                     plan.cover_letter = letter
+                    if vacancy.data and "cover_letter_attempts" in vacancy.data:
+                        data = dict(vacancy.data)
+                        data.pop("cover_letter_attempts", None)
+                        data.pop("cover_letter_error", None)
+                        vacancy.data = data
                     plan.allow_foreign_application = adapter_id == "hh"
                     plan_record.data = plan.model_dump()
                     if cover_record is None:

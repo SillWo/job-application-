@@ -59,6 +59,7 @@ from backend.persistence.models import (
 )
 from backend.schemas.domain import (
     CandidateProfileData,
+    CandidateProfileInput,
     ResumeData,
     SessionStatus,
 )
@@ -279,6 +280,8 @@ class SessionCreate(BaseModel):
     adapter_id: str
     application_limit: int | None = Field(default=5, ge=1)
     guaranteed_application: bool = False
+    cover_letter_auto: bool = True
+    cover_letter_template: str = Field(default="", max_length=12000)
 
     @classmethod
     def _minimum_limits(cls) -> dict[str, int]:
@@ -318,6 +321,12 @@ class SessionCreate(BaseModel):
                 raise ValueError(f"Минимум {key} должен быть от 0 до {maximum}")
         return self
 
+    @model_validator(mode="after")
+    def validate_cover_letter(self) -> SessionCreate:
+        if not self.cover_letter_auto and not self.cover_letter_template.strip():
+            raise ValueError("Укажите структуру сопроводительного письма или включите автоматическое написание")
+        return self
+
 
 @router.get("/health")
 def health() -> dict:
@@ -347,6 +356,7 @@ async def _import_resume_for_profile(
         if profile is None:
             profile = CandidateProfile(
                 full_name=personal.full_name,
+                gender=personal.gender,
                 residence=personal.residence,
                 job_search_locations=personal.job_search_locations,
                 contacts=personal.contacts.model_dump(),
@@ -396,6 +406,7 @@ async def upload_resume(
 def _profile_data(item: CandidateProfile) -> CandidateProfileData:
     return CandidateProfileData(
         full_name=item.full_name,
+        gender=item.gender,
         residence=item.residence,
         job_search_locations=item.job_search_locations or [],
         contacts=item.contacts or {},
@@ -410,6 +421,8 @@ def _merge_personal_profile(item: CandidateProfile, data: CandidateProfileData) 
         item.full_name = data.full_name
     if not item.residence and data.residence:
         item.residence = data.residence
+    if item.gender is None and data.gender is not None:
+        item.gender = data.gender
     if not item.job_search_locations and data.job_search_locations:
         item.job_search_locations = data.job_search_locations
     if not item.contacts and data.contacts.model_dump(exclude_none=True):
@@ -420,6 +433,14 @@ def _merge_personal_profile(item: CandidateProfile, data: CandidateProfileData) 
         item.languages = [entry.model_dump() for entry in data.languages]
     if item.driver_license is None and data.driver_license is not None:
         item.driver_license = data.driver_license
+
+
+def _require_profile_gender(item: CandidateProfile) -> None:
+    if item.gender not in {"male", "female"}:
+        raise HTTPException(
+            422,
+            "Укажите пол соискателя в профиле перед запуском сессии",
+        )
 
 
 def _matching_resumes(profile_id: int, db: Session) -> list[dict]:
@@ -468,9 +489,10 @@ def profiles(db: Session = Depends(get_db)) -> list[dict]:
 
 
 @router.post("/profiles")
-def create_profile(data: CandidateProfileData, db: Session = Depends(get_db)) -> dict:
+def create_profile(data: CandidateProfileInput, db: Session = Depends(get_db)) -> dict:
     item = CandidateProfile(
         full_name=data.full_name,
+        gender=data.gender,
         residence=data.residence,
         job_search_locations=data.job_search_locations,
         contacts=data.contacts.model_dump(),
@@ -549,12 +571,13 @@ def answer_profile_question(profile_id: int, question_id: int, payload: Question
 
 @router.patch("/profiles/{profile_id}")
 def patch_profile(
-    profile_id: int, data: CandidateProfileData, db: Session = Depends(get_db)
+    profile_id: int, data: CandidateProfileInput, db: Session = Depends(get_db)
 ) -> dict:
     item = db.get(CandidateProfile, profile_id)
     if not item:
         raise HTTPException(404, "Профиль не найден")
     item.full_name = data.full_name
+    item.gender = data.gender
     item.residence = data.residence
     item.job_search_locations = data.job_search_locations
     item.contacts = data.contacts.model_dump()
@@ -651,6 +674,8 @@ def session_dict(item: JobSession) -> dict:
         "adapter_id": item.adapter_id,
         "application_limit": item.application_limit,
         "guaranteed_application": bool(item.guaranteed_application),
+        "cover_letter_auto": getattr(item, "cover_letter_auto", None) is not False,
+        "cover_letter_template": getattr(item, "cover_letter_template", "") or "",
         "status": item.status,
         "counters": item.counters or {},
         "started_at": item.started_at.isoformat() if item.started_at else None,
@@ -661,8 +686,10 @@ def session_dict(item: JobSession) -> dict:
 
 @router.post("/sessions")
 def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dict:
-    if not db.get(CandidateProfile, payload.profile_id):
+    profile = db.get(CandidateProfile, payload.profile_id)
+    if not profile:
         raise HTTPException(400, "Сначала создайте профиль")
+    _require_profile_gender(profile)
     try:
         adapter_registry.get(payload.adapter_id)
     except KeyError as exc:
@@ -674,6 +701,8 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         adapter_id=payload.adapter_id,
         application_limit=payload.application_limit,
         guaranteed_application=payload.guaranteed_application,
+        cover_letter_auto=payload.cover_letter_auto,
+        cover_letter_template=payload.cover_letter_template,
         status=SessionStatus.CREATED,
         counters={},
     )
@@ -695,6 +724,12 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(404, "Сессия не найдена")
     if item.status != SessionStatus.CREATED:
         raise HTTPException(409, "Запустить можно только новую сессию")
+    profile = db.get(CandidateProfile, item.profile_id)
+    if not profile:
+        raise HTTPException(400, "Сначала создайте профиль")
+    _require_profile_gender(profile)
+    if not item.cover_letter_auto and not (item.cover_letter_template or "").strip():
+        raise HTTPException(422, "Укажите структуру сопроводительного письма")
     if workflow_manager.launch(session_id) is False:
         raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
     item.status = SessionStatus.RUNNING
@@ -714,8 +749,18 @@ async def resume_session(session_id: int, db: Session = Depends(get_db)) -> dict
     item = db.get(JobSession, session_id)
     if not item:
         raise HTTPException(404, "Сессия не найдена")
-    if item.status not in {SessionStatus.PAUSED, SessionStatus.WAITING_FOR_LOGIN}:
-        raise HTTPException(409, "Продолжить можно только приостановленную сессию")
+    if item.status not in {
+        SessionStatus.PAUSED,
+        SessionStatus.WAITING_FOR_LOGIN,
+        SessionStatus.NEEDS_REVIEW,
+    }:
+        raise HTTPException(409, "Продолжить можно только приостановленную сессию или сессию, требующую проверки")
+    profile = db.get(CandidateProfile, item.profile_id)
+    if not profile:
+        raise HTTPException(400, "Сначала создайте профиль")
+    _require_profile_gender(profile)
+    if not item.cover_letter_auto and not (item.cover_letter_template or "").strip():
+        raise HTTPException(422, "Укажите структуру сопроводительного письма")
     if workflow_manager.launch(session_id) is False:
         raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
     item.status = SessionStatus.RUNNING

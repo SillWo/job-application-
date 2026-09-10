@@ -101,7 +101,7 @@ async def test_adaptive_workflow_discovers_ui_channels_without_duplicate_submiss
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        profile = CandidateProfile(full_name="Fixture")
+        profile = CandidateProfile(full_name="Fixture", gender="male")
         db.add(profile)
         db.flush()
         db.add(Resume(profile_id=profile.id, name="Fixture", desired_title="Engineer", selected_for_matching=True))

@@ -481,6 +481,54 @@ class ModelGateway:
             return schema.model_validate({"rule_index": None, "context_complete": False,
                                           "confidence": 0, "vacancy_evidence": [],
                                           "reason": "Mock не интерпретирует условия зарплаты"})
+        if role == "application_salary_estimate":
+            from backend.intelligence.application_answers import SalaryEstimate, _amounts
+            rules = payload.get("salary_rules", []) or []
+            job = payload.get("job", {}) or {}
+            requested = payload.get("requested_context", {}) or {}
+            experience = str(job.get("required_experience") or "")
+            work_format = str(job.get("work_format") or "").casefold()
+            location = str(job.get("location") or "").casefold()
+            def score(rule: dict) -> tuple[int, int]:
+                condition = str(rule.get("condition") or "").casefold()
+                value = 0
+                if "удал" in condition and "удал" in work_format:
+                    value += 4
+                if ("офис" in condition or "на месте" in condition) and (
+                    "офис" in work_format or "на месте" in work_format or "гибрид" in work_format
+                ):
+                    value += 4
+                if any(marker in condition for marker in ("мск", "москва", "санкт-петербург", "спб")) and any(
+                    marker in location for marker in ("москва", "санкт-петербург", "спб")
+                ):
+                    value += 3
+                match = re.search(r"(\d+)\s*[-–—]\s*(\d+)", experience)
+                lower = int(match[1]) if match else None
+                upper = int(match[2]) if match else None
+                if lower is not None and upper is not None:
+                    if lower >= 3 and re.search(r"(?:от|более|свыше|>=)\s*3|3\s*[-–—]\s*\d+", condition):
+                        value += 2
+                    if upper <= 3 and re.search(r"(?:до|не более|<=)\s*3|\d+\s*и\s*(?:меньше|менее)", condition):
+                        value += 2
+                return value, int(rule.get("amount") or 0)
+            if rules:
+                selected = max(rules, key=score)
+            else:
+                amounts = _amounts(str(payload.get("source_text") or ""))
+                if not amounts:
+                    for resume in payload.get("resumes", []) or []:
+                        amounts.update(_amounts(str(resume.get("desired_salary") or "")))
+                selected = {"amount": max(amounts) if amounts else 1, "currency": "RUB", "gross": None, "period": "month"}
+            result = SalaryEstimate(
+                amount=int(selected.get("amount") or 1),
+                currency=str(requested.get("currency") or selected.get("currency") or "RUB"),
+                gross=requested.get("gross") if requested.get("gross") is not None else selected.get("gross"),
+                period=str(requested.get("period") or selected.get("period") or "month"),
+                confidence=0.8,
+                evidence=[str(selected.get("condition") or "Исходные зарплатные правила")],
+                reason="Оценка по исходным зарплатным правилам и контексту вакансии",
+            )
+            return schema.model_validate(result.model_dump())
         if role == "adaptive_search_planner":
             return schema.model_validate({"queries": []})
         from backend.schemas.domain import (
@@ -490,6 +538,10 @@ class ModelGateway:
             ResumeAnalysis,
             ScoreComponent,
         )
+        if role == "special_conditions":
+            from backend.intelligence.letter_writer import _fallback_special_conditions
+            extracted = _fallback_special_conditions(str(payload.get("vacancy_description", "")))
+            return schema.model_validate(extracted.model_dump(mode="json"))
         if role == "preference_compiler":
             from backend.schemas.domain import PreferenceFlag, SalaryPreference
             text = str(payload.get("description", ""))
@@ -596,17 +648,66 @@ class ModelGateway:
                     },
                 }
             )
-        if schema is CoverLetterDraft:
+        if schema is CoverLetterDraft or schema.__name__ == "CoverLetterGenerationDraft":
             vacancy = payload.get("vacancy", {})
-            return schema.model_validate(
-                {
-                    "text": (
-                        f"Здравствуйте! Меня заинтересовала вакансия «{vacancy.get('title', 'эта позиция')}». "
-                        "Мой опыт и навыки соответствуют ключевым задачам позиции. Буду рад обсудить "
-                        "возможный вклад в работу команды на интервью."
-                    )
-                }
+            profile = payload.get("profile", {}) or {}
+            resumes = payload.get("resumes", []) or []
+            full_name = str(profile.get("full_name") or "").strip()
+            gender = profile.get("gender")
+            skills: list[str] = []
+            for resume in resumes:
+                for skill in resume.get("skills", []) if isinstance(resume, dict) else []:
+                    if str(skill).strip() and str(skill).strip() not in skills:
+                        skills.append(str(skill).strip())
+            lines = ["Здравствуйте!"]
+            if full_name:
+                lines += [f"\nЯ {full_name}, кратко обо мне:"]
+            if skills:
+                lines.append("- В работе использую " + ", ".join(skills[:8]) + ".")
+            education = profile.get("education", []) if isinstance(profile, dict) else []
+            if education:
+                institution = education[0].get("institution") if isinstance(education[0], dict) else None
+                if institution:
+                    lines.append(f"- Образование: {institution}.")
+            title = str(vacancy.get("title") or "эта позиция")
+            has_grounded_facts = bool(
+                skills or education or any(
+                    isinstance(resume, dict) and (resume.get("experiences") or resume.get("about"))
+                    for resume in resumes
+                )
             )
+            if gender == "male" and has_grounded_facts:
+                lines.append(f"Уверен, что стану отличным кандидатом на вашу вакансию, ведь мой опыт связан с задачами роли «{title}».")
+                lines.append("Буду рад продолжить с вами общение здесь в чате, телефонном звонке или мессенджерах!")
+            elif gender == "female" and has_grounded_facts:
+                lines.append(f"Уверена, что стану отличным кандидатом на вашу вакансию, ведь мой опыт связан с задачами роли «{title}».")
+                lines.append("Буду рада продолжить с вами общение здесь в чате, телефонном звонке или мессенджерах!")
+            else:
+                lines.append(f"Считаю себя подходящим кандидатом на роль «{title}».")
+                lines.append("Буду рад продолжить с вами общение здесь в чате, телефонном звонке или мессенджерах!")
+            contacts = profile.get("contacts", {}) if isinstance(profile, dict) else {}
+            messengers = contacts.get("messengers", []) if isinstance(contacts, dict) else []
+            if messengers or contacts.get("phone") or contacts.get("email"):
+                lines.append("\nМои контакты:")
+                lines.extend(f"- {item}" for item in messengers if str(item).strip())
+                if contacts.get("phone"):
+                    lines.append(f"- Телефон: {contacts['phone']}")
+                if contacts.get("email"):
+                    lines.append(f"- Почта: {contacts['email']}")
+            lines.append("\nС уважением, " + full_name if full_name else "\nС уважением")
+            text = "\n".join(lines)
+            fulfilled = []
+            for condition in payload.get("special_conditions", []) or []:
+                literal = condition.get("literal") if isinstance(condition, dict) else None
+                if literal and literal.casefold() not in text.casefold():
+                    text += "\n" + literal
+                span = literal or (condition.get("requirement", "") if isinstance(condition, dict) else "")
+                if span and span.casefold() in text.casefold():
+                    fulfilled.append({"id": condition.get("id"), "span": span, "position": "any"})
+            result = {"text": text}
+            if schema.__name__ == "CoverLetterGenerationDraft":
+                result["fulfilled_special_conditions"] = fulfilled
+            return schema.model_validate(result)
         raise ValueError(f"Mock provider has no fixture for role={role}, schema={schema.__name__}")
 
     @staticmethod

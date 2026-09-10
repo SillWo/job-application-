@@ -6,13 +6,15 @@ export type SessionDraft = {
   adapter: string
   applicationLimit: string
   desiredJobDescription: string
+  coverLetterAuto: boolean
+  coverLetterTemplate: string
   unlimitedApplications: boolean
   influence: Record<string, InfluenceLevel>
 }
 type CachedDraft = Partial<SessionDraft> & { revision?: number; pending?: boolean }
 type SavedDraft = { revision: number; draft: SessionDraft | null }
 const defaults: SessionDraft = {
-  adapter: 'hh', applicationLimit: '5', desiredJobDescription: '', unlimitedApplications: false,
+  adapter: 'hh', applicationLimit: '5', desiredJobDescription: '', coverLetterAuto: true, coverLetterTemplate: '', unlimitedApplications: false,
   influence: { tasks: 'medium', skills: 'low', experience_depth: 'medium', role_match: 'medium', industry: 'medium' },
 }
 
@@ -22,9 +24,10 @@ function readLocal(): CachedDraft {
     const draft: CachedDraft = {}
     if (!value || typeof value !== 'object') return draft
     if (['hh', 'hirehi', 'zarplata'].includes(value.adapter)) draft.adapter = value.adapter
-    for (const key of ['applicationLimit', 'desiredJobDescription'] as const) {
-      if (typeof value[key] === 'string') draft[key] = value[key].slice(0, key === 'applicationLimit' ? 32 : 2000)
+    for (const key of ['applicationLimit', 'desiredJobDescription', 'coverLetterTemplate'] as const) {
+      if (typeof value[key] === 'string') draft[key] = value[key].slice(0, key === 'applicationLimit' ? 32 : key === 'coverLetterTemplate' ? 12000 : 2000)
     }
+    if (typeof value.coverLetterAuto === 'boolean') draft.coverLetterAuto = value.coverLetterAuto
     if (typeof value.unlimitedApplications === 'boolean') draft.unlimitedApplications = value.unlimitedApplications
     if (Number.isInteger(value.revision) && value.revision >= 0) draft.revision = value.revision
     if (typeof value.pending === 'boolean') draft.pending = value.pending

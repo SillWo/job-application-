@@ -18,9 +18,17 @@ from backend.adapters.base.protocol import (
     SubmissionResult,
 )
 from backend.api.router import pause_session
+from backend.intelligence.letter_writer import CoverLetterValidationError
 from backend.orchestrator import workflow
 from backend.persistence.database import Base
-from backend.persistence.models import CandidateProfile, JobSession, Notification, Resume, Vacancy
+from backend.persistence.models import (
+    CandidateProfile,
+    CoverLetter,
+    JobSession,
+    Notification,
+    Resume,
+    Vacancy,
+)
 from backend.schemas.domain import JobEvaluation, JobPosting, SessionStatus
 
 
@@ -113,7 +121,7 @@ def runtime(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     with sessions() as db:
-        profile = CandidateProfile(full_name="Test", contacts={}, education=[], languages=[])
+        profile = CandidateProfile(full_name="Test", gender="male", contacts={}, education=[], languages=[])
         db.add(profile)
         db.flush()
         db.add(Resume(profile_id=profile.id, name="Resume", desired_title="Role",
@@ -278,6 +286,35 @@ async def test_model_unavailable_recovers_without_error_and_continues(runtime, m
         assert calls == 3
 
 
+@pytest.mark.asyncio
+async def test_missing_profile_gender_blocks_recovered_session_before_model(runtime, monkeypatch):
+    sessions, session_id = runtime
+    with sessions() as db:
+        profile = db.scalar(select(CandidateProfile))
+        profile.gender = None
+        db.commit()
+
+    evaluated = False
+
+    async def evaluate_impl(*args, **kwargs):
+        nonlocal evaluated
+        evaluated = True
+        return evaluation("skip")
+
+    monkeypatch.setattr(workflow, "evaluate", evaluate_impl)
+    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=5)
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        events = list(db.scalars(select(workflow.BrowserEvent).where(
+            workflow.BrowserEvent.session_id == session_id,
+            workflow.BrowserEvent.event_type == "human_required",
+        )))
+        assert item.status == SessionStatus.NEEDS_REVIEW
+        assert item.stop_reason == "Укажите пол соискателя в профиле перед запуском сессии"
+        assert evaluated is False
+        assert any(event.data == {"kind": "profile", "field": "gender"} for event in events)
+
+
 
 @pytest.mark.asyncio
 async def test_application_attempt_failure_increments_error_once(runtime, monkeypatch):
@@ -302,6 +339,35 @@ async def test_application_attempt_failure_increments_error_once(runtime, monkey
         assert item.status == SessionStatus.COMPLETED
         assert item.counters["errors"] == 1
         assert vacancy.state == "UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_apply_branch_uses_cover_letter_contract_without_extra_kwargs(runtime, monkeypatch):
+    refs = [JobRef(external_id="apply", url="https://fake/apply")]
+    calls = []
+
+    async def apply_evaluation(*args, **kwargs):
+        return evaluation("apply")
+
+    async def strict_writer(
+        job, profile, resumes, gateway, preference_policy=None, *,
+        cover_letter_auto=True, cover_letter_template="",
+    ):
+        calls.append((job.external_id, cover_letter_auto, cover_letter_template))
+        return "Сопроводительное письмо для тестовой вакансии"
+
+    monkeypatch.setattr(workflow, "write_cover_letter", strict_writer)
+    sessions, session_id = await run_workflow(
+        runtime, monkeypatch, FakeAdapter(refs), apply_evaluation,
+    )
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        vacancy = db.scalar(select(Vacancy))
+        assert item.status == SessionStatus.COMPLETED
+        assert item.counters["matched"] == 1
+        assert item.counters["submitted"] == 1
+        assert vacancy.state == "SUBMITTED"
+    assert calls == [("apply", True, "")]
 
 
 @pytest.mark.asyncio
@@ -385,6 +451,10 @@ async def test_letter_model_unavailable_recovers_without_duplicate_match_count(r
         return "Сопроводительное письмо для тестовой вакансии"
 
     monkeypatch.setattr(workflow, "write_cover_letter", write_cover_letter)
+    sessions, session_id = runtime
+    with sessions() as db:
+        db.get(JobSession, session_id).guaranteed_application = True
+        db.commit()
     sessions, session_id = await run_workflow(runtime, monkeypatch, FakeAdapter(refs), apply_all)
     with sessions() as db:
         states = {v.external_id: v.state for v in db.scalars(select(Vacancy))}
@@ -394,6 +464,81 @@ async def test_letter_model_unavailable_recovers_without_duplicate_match_count(r
         assert item.counters["matched"] == 2
         assert item.counters["submitted"] == 2
         assert states == {"bad": "SUBMITTED", "next": "SUBMITTED"}
+
+
+@pytest.mark.asyncio
+async def test_invalid_cover_letter_is_retried_before_submission(runtime, monkeypatch):
+    refs = [JobRef(external_id="bad", url="https://fake/bad"),
+            JobRef(external_id="next", url="https://fake/next")]
+    letter_calls = 0
+
+    async def apply_all(*args, **kwargs):
+        return evaluation("apply")
+
+    async def write_cover_letter(*args, **kwargs):
+        nonlocal letter_calls
+        letter_calls += 1
+        if letter_calls == 1:
+            raise CoverLetterValidationError("не выполнено особое условие")
+        return "Сопроводительное письмо для тестовой вакансии"
+
+    monkeypatch.setattr(workflow, "write_cover_letter", write_cover_letter)
+    sessions, session_id = await run_workflow(runtime, monkeypatch, FakeAdapter(refs), apply_all)
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        rows = {v.external_id: v for v in db.scalars(select(Vacancy))}
+        assert item.status == SessionStatus.COMPLETED
+        assert letter_calls == 3
+        assert item.counters.get("review", 0) == 0
+        assert item.counters["matched"] == 2
+        assert item.counters["submitted"] == 2
+        assert rows["bad"].state == "SUBMITTED"
+        assert "cover_letter_attempts" not in rows["bad"].data
+        assert "cover_letter_error" not in rows["bad"].data
+        assert rows["next"].state == "SUBMITTED"
+        assert db.scalar(select(CoverLetter).where(CoverLetter.vacancy_id == rows["bad"].id)) is not None
+        events = list(db.scalars(select(workflow.BrowserEvent).where(
+            workflow.BrowserEvent.session_id == session_id,
+            workflow.BrowserEvent.event_type == "vacancy_retry",
+        )))
+        assert any(event.data.get("kind") == "cover_letter" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_invalid_cover_letter_becomes_manual_review_after_bounded_retries(runtime, monkeypatch):
+    refs = [JobRef(external_id="bad", url="https://fake/bad"),
+            JobRef(external_id="next", url="https://fake/next")]
+    letter_calls = 0
+
+    async def apply_all(*args, **kwargs):
+        return evaluation("apply")
+
+    async def write_cover_letter(*args, **kwargs):
+        nonlocal letter_calls
+        letter_calls += 1
+        if args[0].external_id == "bad":
+            raise CoverLetterValidationError("не выполнено особое условие")
+        return "Сопроводительное письмо для тестовой вакансии"
+
+    monkeypatch.setattr(workflow, "write_cover_letter", write_cover_letter)
+    sessions, session_id = await run_workflow(runtime, monkeypatch, FakeAdapter(refs), apply_all)
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        rows = {v.external_id: v for v in db.scalars(select(Vacancy))}
+        assert item.status == SessionStatus.COMPLETED
+        assert letter_calls == workflow._COVER_LETTER_RETRY_LIMIT + 1
+        assert item.counters["review"] == 1
+        assert item.counters["submitted"] == 1
+        assert rows["bad"].state == "NEEDS_REVIEW"
+        assert "не выполнено особое условие" in rows["bad"].data["cover_letter_error"]
+        assert rows["bad"].data["cover_letter_attempts"] == workflow._COVER_LETTER_RETRY_LIMIT
+        assert rows["next"].state == "SUBMITTED"
+        assert db.scalar(select(CoverLetter).where(CoverLetter.vacancy_id == rows["bad"].id)) is None
+        events = list(db.scalars(select(workflow.BrowserEvent).where(
+            workflow.BrowserEvent.session_id == session_id,
+            workflow.BrowserEvent.event_type == "human_required",
+        )))
+        assert any(event.data.get("kind") == "cover_letter" for event in events)
 
 
 

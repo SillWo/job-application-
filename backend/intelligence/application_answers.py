@@ -6,9 +6,10 @@ from collections import Counter
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from backend.adapters.base.protocol import ApplicationForm
+from backend.intelligence.gateway import ModelUnavailable
 from backend.schemas.domain import ApplicationPlan, FormAnswer, JobPosting
 
 SALARY_MARKERS = re.compile(r"зарплат|\bзп\b|з/п|доход|оплат|оклад|финансов\w*\s+ожидан|вознагражд|salary|compensation|pay\b|income|wage|от какой суммы рассматрива|какую сумму (?:ожида|рассматрива|хотите)", re.I)
@@ -49,9 +50,21 @@ class SalarySelection(StrictModel):
     reason: str
 
 
+class SalaryEstimate(StrictModel):
+    """A modelled salary expectation used when exact rule matching is unsafe."""
+
+    amount: int = Field(gt=0)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    gross: bool | None
+    period: Literal["month", "year", "hour"]
+    confidence: float = Field(ge=0, le=1)
+    evidence: list[str] = Field(default_factory=list)
+    reason: str = Field(min_length=1)
+
+
 class ResolvedSalary(StrictModel):
     rule: SalaryRule | None = None
-    source: Literal["preferences", "resume", "memory", "unknown"] = "unknown"
+    source: Literal["preferences", "resume", "memory", "estimate", "unknown"] = "unknown"
     reason: str = "Зарплатные ожидания не указаны"
 
     def display(self) -> str:
@@ -109,7 +122,7 @@ def _taxes(text: str) -> set[bool]:
     result = set()
     if re.search(r"до\s+(?:вычета|уплаты)\s+(?:налог|ндфл)|до\s+ндфл|\bgross\b", text, re.I):
         result.add(True)
-    if re.search(r"после\s+(?:вычета|уплаты)\s+(?:налог|ндфл)|на руки|\bnet\b|чистыми", text, re.I):
+    if re.search(r"после\s+(?:(?:вычета|уплаты)\s+)?(?:налог|ндфл)|на руки|\bnet\b|чистыми", text, re.I):
         result.add(False)
     return result
 
@@ -119,6 +132,31 @@ def _periods(text: str) -> set[str]:
                                            "year": r"в год|за год|annual|per year",
                                            "hour": r"в час|за час|hourly|per hour"}.items()
             if re.search(pattern, text, re.I)}
+
+
+def _question_salary_context(question: str) -> dict[str, object]:
+    """Extract only explicit answer-basis requirements from a questionnaire label."""
+    currencies = _currencies(question)
+    taxes = _taxes(question)
+    periods = _periods(question)
+    return {
+        "currency": next(iter(currencies), None) if len(currencies) == 1 else None,
+        "gross": next(iter(taxes), None) if len(taxes) == 1 else None,
+        "period": next(iter(periods), None) if len(periods) == 1 else None,
+        "ambiguous": len(currencies) > 1 or len(taxes) > 1 or len(periods) > 1,
+    }
+
+
+def _salary_context_requires_estimate(question: str, rule: SalaryRule) -> bool:
+    context = _question_salary_context(question)
+    return (
+        bool(context["ambiguous"])
+        or
+        context["currency"] is not None and context["currency"] != rule.currency
+        or context["gross"] is not None and rule.gross is None
+        or context["gross"] is not None and context["gross"] != rule.gross
+        or context["period"] is not None and context["period"] != rule.period
+    )
 
 
 def _valid_rule(source: str, rule: SalaryRule) -> bool:
@@ -153,9 +191,43 @@ def _experience_range_supported(required_experience: str | None, rule: SalaryRul
     named_range = re.search(rf"(?<!\d){lower}\s*[-–—]\s*{upper}\s*(?:лет|года?)", rule.quote, re.I)
     if named_range:
         return True
-    more = re.search(r"(?<!не )\b(?:более|больше|свыше)\s+(\d+)\s*(?:лет|года?)", condition)
-    at_most = re.search(r"(\d+)\s*(?:лет|года?)\s+и\s+(?:меньше|менее)", condition)
-    return lower <= upper and (not more or lower > int(more[1])) and (not at_most or upper <= int(at_most[1]))
+    if lower > upper:
+        return False
+    # Parse the rule as an integer interval. Strict `more than 3` and
+    # inclusive `from 3` deliberately differ at the 3-year boundary.
+    minimum: tuple[int, bool] | None = None
+    maximum: tuple[int, bool] | None = None
+    for match in re.finditer(r"(?<!\d)(\d+)\s*[-–—]\s*(\d+)\s*(?:лет|года?)", condition):
+        minimum = (int(match[1]), True)
+        maximum = (int(match[2]), True)
+        break
+    if minimum is None:
+        match = re.search(
+            r"(?<!не\s)(?:более|больше|свыше|>)[\s:]*(\d+)\s*(?:лет|года?)?\b|"
+            r"(?:от|не\s+менее|как\s+минимум|>=)[\s:]*(\d+)\s*(?:лет|года?)?\b|"
+            r"(\d+)\s*(?:лет|года?)?\s+и\s+(?:более|больше)",
+            condition,
+        )
+        if match:
+            value = next(int(item) for item in match.groups() if item is not None)
+            # `>=3` includes the boundary; only a bare `>` is strict.
+            strict = bool(re.match(r"(?:более|больше|свыше|>(?!=))", match[0]))
+            minimum = (value, not strict)
+    if maximum is None:
+        match = re.search(
+            r"(?:до|не\s+более|не\s+больше|<=)[\s:]*(\d+)\s*(?:лет|года?)?\b|"
+            r"(\d+)\s*(?:лет|года?)?\s+и\s+(?:меньше|менее)",
+            condition,
+        )
+        if match:
+            maximum = (int(next(item for item in match.groups() if item is not None)), True)
+    if minimum is None and maximum is None:
+        return True
+    if minimum is not None:
+        min_value, inclusive = minimum
+        if lower < min_value or (lower == min_value and not inclusive):
+            return False
+    return not (maximum is not None and upper > maximum[0])
 
 
 def _salary_matches(field, values: list[str], rule: SalaryRule) -> bool:
@@ -166,6 +238,20 @@ def _salary_matches(field, values: list[str], rule: SalaryRule) -> bool:
             and _currencies(field.label) <= {rule.currency} and _currencies(text) <= {rule.currency}
             and _taxes(field.label) <= {rule.gross} and _taxes(text) <= {rule.gross}
             and _periods(field.label) <= {rule.period} and _periods(text) <= {rule.period})
+
+
+def _has_salary_orientation(source_text: str, rules: SalaryRules, resumes: list[dict]) -> bool:
+    """Do we have a monetary orientation from which an estimate can be grounded?"""
+    if rules.rules or _amounts(source_text):
+        return True
+    return any(_amounts(str(resume.get("desired_salary") or "")) for resume in resumes)
+
+
+def _human_reason(value: str | None, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text or text.casefold() in {"null", "none", "undefined", "n/a", "нет"}:
+        return fallback
+    return text
 
 
 def _sources(profile, resumes, description: str) -> dict[str, str]:
@@ -192,8 +278,84 @@ def _sources(profile, resumes, description: str) -> dict[str, str]:
     return result
 
 
-async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], description: str, memory: list[dict] | None = None) -> ResolvedSalary:
-    """User text is authoritative; conditional rules are never flattened to a minimum."""
+async def _estimate_salary(
+    gateway,
+    job: JobPosting,
+    resumes: list[dict],
+    source_text: str,
+    rules: SalaryRules,
+    source: str,
+    question: str,
+    reason: str,
+) -> ResolvedSalary:
+    """Ask the model for an explicit, grounded estimate after exact matching fails."""
+    if not _has_salary_orientation(source_text, rules, resumes):
+        return ResolvedSalary(reason="Зарплатные ожидания не указаны")
+    job_payload = job.model_dump(mode="json")
+    job_payload.pop("salary", None)
+    question_context = _question_salary_context(question)
+    if question_context["ambiguous"]:
+        return ResolvedSalary(reason="Вопрос содержит несколько валют, периодов или налоговых баз")
+    grounded_rules = [rule for rule in rules.rules if _valid_rule(source_text, rule)]
+    try:
+        estimate = await gateway.structured("application_salary_estimate", {
+            "salary_rules": [rule.model_dump() for rule in grounded_rules],
+            "source_text": source_text,
+            "resumes": resumes,
+            "job": job_payload,
+            "question": question,
+            "requested_context": question_context,
+            "salary_source": source,
+            "reason_exact_match_failed": reason,
+        }, SalaryEstimate)
+    except ModelUnavailable:
+        raise
+    except (ValidationError, TypeError, ValueError):
+        return ResolvedSalary(reason="Модель не вернула обоснованную зарплатную оценку")
+    raw_estimate_reason = str(estimate.reason or "").strip()
+    if estimate.confidence < 0.5 or raw_estimate_reason.casefold() in {"null", "none", "undefined", "n/a", "нет", ""}:
+        return ResolvedSalary(reason="Модель не обосновала зарплатную оценку")
+    estimate_reason = _human_reason(raw_estimate_reason, "Оценка по исходным данным")
+    requested_currency = question_context["currency"]
+    requested_gross = question_context["gross"]
+    requested_period = question_context["period"]
+    source_currencies = _currencies(source_text)
+    if not source_currencies:
+        source_currencies = set().union(*(_currencies(rule.quote) for rule in grounded_rules))
+    if not source_currencies:
+        source_currencies = set().union(*(
+            _currencies(str(resume.get("desired_salary") or "")) for resume in resumes
+        ))
+    if len(source_currencies) == 1 and estimate.currency not in source_currencies:
+        return ResolvedSalary(reason="Оценка требует неподтверждённого пересчёта валюты")
+    if (requested_currency and estimate.currency != requested_currency
+            or requested_gross is not None and estimate.gross != requested_gross
+            or requested_period and estimate.period != requested_period):
+        return ResolvedSalary(reason="Оценка не соответствует валюте, периоду или налоговой базе вопроса")
+    estimated_rule = SalaryRule(
+        amount=estimate.amount,
+        currency=estimate.currency,
+        gross=estimate.gross,
+        period=estimate.period,
+        condition="Оценка по правилам зарплаты, выбранному резюме и контексту вакансии",
+        quote=estimate_reason,
+    )
+    return ResolvedSalary(
+        rule=estimated_rule,
+        source="estimate",
+        reason=f"Оценка: {estimate_reason}",
+    )
+
+
+async def resolve_salary(
+    gateway,
+    job: JobPosting,
+    resumes: list[dict],
+    description: str,
+    memory: list[dict] | None = None,
+    question: str = "",
+) -> ResolvedSalary:
+    """Use an exact rule only after a strict match; otherwise request an estimate."""
     rules = SalaryRules(has_salary_rules=False, rules=[])
     source_text = description.strip()
     answer_scope = _answer_salary_scope(source_text)
@@ -218,6 +380,8 @@ async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], descript
         source_text = salaries[0]
         rules = await gateway.structured("application_salary_rules", {"text": source_text}, SalaryRules)
     if answer_scope is not None:
+        if not answer_scope.strip():
+            return ResolvedSalary(reason="В разделе зарплатных вопросов нет указанного ожидания")
         # Only discard grounded rules from outside the explicitly selected section.
         # Invented quotes still fail validation below, rather than hiding bad extraction.
         rules.rules = [rule for rule in rules.rules
@@ -228,8 +392,16 @@ async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], descript
         rules.rules = [rule.model_copy(update={"gross": None}) for rule in rules.rules]
     # An invalid rule poisons the rule set: silently dropping it could select a wrong fallback.
     if not rules.rules or any(not _valid_rule(source_text, rule) for rule in rules.rules):
-        return ResolvedSalary(reason="Не удалось однозначно прочитать зарплатные условия пользователя")
+        return await _estimate_salary(
+            gateway, job, resumes, source_text, rules, source, question,
+            "Зарплатные правила отсутствуют, неполны или не подтверждены исходным текстом",
+        )
     if len(rules.rules) == 1 and not rules.rules[0].condition.strip():
+        if _salary_context_requires_estimate(question, rules.rules[0]):
+            return await _estimate_salary(
+                gateway, job, resumes, source_text, rules, source, question,
+                "Точная сумма есть, но база вопроса требует адаптации",
+            )
         return ResolvedSalary(rule=rules.rules[0], source=source, reason="Явное зарплатное ожидание")
     job_payload = job.model_dump(mode="json")
     # The employer's compensation must never become the candidate's salary expectation.
@@ -242,12 +414,26 @@ async def resolve_salary(gateway, job: JobPosting, resumes: list[dict], descript
     index = selected.rule_index
     evidence_text = " ".join(str(value) for value in job_payload.values() if value is not None)
     if (index is None or not 0 <= index < len(rules.rules) or not selected.context_complete
-            or selected.confidence < .95 or not selected.vacancy_evidence
+            or selected.confidence < 1 or not selected.vacancy_evidence
             or any(not _contains(evidence_text, quote) for quote in selected.vacancy_evidence)):
-        return ResolvedSalary(reason=selected.reason or "Условия зарплатного правила не подтверждены вакансией")
+        return await _estimate_salary(
+            gateway, job, resumes, source_text, rules, source, question,
+            _human_reason(selected.reason, "Условия зарплатного правила не подтверждены вакансией"),
+        )
     if not _experience_range_supported(job.required_experience, rules.rules[index]):
-        return ResolvedSalary(reason="Диапазон требуемого опыта пересекает границу зарплатного правила; требуется уточнение")
-    return ResolvedSalary(rule=rules.rules[index], source=source, reason=selected.reason)
+        return await _estimate_salary(
+            gateway, job, resumes, source_text, rules, source, question,
+            "Диапазон требуемого опыта пересекает границу зарплатного правила",
+        )
+    if _salary_context_requires_estimate(question, rules.rules[index]):
+        return await _estimate_salary(
+            gateway, job, resumes, source_text, rules, source, question,
+            "Точная сумма есть, но база вопроса требует адаптации",
+        )
+    return ResolvedSalary(
+        rule=rules.rules[index], source=source,
+        reason=_human_reason(selected.reason, "Условия зарплатного правила подтверждены вакансией"),
+    )
 
 
 async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan, job: JobPosting,
@@ -265,11 +451,15 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
     for entry in applicable_memory:
         sources[f"memory.{entry['id']}"] = f"{entry['question']}\n{entry['answer']}"
     salary_fields = {field.id for field in form.fields if SALARY_MARKERS.search(field.label)}
-    salary = await resolve_salary(gateway, job, resumes, description, applicable_memory) if salary_fields else ResolvedSalary()
+    salary_question = " ".join(field.label for field in form.fields if field.id in salary_fields)
+    salary = (await resolve_salary(gateway, job, resumes, description, applicable_memory, salary_question)
+              if salary_fields else ResolvedSalary())
     # Remove raw salary fields so lower-priority resume amounts cannot leak into a composite answer.
     sources = {key: value for key, value in sources.items() if not key.endswith(".desired_salary")}
     if salary.rule:
         sources["salary"] = salary.display()
+    if salary.source == "estimate":
+        sources["salary_estimate"] = salary.reason
     async def propose():
         return await gateway.structured("application_answers", {
             "fields": [field.model_dump() for field in form.fields],
@@ -288,9 +478,16 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
         salary_fields = {answer.field_id for answer in proposed.answers
                          if answer.category == "salary" and answer.field_id in known_fields}
         if salary_fields:
-            salary = await resolve_salary(gateway, job, resumes, description, applicable_memory)
+            salary_question = " ".join(
+                field.label for field in form.fields if field.id in salary_fields
+            )
+            salary = await resolve_salary(
+                gateway, job, resumes, description, applicable_memory, salary_question,
+            )
             if salary.rule:
                 sources["salary"] = salary.display()
+            if salary.source == "estimate":
+                sources["salary_estimate"] = salary.reason
             proposed = await propose()
     counts = Counter(answer.field_id for answer in proposed.answers)
     answers = {answer.field_id: answer for answer in proposed.answers if counts[answer.field_id] == 1}
@@ -301,8 +498,10 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
         result.form_answers.pop(field.id, None)
         answer = answers.get(field.id)
         reason = "Для ответа недостаточно подтверждённых данных"
+        confidence_threshold = .5 if salary.source == "estimate" and answer and answer.category == "salary" else .95
         accepted = bool(answer and answer.values and all(value.strip() for value in answer.values)
-                        and answer.confidence >= .95 and answer.category not in {"unknown", "sensitive", "task"})
+                        and answer.confidence >= confidence_threshold
+                        and answer.category not in {"unknown", "sensitive", "task"})
         if answer:
             reason = answer.reason or reason
             if answer.category == "assumption":
@@ -320,7 +519,9 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                     accepted = False
                     reason = salary.reason
                 else:
-                    accepted = accepted and any(e.source == "salary" for e in answer.evidence)
+                    accepted = accepted and any(
+                        e.source in {"salary", "salary_estimate"} for e in answer.evidence
+                    )
                     if not _salary_matches(field, answer.values, salary.rule):
                         accepted = False
                         reason = "Сумма, валюта, период или налоговая база ответа не совпадают с ожиданиями"
@@ -332,12 +533,27 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                 accepted = accepted and all(re.fullmatch(r"\d+(?:\.\d+)?", value) for value in answer.values)
             if field.max_length is not None:
                 accepted = accepted and all(len(value) <= field.max_length for value in answer.values)
+            if ((field.id in salary_fields or answer.category == "salary")
+                    and not accepted and salary.rule is not None
+                    and reason == (answer.reason or "Для ответа недостаточно подтверждённых данных")):
+                selected_amount = ", ".join(answer.values) if answer.values else "пустое значение"
+                reason = (
+                    f"Зарплатный ответ с суммой «{selected_amount}» отклонён: "
+                    "источник salary или локальная проверка не подтверждают ответ"
+                )
         if SENSITIVE.search(field.label) or field.kind == "unsupported" or field.label.startswith("Вопрос без подписи"):
             accepted = False
             reason = "Вопрос требует участия пользователя"
         if accepted:
+            salary_answer = field.id in salary_fields or answer.category == "salary"
             result.form_answers[field.id] = FormAnswer(
-                field=field, values=answer.values, source=answer.category, explanation=answer.reason,
+                field=field,
+                values=answer.values,
+                source=answer.category,
+                explanation=(
+                    salary.reason
+                    if salary_answer and salary.source == "estimate" and salary.reason else answer.reason
+                ),
             )
         else:
             result.unanswered_fields[field.id] = reason

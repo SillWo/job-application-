@@ -53,6 +53,8 @@ class LanguageEntry(BaseModel):
 class PersonalProfileData(BaseModel):
     model_config = ConfigDict(extra="forbid")
     full_name: str | None = None
+    # User supplied; never infer gender from a name.
+    gender: Literal["male", "female"] | None = None
     residence: str | None = None
     job_search_locations: list[str] = Field(default_factory=list)
     contacts: ContactData = Field(default_factory=ContactData)
@@ -109,6 +111,12 @@ class ResumeData(BaseModel):
 
 class CandidateProfileData(PersonalProfileData):
     """The personal profile payload; resumes are separate resources."""
+
+
+class CandidateProfileInput(PersonalProfileData):
+    """Required user-authored fields accepted by create/update profile APIs."""
+
+    gender: Literal["male", "female"]
 
 
 class ResumeImportData(BaseModel):

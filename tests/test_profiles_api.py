@@ -3,16 +3,17 @@ from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from backend.api.router import router
 from backend.persistence.database import get_db
 from backend.persistence.models import CandidateProfile
-from backend.schemas.domain import CandidateProfileData
+from backend.schemas.domain import CandidateProfileData, CandidateProfileInput
 
 
-@pytest.mark.parametrize("payload", [{}, {
+@pytest.mark.parametrize("payload", [{"gender": "male"}, {
     "full_name": "Fixture Candidate",
     "residence": "Fixture City",
     "job_search_locations": ["Fixture City", "Remote"],
@@ -20,6 +21,7 @@ from backend.schemas.domain import CandidateProfileData
     "education": [{"type": "school", "institution": "Fixture School"}],
     "languages": [{"language": "English", "proficiency": "B2"}],
     "driver_license": False,
+    "gender": "female",
 }])
 def test_create_profile_on_fresh_migrated_database(tmp_path, monkeypatch, payload):
     monkeypatch.delenv("JAO_DATABASE_URL", raising=False)
@@ -52,3 +54,9 @@ def test_create_profile_on_fresh_migrated_database(tmp_path, monkeypatch, payloa
                 assert getattr(stored, key) == value
     finally:
         engine.dispose()
+
+
+def test_profile_write_schema_requires_explicit_gender():
+    with pytest.raises(ValidationError):
+        CandidateProfileInput.model_validate({})
+    assert CandidateProfileInput.model_validate({"gender": "female"}).gender == "female"

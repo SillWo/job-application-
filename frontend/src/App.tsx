@@ -16,6 +16,7 @@ import type {
   JobSession,
   Language,
   PersonalProfileData,
+  ProfileGender,
   Profile,
   Resume,
   ScoreComponent,
@@ -350,6 +351,7 @@ function Dashboard() {
 
 const blankPersonal: Omit<PersonalProfileData, "resumes"> = {
   full_name: "",
+  gender: null,
   residence: "",
   job_search_locations: [],
   contacts: { phone: "", email: "", messengers: [] },
@@ -375,6 +377,10 @@ const educationOptions: Array<[EducationType, string]> = [
   ["higher", "Высшее"],
   ["secondary_vocational", "Среднее специальное"],
   ["school", "Школьное"],
+];
+const genderOptions: Array<[string, string]> = [
+  ["male", "Мужской"],
+  ["female", "Женский"],
 ];
 
 function SingleSelect({ options, value, onValueChange, label, placeholder, className, disabled }: { options: ReadonlyArray<readonly [string, string]>; value: string; onValueChange: (value: string) => void; label: string; placeholder?: string; className?: string; disabled?: boolean }) {
@@ -420,11 +426,13 @@ function PersonalEditor({
   onChange,
   onSave,
   saving,
+  submitLabel = "Сохранить личный профиль",
 }: {
   value: Omit<PersonalProfileData, "resumes">;
   onChange: (value: Omit<PersonalProfileData, "resumes">) => void;
   onSave: () => void;
   saving: boolean;
+  submitLabel?: string;
 }) {
   const change = <K extends keyof Omit<PersonalProfileData, "resumes">>(key: K, next: Omit<PersonalProfileData, "resumes">[K]) =>
     onChange({ ...value, [key]: next });
@@ -446,6 +454,9 @@ function PersonalEditor({
       <div className="profile-pair-row">
         <label className="profile-field">ФИО<input value={value.full_name ?? ""} onChange={(e) => change("full_name", e.target.value)} /></label>
         <label className="profile-field">Место проживания<input value={value.residence ?? ""} onChange={(e) => change("residence", e.target.value)} /></label>
+      </div>
+      <div className="profile-pair-row">
+        <SingleSelect className="profile-field" label="Пол соискателя" placeholder="Выберите пол" options={genderOptions} value={value.gender ?? ""} onValueChange={(next) => change("gender", next as ProfileGender)} />
       </div>
       <label className="profile-full-field">Где ищу работу<input value={value.job_search_locations.join(", ")} onChange={(e) => change("job_search_locations", e.target.value.split(",").map((item) => item.trim()).filter(Boolean))} placeholder="Города или направления через запятую" /></label>
       <div className="subsection form-rail">
@@ -475,7 +486,7 @@ function PersonalEditor({
           <div className="repeat-list">{value.languages.map((language, index) => <div className="profile-pair-remove-row animated-repeat-item" key={index}><input className="profile-field" aria-label={`Язык ${index + 1}`} value={language.language} onChange={(e) => changeLanguage(index, { language: e.target.value })} placeholder="Например, английский" /><input className="profile-field" aria-label={`Уровень языка ${index + 1}`} value={language.proficiency} onChange={(e) => changeLanguage(index, { proficiency: e.target.value })} placeholder="Например, B2" /><button type="button" className="icon-button" aria-label={`Удалить язык ${index + 1}`} onClick={(event) => delayedRemove(event, (currentIndex) => change("languages", value.languages.filter((_, itemIndex) => itemIndex !== currentIndex)))}><CloseIcon /></button></div>)}</div>
       </div>
       <label className="checkline"><input type="checkbox" checked={value.driver_license ?? false} onChange={(e) => change("driver_license", e.target.checked)} /> Есть водительские права</label>
-      <div className="actions sticky-actions profile-save-bar"><button type="button" className="primary" onClick={onSave} disabled={saving}>{saving ? "Сохраняю…" : "Сохранить личный профиль"}</button></div>
+      <div className="actions sticky-actions profile-save-bar"><button type="button" className="primary" onClick={onSave} disabled={saving || !value.gender}>{saving ? "Сохраняю…" : submitLabel}</button>{!value.gender && <small role="alert">Выберите пол соискателя, чтобы сохранить профиль.</small>}</div>
       </div>
     </article>
   );
@@ -619,6 +630,7 @@ function ProfilePage() {
   useEffect(() => { if (current) { const data = { ...current.data }; delete data.resumes; setPersonal({ ...blankPersonal, ...data, contacts: { ...blankPersonal.contacts, ...data.contacts, messengers: data.contacts?.messengers ?? [] }, job_search_locations: data.job_search_locations ?? [], education: data.education ?? [], languages: data.languages ?? [] }); } }, [current]);
   const personalPayload = (value: Omit<PersonalProfileData, "resumes">) => ({
     full_name: value.full_name || null,
+    gender: value.gender || null,
     residence: value.residence || null,
     job_search_locations: value.job_search_locations,
     contacts: { phone: value.contacts.phone || null, email: value.contacts.email || null, messengers: value.contacts.messengers.filter(Boolean) },
@@ -641,11 +653,13 @@ function ProfilePage() {
   const toggleSelected = async (resume: Resume) => { if (!current) return; try { await api<Resume>(`/profiles/${current.id}/resumes/${resume.id}`, { method: "PATCH", body: JSON.stringify(resumePayload({ ...resume, selected_for_matching: !resume.selected_for_matching })) }); await qc.invalidateQueries({ queryKey: ["resumes", current.id] }); } catch (error) { setMessageTone("danger"); setMessage(error instanceof Error ? error.message : "Не удалось изменить выбор резюме"); } };
   return <section className="page">
     <Title eyebrow="ПРОФИЛЬ КАНДИДАТА" note="Заполните личные данные один раз, а затем создавайте отдельные резюме под разные направления поиска. Только выбранные резюме попадут в оценку вакансий.">Профиль и резюме под вашим контролем</Title>
-    {!current && <Empty title="Создайте личный профиль" className="panel empty-profile" action={<button type="button" className="primary" onClick={() => savePersonal.mutate()} disabled={savePersonal.isPending}>{savePersonal.isPending ? "Создаём…" : "Создать профиль"}</button>}>Начните с личной информации. После сохранения можно импортировать PDF, DOCX или TXT и отредактировать результат.</Empty>}
+    {!current && <Notice tone="warning">Заполните личную информацию и выберите пол соискателя, чтобы создать профиль.</Notice>}
     {current && <>
       <label className={`upload ${upload.isPending ? "busy" : ""}`}><input type="file" accept=".pdf,.docx,.txt" aria-label="Импортировать резюме" disabled={upload.isPending} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file) upload.mutate(file); }} /><span>{upload.isPending ? `Обрабатываем «${upload.variables?.name}»…` : "Импортировать PDF, DOCX или TXT"}</span><small>Парсер заполнит личный профиль и создаст отдельное резюме. После импорта проверьте поля.</small></label>
-      {message && <Notice tone={messageTone}>{message}</Notice>}
-      <PersonalEditor value={personal} onChange={setPersonal} onSave={() => savePersonal.mutate()} saving={savePersonal.isPending} />
+    </>}
+    {message && <Notice tone={messageTone}>{message}</Notice>}
+    <PersonalEditor value={personal} onChange={setPersonal} onSave={() => savePersonal.mutate()} saving={savePersonal.isPending} submitLabel={current ? "Сохранить личный профиль" : "Создать профиль"} />
+    {current && <>
       <section className="resume-section"><div className="section-heading resume-section-heading"><div><span className="eyebrow">БЛОК 2</span><h2>Мои резюме</h2><p>Отметьте одно или несколько резюме, которые передавать ИИ при оценке релевантности вакансий.</p></div><button type="button" className="primary" onClick={() => setEditingResume(newResume(current.id))}>+ Создать резюме</button></div>
         {editingResume && <ResumeEditor value={editingResume} onSave={(value) => saveResume.mutate(value)} onCancel={() => setEditingResume(null)} saving={saveResume.isPending} />}
         {resumes.data?.length ? <div className="resume-grid">{resumes.data.map((resume) => <article className={`panel resume-card ${resume.selected_for_matching ? "selected" : ""}`} key={resume.id}><div className="resume-card-top"><div><span className="eyebrow">РЕЗЮМЕ</span><h3>{resume.name || resume.desired_title || "Без названия"}</h3></div><label className="selection-control"><input type="checkbox" checked={resume.selected_for_matching} onChange={() => void toggleSelected(resume)} /> Передавать модели</label></div><div className="resume-meta"><span>{resume.desired_title || "Должность не указана"}</span><span>{resume.skills?.length ?? 0} навыков</span><span>{resume.experiences?.length ?? 0} мест опыта</span></div><p>{resume.about || "Добавьте короткое описание о себе как о работнике."}</p><div className="tag-list">{resume.skills?.slice(0, 8).map((skill) => <span className="tag" key={skill}>{skill}</span>)}</div><div className="actions"><button type="button" className="secondary" onClick={() => setEditingResume(resume)}>Редактировать</button><button type="button" className="danger" onClick={() => { if (window.confirm("Удалить это резюме?")) removeResume.mutate(resume.id); }}>Удалить</button></div></article>)}</div> : <Empty title="Резюме пока нет">Создайте резюме вручную или импортируйте файл сверху.</Empty>}
@@ -676,16 +690,18 @@ function SessionPage() {
   const terminalStatuses = ["COMPLETED", "STOPPED", "FAILED"];
   const profileReady = Boolean(
     sessionProfile &&
+      sessionProfile.data?.gender &&
       sessionResumes.data?.some((resume) => resume.selected_for_matching),
   );
   const { draft, updateDraft, status: draftStatus, conflict: draftConflict, loadSaved } = useSessionDraft();
-  const { adapter, applicationLimit, desiredJobDescription, unlimitedApplications, influence } = draft;
+  const { adapter, applicationLimit, desiredJobDescription, coverLetterAuto, coverLetterTemplate, unlimitedApplications, influence } = draft;
   const blockedByAdapter = (sessions.data ?? []).some((session) => session.adapter_id === adapter && !terminalStatuses.includes(session.status));
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"neutral" | "success" | "warning" | "danger" | "info">("neutral");
   const validLimit = (value: string, unlimited: boolean) =>
     unlimited || /^[1-9]\d*$/.test(value);
   const limitsAreValid = validLimit(applicationLimit, unlimitedApplications);
+  const coverLetterIsValid = coverLetterAuto || coverLetterTemplate.trim().length > 0;
   const create = useMutation({
     mutationFn: async () => {
       const session = await api<JobSession>("/sessions", {
@@ -696,6 +712,8 @@ function SessionPage() {
           guaranteed_application: guaranteedApplication,
           application_limit: unlimitedApplications ? null : Number(applicationLimit),
           desired_job_description: desiredJobDescription.trim(),
+          cover_letter_auto: coverLetterAuto,
+          cover_letter_template: coverLetterTemplate,
           minimum_scores: { ...Object.fromEntries(Object.entries(influence).map(([key, level]) => [key, INFLUENCE_LEVELS.indexOf(level) + 1])), special_requirements: 1 },
         }),
       });
@@ -768,6 +786,15 @@ function SessionPage() {
             <small role="status">{draftStatus}</small>
             {draftConflict && <button type="button" className="secondary" onClick={() => void loadSaved()}>Заменить форму сохранённой копией</button>}
           </label>
+          <section className="subsection form-rail cover-letter-settings" aria-labelledby="cover-letter-heading">
+            <div className="section-heading"><div><h3 id="cover-letter-heading">Сопроводительное письмо</h3><small>Можно использовать свою структуру. Фрагменты в квадратных скобках, например [ФИО], будут заменены ИИ по контексту.</small></div></div>
+            <label className="checkline"><input type="checkbox" aria-label="ИИ самостоятельно определяет структуру сопроводительного письма" checked={coverLetterAuto} onChange={(event) => updateDraft({ coverLetterAuto: event.target.checked })} />ИИ самостоятельно определяет структуру письма</label>
+            <small>В автоматическом режиме письмо включает достижение, навыки, образование, аргументы соответствия и контакты.</small>
+            <label className="field-prose">Своя структура сопроводительного письма
+              <textarea aria-label="Своя структура сопроводительного письма" maxLength={12000} rows={8} value={coverLetterTemplate} disabled={coverLetterAuto} onChange={(event) => updateDraft({ coverLetterTemplate: event.target.value })} placeholder="Например: Я [ФИО] — ..." />
+              <small>{coverLetterTemplate.length} / 12000 символов. Особые требования работодателя будут выполнены в любом режиме.</small>
+            </label>
+          </section>
           <section className="influence-section" aria-labelledby="influence-heading">
             <h3 id="influence-heading">Влияние факторов на вакансии</h3>
             {INFLUENCE_CRITERIA.map((criterion) => {
@@ -791,7 +818,7 @@ function SessionPage() {
           </div>
           <button type="button" className="primary"
             onClick={() => create.mutate()}
-            disabled={!profileReady || create.isPending || !limitsAreValid || blockedByAdapter}
+            disabled={!profileReady || create.isPending || !limitsAreValid || !coverLetterIsValid || blockedByAdapter}
           >
             {create.isPending ? "Запускаем…" : "Создать и запустить"}
           </button>
@@ -801,8 +828,15 @@ function SessionPage() {
               Введите целое положительное значение лимита или включите «Без ограничений».
             </Notice>
           )}
+          {!coverLetterIsValid && (
+            <Notice tone="danger" role="alert">Добавьте структуру сопроводительного письма или включите автоматическую структуру.</Notice>
+          )}
           {!profileReady && (
-            <Notice tone="warning">Сначала заполните профиль и выберите хотя бы одно резюме.</Notice>
+            <Notice tone="warning">
+              {(!sessionProfile || !sessionProfile.data?.gender)
+                ? <>Выберите пол соискателя в профиле и хотя бы одно резюме. <NavLink className="button-link secondary" to="/profile">Открыть профиль</NavLink></>
+                : "Сначала выберите хотя бы одно резюме в профиле."}
+            </Notice>
           )}
         </article>
       {message && <Notice tone={messageTone}>{message}</Notice>}
@@ -868,7 +902,7 @@ function SessionCard({ session, formatSessionLimit, action }: { session: JobSess
                   <button type="button" className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
                 </>
               )}
-              {session.status === "PAUSED" && (
+              {(session.status === "PAUSED" || session.status === "NEEDS_REVIEW") && (
                 <>
                   <button type="button" className="primary" onClick={() => void action(session.id, "resume")}>Продолжить</button>
                   <button type="button" className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>

@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react'
 import { useSessionDraft } from './useSessionDraft'
 
 const key = 'job-orchestrator.session-draft'
-const draft = { adapter: 'hirehi', applicationLimit: '7', desiredJobDescription: 'Исследования; не продажи', unlimitedApplications: true, influence: { tasks: 'high', skills: 'low', experience_depth: 'medium', role_match: 'maximum', industry: 'low' } }
+const draft = { adapter: 'hirehi', applicationLimit: '7', desiredJobDescription: 'Исследования; не продажи', coverLetterAuto: true, coverLetterTemplate: '', unlimitedApplications: true, influence: { tasks: 'high', skills: 'low', experience_depth: 'medium', role_match: 'maximum', industry: 'low' } }
 const response = (value: unknown, status = 200) => ({ ok: status === 200, status, json: async () => value })
 
 beforeEach(() => localStorage.clear())

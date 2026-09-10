@@ -37,6 +37,7 @@ class CandidateProfile(Base):
     __tablename__ = "candidate_profiles"
     id: Mapped[int] = mapped_column(primary_key=True)
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(10), nullable=True)
     residence: Mapped[str | None] = mapped_column(String(255), nullable=True)
     job_search_locations: Mapped[list] = mapped_column(JSON, default=list)
     contacts: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -77,6 +78,8 @@ class JobSession(Base):
     adapter_id: Mapped[str] = mapped_column(String(50))
     # Application limit is a snapshot of the launch configuration.
     application_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cover_letter_auto: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    cover_letter_template: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     status: Mapped[str] = mapped_column(String(40), default="CREATED")
     counters: Mapped[dict] = mapped_column(JSON, default=dict)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

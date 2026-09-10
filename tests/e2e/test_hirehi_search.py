@@ -86,7 +86,7 @@ async def test_hirehi_category_pagination_and_recovery(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        profile = CandidateProfile(full_name="Fixture")
+        profile = CandidateProfile(full_name="Fixture", gender="male")
         db.add(profile)
         db.flush()
         db.add(Resume(profile_id=profile.id, name="Fixture", selected_for_matching=True))

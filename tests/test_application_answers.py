@@ -1,7 +1,7 @@
 import pytest
 
 from backend.adapters.base.protocol import ApplicationForm, FillResult
-from backend.intelligence.application_answers import prepare_answers, resolve_salary
+from backend.intelligence.application_answers import _taxes, prepare_answers, resolve_salary
 from backend.orchestrator.application_guard import unresolved_application_questions
 from backend.schemas.domain import ApplicationField, ApplicationPlan, JobPosting
 
@@ -87,8 +87,12 @@ async def test_model_cannot_select_salary_across_experience_boundary(experience,
     text = f"120000 RUB — {condition}"
     gateway = Gateway(dict(has_salary_rules=True, rules=[rule(120000, text, condition)]),
                       dict(rule_index=0, context_complete=True, confidence=1, vacancy_evidence=[experience], reason="Условия подходят"))
+    if not accepted:
+        gateway.responses.append(dict(amount=120000, currency="RUB", gross=None, period="month",
+                                      confidence=.8, evidence=[condition], reason="Оценка при пересечении опыта"))
     result = await resolve_salary(gateway, job(required_experience=experience), [], text)
-    assert (result.rule is not None) is accepted
+    assert result.rule is not None
+    assert (result.source == "preferences") is accepted
 
 
 @pytest.mark.asyncio
@@ -97,18 +101,29 @@ async def test_model_cannot_select_salary_across_experience_boundary(experience,
     dict(rule_index=0, context_complete=True, confidence=1, vacancy_evidence=["Москва"], reason="Город выдуман"),
     dict(rule_index=99, context_complete=True, confidence=1, vacancy_evidence=["Разработчик"], reason="Неверный индекс"),
 ])
-async def test_unmatched_or_ungrounded_rule_never_falls_back_to_resume(selection):
-    gateway = Gateway(dict(has_salary_rules=True, rules=[rule(250000, "офис МСК 250к", "Москва, офис")]), selection)
+async def test_unmatched_or_ungrounded_rule_uses_estimate_without_flattening_resume(selection):
+    gateway = Gateway(dict(has_salary_rules=True, rules=[rule(250000, "офис МСК 250к", "Москва, офис")]), selection,
+                      dict(amount=160000, currency="RUB", gross=None, period="month", confidence=.8,
+                           evidence=["Оценка по контексту"], reason="Примерная оценка по выбранному резюме"))
     result = await resolve_salary(gateway, job(), [{"desired_salary": "150000 RUB"}], "офис МСК 250к")
-    assert result.rule is None
-    assert "150000" not in str(gateway.calls)
+    assert result.source == "estimate"
+    assert result.rule.amount == 160000
+    assert gateway.calls[-1][0] == "application_salary_estimate"
+    assert gateway.calls[-1][1]["resumes"] == [{"desired_salary": "150000 RUB"}]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rules", [[], [rule(777777, "150000 RUB")], [rule(150000, "нет такой цитаты")]])
-async def test_invalid_preference_rules_cannot_fall_back(rules):
-    gateway = Gateway(dict(has_salary_rules=True, rules=rules))
-    assert (await resolve_salary(gateway, job(), [{"desired_salary": "120000 RUB"}], "Зарплата 150000 RUB")).rule is None
+async def test_invalid_preference_rules_use_grounded_estimate(rules):
+    gateway = Gateway(dict(has_salary_rules=True, rules=rules),
+                      dict(amount=145000, currency="RUB", gross=None, period="month", confidence=.8,
+                           evidence=["Зарплата 150000 RUB"], reason="Оценка по исходному ориентиру"))
+    result = await resolve_salary(gateway, job(), [{"desired_salary": "120000 RUB"}], "Зарплата 150000 RUB")
+    assert result.source == "estimate"
+    assert result.rule.amount == 145000
+    assert gateway.calls[-1][1]["salary_rules"] == [] or all(
+        rule_item["amount"] == 150000 for rule_item in gateway.calls[-1][1]["salary_rules"]
+    )
 
 
 @pytest.mark.asyncio
@@ -231,10 +246,23 @@ def test_guard_requires_proof_per_field_even_with_duplicate_labels():
 ])
 async def test_salary_cannot_change_currency_period_tax_basis_or_offer_second_amount(label, value):
     answer = {**proposal("salary", [value]), "evidence": [{"source": "salary", "quote": "200000 RUB"}]}
-    gateway = Gateway(dict(has_salary_rules=True, rules=[rule(200000, "200000 RUB")]), dict(answers=[answer]))
+    responses = [dict(has_salary_rules=True, rules=[rule(200000, "200000 RUB")])]
+    if label != "Желаемая зарплата":
+        responses.append(dict(
+            amount=200000,
+            currency="USD" if "USD" in label else "RUB",
+            gross=True if "до вычета" in label else False if "на руки" in label else None,
+            period="year" if "в год" in label else "month",
+            confidence=.8,
+            evidence=["Оценка в базе вопроса"],
+            reason="Оценка в запрошенной базе",
+        ))
+    responses.append(dict(answers=[answer]))
+    gateway = Gateway(*responses)
     plan = await answer_form(ApplicationField(id="q1", label=label), [], gateway=gateway,
                              resumes=[{"desired_salary": "200000 RUB"}])
-    assert not plan.form_answers
+    expected = "в год" in label or "до вычета" in label
+    assert bool(plan.form_answers) is expected
 
 
 @pytest.mark.asyncio
@@ -248,13 +276,132 @@ async def test_salary_compiler_cannot_invent_tax_basis():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("label", "accepted"), [("Желаемая зарплата", True), ("Желаемая зарплата на руки", False)])
+@pytest.mark.parametrize(("label", "accepted"), [("Желаемая зарплата", True), ("Желаемая зарплата на руки", True)])
 async def test_normalized_unknown_taxes_allow_only_unspecified_tax_question(label, accepted):
     answer = {**proposal("salary", ["150000 RUB"]), "evidence": [{"source": "salary", "quote": "150000 RUB"}]}
-    gateway = Gateway(dict(has_salary_rules=True, rules=[{**rule(), "gross": False}]), dict(answers=[answer]))
+    responses = [dict(has_salary_rules=True, rules=[{**rule(), "gross": False}])]
+    if "на руки" in label:
+        responses.append(dict(amount=150000, currency="RUB", gross=False, period="month", confidence=.8,
+                              evidence=["Оценка на руки"], reason="Оценка после налогов"))
+    responses.append(dict(answers=[answer]))
+    gateway = Gateway(*responses)
     plan = await answer_form(ApplicationField(id="q1", label=label), [], gateway=gateway,
                              resumes=[{"desired_salary": "150000 RUB"}])
     assert bool(plan.form_answers) is accepted
+
+
+def test_after_tax_phrase_is_detected_as_net_basis():
+    assert _taxes("Какие у вас зарплатные ожидания? (сумма после налогов)") == {False}
+
+
+@pytest.mark.asyncio
+async def test_exact_match_requires_one_hundred_percent_confidence():
+    text = "Офис МСК 100000 RUB"
+    gateway = Gateway(
+        dict(has_salary_rules=True, rules=[rule(100000, text, "офис Москва")]),
+        dict(rule_index=0, context_complete=True, confidence=.99, vacancy_evidence=["Москва", "офис"], reason="Почти совпало"),
+        dict(amount=110000, currency="RUB", gross=None, period="month", confidence=.8,
+             evidence=["Оценка"], reason="Оценка при неполной уверенности"),
+    )
+    result = await resolve_salary(gateway, job(location="Москва", work_format="офис"),
+                                  [{"desired_salary": "100000 RUB"}], text)
+    assert result.source == "estimate"
+    assert result.rule.amount == 110000
+    assert [role for role, _ in gateway.calls] == [
+        "application_salary_rules", "application_salary_selection", "application_salary_estimate",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_net_question_adapts_exact_amount_when_source_tax_basis_is_unknown():
+    text = "Офис МСК 120000 RUB"
+    gateway = Gateway(
+        dict(has_salary_rules=True, rules=[rule(120000, text, "офис Москва")]),
+        dict(rule_index=0, context_complete=True, confidence=1, vacancy_evidence=["Москва", "офис"], reason="Условия совпали"),
+        dict(amount=120000, currency="RUB", gross=False, period="month", confidence=.8,
+             evidence=["Исходная сумма 120000 RUB"], reason="Сумма сохранена и указана после налогов"),
+    )
+    result = await resolve_salary(
+        gateway,
+        job(location="Москва", work_format="офис"),
+        [{"desired_salary": "120000 RUB"}],
+        text,
+        question="Какие у вас зарплатные ожидания? (сумма после налогов)",
+    )
+    assert result.source == "estimate"
+    assert result.rule.amount == 120000
+    assert result.rule.gross is False
+    assert gateway.calls[-1][1]["requested_context"]["gross"] is False
+
+
+@pytest.mark.asyncio
+async def test_salary_estimate_is_accepted_without_guaranteed_application_and_keeps_reason():
+    answer = {
+        "field_id": "salary",
+        "category": "salary",
+        "values": ["120000"],
+        "evidence": [{"source": "salary_estimate", "quote": "Оценка: 120000 RUB после налогов"}],
+        "confidence": .8,
+        "reason": "Оценка по данным кандидата",
+    }
+    gateway = Gateway(
+        dict(has_salary_rules=True, rules=[rule(120000, "120000 RUB")]),
+        dict(amount=120000, currency="RUB", gross=False, period="month", confidence=.8,
+             evidence=["Резюме"], reason="120000 RUB после налогов"),
+        dict(answers=[answer]),
+    )
+    plan = await answer_form(
+        ApplicationField(id="salary", label="Зарплатные ожидания (сумма после налогов)"),
+        [], gateway=gateway, resumes=[{"desired_salary": "120000 RUB"}],
+    )
+    assert plan.form_answers["salary"].values == ["120000"]
+    assert "Оценка:" in plan.form_answers["salary"].explanation
+
+
+@pytest.mark.asyncio
+async def test_rejected_salary_answer_reports_local_validation_reason():
+    answer = {
+        "field_id": "salary",
+        "category": "salary",
+        "values": ["150000 RUB"],
+        "evidence": [{"source": "job.description", "quote": "150000 RUB"}],
+        "confidence": 1,
+        "reason": "Пользователь указал сумму",
+    }
+    gateway = Gateway(
+        dict(has_salary_rules=True, rules=[rule(150000)]),
+        dict(answers=[answer]),
+    )
+    plan = await answer_form(
+        ApplicationField(id="salary", label="Зарплатные ожидания"),
+        [], gateway=gateway, resumes=[{"desired_salary": "150000 RUB"}],
+    )
+    assert "150000 RUB" in plan.unanswered_fields["salary"]
+    assert "salary" in plan.unanswered_fields["salary"]
+
+
+@pytest.mark.asyncio
+async def test_historical_office_or_hybrid_context_uses_moscow_three_to_six_rule():
+    text = "Удалёнка не МСК/СПб <=3: 70000; >3: 100000; офис не МСК/СПб <=3: 80000; >3: 100000; офис МСК/СПб <=3: 100000; >=3: 120000 RUB/month"
+    rules = [
+        rule(70000, "<=3: 70000", "удалёнка не МСК/СПб <=3"),
+        rule(100000, ">3: 100000", "удалёнка не МСК/СПб >3"),
+        rule(80000, "<=3: 80000", "офис не МСК/СПб <=3"),
+        rule(100000, ">3: 100000", "офис не МСК/СПб >3"),
+        rule(100000, "офис МСК/СПб <=3: 100000", "офис МСК/СПб <=3"),
+        rule(120000, ">=3: 120000 RUB/month", "офис МСК/СПб >=3"),
+    ]
+    gateway = Gateway(
+        dict(has_salary_rules=True, rules=rules),
+        dict(rule_index=5, context_complete=True, confidence=1, vacancy_evidence=["Москва", "гибрид", "3–6 лет"], reason="Москва и гибрид"),
+    )
+    result = await resolve_salary(
+        gateway,
+        job(location="Москва", work_format="Формат работы: на месте работодателя или гибрид",
+             required_experience="Опыт работы: 3–6 лет"), [], text,
+    )
+    assert result.source == "preferences"
+    assert result.rule.amount == 120000
 
 
 @pytest.mark.asyncio
@@ -281,8 +428,12 @@ async def test_empty_form_rule_section_never_falls_back_to_filter_or_resume():
 
 @pytest.mark.asyncio
 async def test_explicit_tax_basis_is_preserved_and_conflicting_basis_rejected():
-    for gross, expected in [(True, False), (False, True), (None, True)]:
-        gateway = Gateway(dict(has_salary_rules=True, rules=[{**rule(150000, "150000 RUB на руки"), "gross": gross}]))
+    for gross, expected in [(True, True), (False, True), (None, True)]:
+        responses = [dict(has_salary_rules=True, rules=[{**rule(150000, "150000 RUB на руки"), "gross": gross}])]
+        if gross is True:
+            responses.append(dict(amount=150000, currency="RUB", gross=False, period="month", confidence=.8,
+                                  evidence=["150000 RUB на руки"], reason="Оценка в подтверждённой налоговой базе"))
+        gateway = Gateway(*responses)
         result = await resolve_salary(gateway, job(), [], "150000 RUB на руки")
         assert (result.rule is not None) is expected
 
