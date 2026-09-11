@@ -7,6 +7,7 @@ import re
 
 from sqlalchemy import select
 
+from backend.intelligence.security import sanitize_untrusted_input
 from backend.persistence.models import (
     ApplicationPlanRecord,
     JobSession,
@@ -28,7 +29,10 @@ def normalized_question(text: str) -> str:
 
 
 def can_remember(question: str) -> bool:
-    return not AUTH_QUESTION.search(question)
+    safe_question = str(sanitize_untrusted_input(question, context="profile memory question") or "")
+    if AUTH_QUESTION.search(safe_question):
+        return False
+    return bool(safe_question.strip())
 
 
 def question_context(question: str, job: dict) -> dict:
@@ -70,13 +74,20 @@ def collect_session_questions(db, item: JobSession) -> int:
     count = 0
     for vacancy, record in rows:
         for question, reason, options in _unanswered(record.data if record else {}, vacancy):
-            context = question_context(question, vacancy.data or {})
-            key = _key(question, context)
+            safe_question = str(sanitize_untrusted_input(question, context="profile memory question") or "").strip()
+            safe_reason = str(sanitize_untrusted_input(reason, context="profile memory reason") or "").strip()
+            safe_options = sanitize_untrusted_input(options, context="profile memory options")
+            if not safe_question:
+                continue
+            safe_vacancy_data = sanitize_untrusted_input(vacancy.data or {}, context="vacancy memory context")
+            context = question_context(safe_question, safe_vacancy_data)
+            key = _key(safe_question, context)
             if key in known or key in remembered:
                 continue
             known.add(key)
             db.add(SessionQuestion(session_id=item.id, profile_id=item.profile_id, vacancy_id=vacancy.id,
-                                   memory_key=key, question=question, reason=reason, options=options, context=context))
+                                   memory_key=key, question=safe_question, reason=safe_reason,
+                                   options=safe_options, context=context))
             count += 1
     item.questions_collected_at = now()
     if count:
@@ -94,20 +105,33 @@ def collect_finished_sessions(db) -> int:
 
 def load_profile_memory(db, profile_id: int) -> list[dict]:
     """Internal API, deliberately independent of session and adapter identifiers."""
-    return [{"id": entry.id, "question": entry.question, "answer": entry.answer, "context": entry.context}
-            for entry in db.scalars(select(ProfileMemory).where(ProfileMemory.profile_id == profile_id).order_by(ProfileMemory.updated_at.desc(), ProfileMemory.id.desc()))]
+    result = []
+    for entry in db.scalars(select(ProfileMemory).where(ProfileMemory.profile_id == profile_id).order_by(ProfileMemory.updated_at.desc(), ProfileMemory.id.desc())):
+        if not isinstance(entry.question, str) or not isinstance(entry.answer, str) or not isinstance(entry.context or {}, dict):
+            continue
+        question = str(sanitize_untrusted_input(entry.question, context="stored profile question") or "").strip()
+        answer = str(sanitize_untrusted_input(entry.answer, context="stored profile answer") or "").strip()
+        context = sanitize_untrusted_input(entry.context or {}, context="stored profile context")
+        if question and answer:
+            result.append({"id": entry.id, "question": question, "answer": answer, "context": context})
+    return result
 
 
 def save_user_answer(db, question: SessionQuestion, answer: str) -> None:
-    if not can_remember(question.question):
+    if not isinstance(question.question, str) or not isinstance(answer, str) or not isinstance(question.context or {}, dict):
+        raise ValueError("Некорректные данные вопроса профиля")
+    safe_question = str(sanitize_untrusted_input(question.question, context="profile memory question") or "").strip()
+    safe_answer = str(sanitize_untrusted_input(answer, context="profile memory answer") or "").strip()
+    safe_context = sanitize_untrusted_input(question.context or {}, context="profile memory context")
+    if not can_remember(safe_question):
         raise ValueError("Пароли и коды доступа не сохраняются в ответах профиля")
     entry = db.scalar(select(ProfileMemory).where(ProfileMemory.profile_id == question.profile_id, ProfileMemory.memory_key == question.memory_key))
     if entry is None:
         entry = ProfileMemory(profile_id=question.profile_id, memory_key=question.memory_key,
-                              question=question.question, answer=answer, context=question.context)
+                              question=safe_question, answer=safe_answer, context=safe_context)
         db.add(entry)
     else:
-        entry.answer = answer
+        entry.answer = safe_answer
         entry.updated_at = now()
     # The same question asked by another completed session needs no second interview.
     for pending in db.scalars(select(SessionQuestion).where(SessionQuestion.profile_id == question.profile_id,

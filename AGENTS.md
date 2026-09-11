@@ -10,9 +10,8 @@
 
 ## Команды
 
-- Установка Windows: `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1`
+- Основной запуск Windows (установка зависимостей и запуск): `powershell -ExecutionPolicy Bypass -File .\run.ps1`
 - Dev: `powershell -ExecutionPolicy Bypass -File scripts/start-dev.ps1`
-- Production: `powershell -ExecutionPolicy Bypass -File scripts/start.ps1`
 - Backend tests/lint: `.venv/Scripts/python -m pytest && .venv/Scripts/python -m ruff check .`
 - Frontend (Windows): `cd frontend; npm.cmd test; npm.cmd run typecheck; npm.cmd run lint; npm.cmd run build`
 - E2E: `.venv/Scripts/python -m pytest tests/e2e`

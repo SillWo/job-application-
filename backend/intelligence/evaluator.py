@@ -306,6 +306,22 @@ def _ground_resume_analysis(
     return analysis
 
 
+def _ungrounded_positive_scores(analysis: ResumeAnalysis, job: JobPosting) -> list[str]:
+    """Return criteria whose positive model score has no grounded evidence."""
+    missing: list[str] = []
+    for field_name in ("tasks", "experience_depth", "role_match", "industry"):
+        assessment = getattr(analysis, field_name)
+        if assessment.score > 0 and not assessment.evidence:
+            missing.append(field_name)
+    if _has_explicit_special_requirements(job):
+        assessment = analysis.special_requirements
+        if assessment.score > 0 and not assessment.evidence:
+            missing.append("special_requirements")
+    if any(item.score > 0 and not item.evidence for item in analysis.skills):
+        missing.append("skills")
+    return missing
+
+
 async def evaluate(
     job: JobPosting,
     profile: Any,
@@ -345,6 +361,7 @@ async def evaluate(
 
     # Keep the project's deterministic safety layer unchanged.
     analysis = _ground_resume_analysis(analysis, job, profile, resumes)
+    ungrounded_positive_scores = _ungrounded_positive_scores(analysis, job)
     job_text = _job_grounding_text(job)
     known = {flag.id: flag for flag in [*policy.green_flags, *policy.red_flags]}
     red_safety_issue = _red_flag_safety_issue(analysis, job, policy) if preference_policy else False
@@ -392,7 +409,13 @@ async def evaluate(
         )
         if actual < minimum:
             minimum_score_violations.append(f"{key}: {actual}/{raw_max}, минимум {minimum}")
-    blocked = bool(minimum_score_violations or red_hit or salary_hit)
+    blocked = bool(
+        minimum_score_violations
+        or red_hit
+        or salary_hit
+        or red_safety_issue
+        or ungrounded_positive_scores
+    )
     # Keep the detailed violations in their dedicated internal fields, while the
     # reason shown in the vacancies UI stays short and understandable.
     if blocked:
@@ -404,15 +427,14 @@ async def evaluate(
         if salary_hit:
             blockers.append("условия оплаты не соответствуют ожиданиям")
         if red_safety_issue:
-            blockers.append("результат проверки красных флагов требует ручной проверки")
+            blockers.append("результат проверки красных флагов не подтверждён")
+        if ungrounded_positive_scores:
+            blockers.append("положительные оценки не подтверждены текстом")
         reason = f"{reason.rstrip('.')} Вакансия не рекомендована: {', '.join(blockers)}."
-    elif red_safety_issue:
-        reason = f"{reason.rstrip('.')} Нужна ручная проверка условий перед откликом."
     else:
         reason = f"{reason.rstrip('.')} Вакансия подходит для отклика."
 
     return JobEvaluation(
-        decision="skip" if blocked else ("manual_review" if red_safety_issue else "apply"),
         score=score,
         confidence=max((item.confidence for item in assessments), default=0),
         category=analysis.category or job.title,
@@ -421,10 +443,12 @@ async def evaluate(
         hard_rule_violations=[f"minimum_score:{item}" for item in minimum_score_violations]
         + (["preference_red_flag"] if red_hit else [])
         + (["preference_red_flag_unverified"] if red_safety_issue else [])
+        + (["ungrounded_positive_score"] if ungrounded_positive_scores else [])
         + (["salary_below_preference"] if salary_hit else []),
         flag_matches=matches,
-        preference_flags_verified=bool(preference_policy) and not red_safety_issue,
-        requires_manual_review=red_safety_issue and not blocked,
+        preference_flags_verified=bool(preference_policy) and not red_safety_issue and not ungrounded_positive_scores,
+        requires_manual_review=False,
+        decision="skip" if blocked else "apply",
         reason=reason,
         has_test_assignment=bool(job.has_test_assignment),
     )

@@ -10,6 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from backend.adapters.base.protocol import ApplicationForm
 from backend.intelligence.gateway import ModelUnavailable
+from backend.intelligence.security import (
+    PromptInjectionDetected,
+    assert_safe_outgoing_text,
+    assert_safe_output,
+    sanitize_untrusted_input,
+)
 from backend.schemas.domain import ApplicationPlan, FormAnswer, JobPosting
 
 SALARY_MARKERS = re.compile(r"зарплат|\bзп\b|з/п|доход|оплат|оклад|финансов\w*\s+ожидан|вознагражд|salary|compensation|pay\b|income|wage|от какой суммы рассматрива|какую сумму (?:ожида|рассматрива|хотите)", re.I)
@@ -22,8 +28,6 @@ CURRENCIES = {
     "GBP": r"фунт|£|\bgbp\b", "CNY": r"юан|\bcny\b", "AED": r"дирхам|\baed\b",
     "GEL": r"лари|\bgel\b", "AMD": r"драм|\bamd\b", "UZS": r"\buzs\b", "KGS": r"\bkgs\b",
 }
-
-
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -291,7 +295,7 @@ async def _estimate_salary(
     """Ask the model for an explicit, grounded estimate after exact matching fails."""
     if not _has_salary_orientation(source_text, rules, resumes):
         return ResolvedSalary(reason="Зарплатные ожидания не указаны")
-    job_payload = job.model_dump(mode="json")
+    job_payload = sanitize_untrusted_input(job.model_dump(mode="json"), context="vacancy salary data")
     job_payload.pop("salary", None)
     question_context = _question_salary_context(question)
     if question_context["ambiguous"]:
@@ -308,10 +312,13 @@ async def _estimate_salary(
             "salary_source": source,
             "reason_exact_match_failed": reason,
         }, SalaryEstimate)
+    except PromptInjectionDetected:
+        raise
     except ModelUnavailable:
         raise
     except (ValidationError, TypeError, ValueError):
         return ResolvedSalary(reason="Модель не вернула обоснованную зарплатную оценку")
+    assert_safe_output(estimate.model_dump(mode="json"), context="salary estimate")
     raw_estimate_reason = str(estimate.reason or "").strip()
     if estimate.confidence < 0.5 or raw_estimate_reason.casefold() in {"null", "none", "undefined", "n/a", "нет", ""}:
         return ResolvedSalary(reason="Модель не обосновала зарплатную оценку")
@@ -356,6 +363,13 @@ async def resolve_salary(
     question: str = "",
 ) -> ResolvedSalary:
     """Use an exact rule only after a strict match; otherwise request an estimate."""
+    description = str(sanitize_untrusted_input(description, context="application salary source") or "")
+    question = str(sanitize_untrusted_input(question, context="salary question") or "")
+    resumes = sanitize_untrusted_input(resumes, context="candidate salary sources")
+    memory = (
+        sanitize_untrusted_input(memory, context="stored profile answers")
+        if memory is not None else None
+    )
     rules = SalaryRules(has_salary_rules=False, rules=[])
     source_text = description.strip()
     answer_scope = _answer_salary_scope(source_text)
@@ -364,6 +378,7 @@ async def resolve_salary(
         if answer_scope is not None:
             payload["answer_rules_text"] = answer_scope
         rules = await gateway.structured("application_salary_rules", payload, SalaryRules)
+        assert_safe_output(rules.model_dump(mode="json"), context="salary rules")
     # A mention of paid training or company revenue is not a candidate salary rule.
     preference_salary = answer_scope is not None or rules.has_salary_rules or bool(rules.rules)
     source = "preferences"
@@ -379,6 +394,7 @@ async def resolve_salary(
             return ResolvedSalary(reason="В выбранных резюме зарплата отсутствует или различается")
         source_text = salaries[0]
         rules = await gateway.structured("application_salary_rules", {"text": source_text}, SalaryRules)
+        assert_safe_output(rules.model_dump(mode="json"), context="salary rules")
     if answer_scope is not None:
         if not answer_scope.strip():
             return ResolvedSalary(reason="В разделе зарплатных вопросов нет указанного ожидания")
@@ -403,7 +419,7 @@ async def resolve_salary(
                 "Точная сумма есть, но база вопроса требует адаптации",
             )
         return ResolvedSalary(rule=rules.rules[0], source=source, reason="Явное зарплатное ожидание")
-    job_payload = job.model_dump(mode="json")
+    job_payload = sanitize_untrusted_input(job.model_dump(mode="json"), context="vacancy salary data")
     # The employer's compensation must never become the candidate's salary expectation.
     job_payload.pop("salary", None)
     selected = await gateway.structured("application_salary_selection", {
@@ -411,6 +427,7 @@ async def resolve_salary(
         "job": job_payload,
         "source_text": source_text,
     }, SalarySelection)
+    assert_safe_output(selected.model_dump(mode="json"), context="salary selection")
     index = selected.rule_index
     evidence_text = " ".join(str(value) for value in job_payload.values() if value is not None)
     if (index is None or not 0 <= index < len(rules.rules) or not selected.context_complete
@@ -440,11 +457,26 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                           profile, resumes: list[dict], description: str, *,
                           memory: list[dict] | None = None, guaranteed_application: bool = False) -> ApplicationPlan:
     """Model output is a proposal; source quotes, IDs, choices and salary are checked locally."""
+    safe_job = sanitize_untrusted_input(job.model_dump(mode="json"), context="vacancy data")
+    safe_form = sanitize_untrusted_input(form.model_dump(mode="json"), context="application form")
+    safe_profile = sanitize_untrusted_input(profile, context="candidate profile")
+    safe_resumes = sanitize_untrusted_input(resumes, context="candidate resumes")
+    safe_description = str(sanitize_untrusted_input(description, context="application preferences") or "")
+    safe_memory = (
+        sanitize_untrusted_input(memory, context="stored profile answers")
+        if memory is not None else None
+    )
+    if not isinstance(guaranteed_application, bool):
+        raise ValueError("Некорректный режим гарантированной подачи")
     if not form.fields:
         return plan
-    sources = _sources(profile, resumes, description)
+    safe_fields_by_id = {
+        item.get("id"): item for item in safe_form.get("fields", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    sources = _sources(safe_profile, safe_resumes, safe_description)
     # Context-dependent answers travel only to matching vacancies, regardless of site.
-    applicable_memory = [entry for entry in (memory or []) if all(
+    applicable_memory = [entry for entry in (safe_memory or []) if all(
         _normalized(str(getattr(job, key, "") or "")) == _normalized(str(value))
         for key, value in entry.get("context", {}).items()
     )]
@@ -452,7 +484,7 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
         sources[f"memory.{entry['id']}"] = f"{entry['question']}\n{entry['answer']}"
     salary_fields = {field.id for field in form.fields if SALARY_MARKERS.search(field.label)}
     salary_question = " ".join(field.label for field in form.fields if field.id in salary_fields)
-    salary = (await resolve_salary(gateway, job, resumes, description, applicable_memory, salary_question)
+    salary = (await resolve_salary(gateway, job, safe_resumes, safe_description, applicable_memory, salary_question)
               if salary_fields else ResolvedSalary())
     # Remove raw salary fields so lower-priority resume amounts cannot leak into a composite answer.
     sources = {key: value for key, value in sources.items() if not key.endswith(".desired_salary")}
@@ -461,14 +493,23 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
     if salary.source == "estimate":
         sources["salary_estimate"] = salary.reason
     async def propose():
-        return await gateway.structured("application_answers", {
-            "fields": [field.model_dump() for field in form.fields],
+        proposed = await gateway.structured("application_answers", {
+            # Semantic labels/options are sanitized, while original form
+            # objects remain authoritative for exact UI binding below.
+            "fields": safe_form.get("fields", []),
             "sources": sources,
             "guaranteed_application": guaranteed_application,
             "salary": salary.model_dump(),
             "as_of_date": date.today().isoformat(),
-            "job": job.model_dump(mode="json"),
+            "job": safe_job,
         }, AnswerBatch)
+        assert_safe_output(proposed.model_dump(mode="json"), context="application_answer_proposals")
+        for answer in proposed.answers:
+            for value in [answer.values, answer.reason, *(evidence.quote for evidence in answer.evidence)]:
+                assert_safe_output(value, context="application_answer_content")
+            for value in answer.values:
+                assert_safe_outgoing_text(value, profile, resumes, context="application_answer")
+        return proposed
 
     proposed = await propose()
     if not salary_fields:
@@ -482,7 +523,7 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                 field.label for field in form.fields if field.id in salary_fields
             )
             salary = await resolve_salary(
-                gateway, job, resumes, description, applicable_memory, salary_question,
+                gateway, job, safe_resumes, safe_description, applicable_memory, salary_question,
             )
             if salary.rule:
                 sources["salary"] = salary.display()
@@ -503,12 +544,30 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                         and answer.confidence >= confidence_threshold
                         and answer.category not in {"unknown", "sensitive", "task"})
         if answer:
+            safe_field = safe_fields_by_id.get(field.id, {})
+            safe_label = str(safe_field.get("label") or field.label)
+            # Sanitization can change an option's text. Bind the model's clean
+            # value back to the exact original option by index, and only when
+            # every clean option is unique and non-empty. This keeps live UI
+            # values byte-for-byte stable without allowing arbitrary remapping.
+            if field.options:
+                safe_options = safe_field.get("options") or []
+                if len(safe_options) == len(field.options) and all(
+                    isinstance(value, str) and value.strip() for value in safe_options
+                ) and len(set(safe_options)) == len(safe_options):
+                    option_map = dict(zip(safe_options, field.options))
+                    if all(value in option_map for value in answer.values):
+                        answer = answer.model_copy(update={
+                            "values": [option_map[value] for value in answer.values]
+                        })
+                        for value in answer.values:
+                            assert_safe_outgoing_text(value, profile, resumes, context="application_answer")
             reason = answer.reason or reason
             if answer.category == "assumption":
                 accepted = bool(guaranteed_application and answer.values
                                 and all(value.strip() for value in answer.values) and answer.reason.strip())
             elif answer.category == "knowledge":
-                accepted = accepted and not PERSONAL.search(field.label) and bool(answer.reason.strip())
+                accepted = accepted and not PERSONAL.search(safe_label) and bool(answer.reason.strip())
             else:
                 accepted = accepted and bool(answer.evidence) and all(
                     evidence.source in sources and _contains(sources[evidence.source], evidence.quote)
@@ -541,9 +600,10 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                     f"Зарплатный ответ с суммой «{selected_amount}» отклонён: "
                     "источник salary или локальная проверка не подтверждают ответ"
                 )
-        if SENSITIVE.search(field.label) or field.kind == "unsupported" or field.label.startswith("Вопрос без подписи"):
+        safe_label = str(safe_fields_by_id.get(field.id, {}).get("label") or field.label)
+        if SENSITIVE.search(safe_label) or field.kind == "unsupported" or safe_label.startswith("Вопрос без подписи"):
             accepted = False
-            reason = "Вопрос требует участия пользователя"
+            reason = "Вопрос не может быть обработан автоматически"
         if accepted:
             salary_answer = field.id in salary_fields or answer.category == "salary"
             result.form_answers[field.id] = FormAnswer(

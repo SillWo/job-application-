@@ -119,7 +119,7 @@ async def test_red_threshold(confidence, expected):
 
 
 @pytest.mark.asyncio
-async def test_unverified_red_match_requires_manual_review():
+async def test_unverified_red_match_is_skipped_automatically():
     p = policy(red=True)
     complete = analysis(
         [FlagMatch(flag_id="red-1", matched=True)],
@@ -133,8 +133,8 @@ async def test_unverified_red_match_requires_manual_review():
     result = await evaluate(
         job(text="Продажи и работа с клиентами"), {}, [{}], FakeGateway(complete), preference_policy=p,
     )
-    assert result.decision == "manual_review"
-    assert result.requires_manual_review is True
+    assert result.decision == "skip"
+    assert result.requires_manual_review is False
     assert "preference_red_flag_unverified" in result.hard_rule_violations
 
 
@@ -163,11 +163,12 @@ async def test_confirmed_negative_red_match_can_apply():
         [FlagMatch(flag_id="red-1", matched=False, confidence=.8, evidence=[])],
         task_score=2,
     )
+    complete.tasks.evidence = ["Разработка продукта"]
     for field in ("experience_depth", "role_match", "industry", "special_requirements"):
-        setattr(complete, field, assessment(1 if field != "industry" else 2, .8, ["Продажи"]))
+        setattr(complete, field, assessment(1 if field != "industry" else 2, .8, ["Разработка продукта"]))
     complete.skills = [SkillAssessment(skill="product", importance="required", score=1, evidence=["product"], explanation="x")]
     result = await evaluate(
-        job(text="Разработка продукта"), {}, [{}], FakeGateway(complete), preference_policy=policy(red=True),
+        job(text="Разработка продукта"), {}, [{"skills": ["product"]}], FakeGateway(complete), preference_policy=policy(red=True),
     )
     assert result.decision == "apply"
     assert "preference_red_flag" not in result.hard_rule_violations

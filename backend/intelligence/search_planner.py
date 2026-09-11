@@ -5,6 +5,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from backend.intelligence.security import (
+    PromptInjectionDetected,
+    assert_safe_output,
+    sanitize_untrusted_input,
+)
+
 
 class SearchQuery(BaseModel):
     model_config = {"extra": "forbid"}
@@ -76,18 +82,28 @@ def _sanitize(values: list[str], resumes: list[dict[str, Any]], limit: int) -> l
 
 
 async def plan_search_queries(gateway, resumes: list[dict[str, Any]], limit: int = 12, preference_policy: Any = None) -> list[str]:
+    # Keep caller-owned records intact, but remove instruction-bearing prose
+    # before extracting titles or sending anything to the model.
+    safe_resumes = sanitize_untrusted_input(resumes, context="candidate resumes")
+    safe_preferences = (
+        sanitize_untrusted_input(preference_policy, context="candidate search preferences")
+        if preference_policy is not None else None
+    )
     limit = max(0, min(limit, 12))
-    if not resumes or not limit:
+    if not safe_resumes or not limit:
         return []
-    payload = {"resumes": resumes, "limit": limit}
-    if preference_policy:
-        payload["preference_policy"] = preference_policy.model_dump(mode="json") if hasattr(preference_policy, "model_dump") else preference_policy
+    payload = {"resumes": safe_resumes, "limit": limit}
+    if safe_preferences:
+        payload["preference_policy"] = safe_preferences.model_dump(mode="json") if hasattr(safe_preferences, "model_dump") else safe_preferences
     try:
         planned = await gateway.structured("search_planner", payload, SearchQueryPlan)
+        assert_safe_output(planned.model_dump(mode="json"), context="search query plan")
         values = [item.query for item in planned.queries if not item.is_title_equivalent]
+    except PromptInjectionDetected:
+        values = []
     except (ValueError, TypeError, AttributeError):
         values = []
-    result = _sanitize(values, resumes, limit)
+    result = _sanitize(values, safe_resumes, limit)
     if result:
         return result
-    return _fallback(resumes, limit)
+    return _fallback(safe_resumes, limit)

@@ -68,4 +68,4 @@ if dist.exists():
 else:
     @app.get("/", include_in_schema=False)
     def root() -> dict:
-        return {"message": "Frontend не собран. Выполните scripts/bootstrap.ps1", "docs": "/docs"}
+        return {"message": "Frontend не собран. Выполните powershell -ExecutionPolicy Bypass -File ./run.ps1 -ForceRebuild", "docs": "/docs"}

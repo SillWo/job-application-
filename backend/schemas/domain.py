@@ -358,7 +358,9 @@ class ApplicationPlan(BaseModel):
     unanswered_fields: dict[str, str] = Field(default_factory=dict)
     form_fields: dict[str, ApplicationField] = Field(default_factory=dict)
     allow_foreign_application: bool = False
-    unknown_question_policy: Literal["manual_review", "skip"] = "manual_review"
+    # ``manual_review`` remains accepted so plans persisted by older releases
+    # can be loaded, but new plans must keep the pipeline fully automatic.
+    unknown_question_policy: Literal["manual_review", "skip"] = "skip"
     submission_allowed: bool = False
 
 

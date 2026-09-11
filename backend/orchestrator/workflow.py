@@ -19,6 +19,12 @@ from backend.intelligence.hirehi_grade import hirehi_grades
 from backend.intelligence.letter_writer import CoverLetterValidationError, write_cover_letter
 from backend.intelligence.preference_policy import compile_preference_policy
 from backend.intelligence.search_planner import plan_search_queries
+from backend.intelligence.security import (
+    PromptInjectionDetected,
+    assert_safe_outgoing_text,
+    assert_safe_output,
+    sanitize_untrusted_input,
+)
 from backend.orchestrator.adaptive_search import AdaptiveSearch
 from backend.orchestrator.application_guard import unresolved_application_questions
 from backend.orchestrator.hh_application import complete_application
@@ -95,7 +101,7 @@ def _vacancy_scope(
 
 def _blocker_state(kind: str) -> str:
     if kind == "test":
-        return "NEEDS_REVIEW"
+        return "FILTERED_OUT"
     if kind == "unknown_form":
         return "UNKNOWN"
     return "ERROR"
@@ -106,7 +112,7 @@ def _record_blocker_outcome(db, item: JobSession, blocker: Any, vacancy: Vacancy
     counters = dict(item.counters)
     if blocker.kind == "test":
         counters["skipped_test"] = counters.get("skipped_test", 0) + 1
-        counters["review"] = counters.get("review", 0) + 1
+        counters["filtered"] = counters.get("filtered", 0) + 1
     else:
         counters["errors"] = counters.get("errors", 0) + 1
     item.counters = counters
@@ -189,6 +195,79 @@ def _profile_payload(record: Any) -> dict:
 
 _PROFILE_GENDER_REQUIRED_MESSAGE = "Укажите пол соискателя в профиле перед запуском сессии"
 _COVER_LETTER_RETRY_LIMIT = 3
+_EVALUATION_SECURITY_VERSION = 1
+
+
+def _security_incident(exc: PromptInjectionDetected, *, context: str) -> dict[str, str]:
+    """Build a bounded, attack-content-free incident record."""
+    reason_code = getattr(exc, "reason_code", "prompt_injection_detected")
+    if not isinstance(reason_code, str) or not reason_code.isascii():
+        reason_code = "prompt_injection_detected"
+    reason_code = "".join(char for char in reason_code if char.isalnum() or char in "_-")[:80]
+    return {"reason_code": reason_code or "prompt_injection_detected", "context": context[:80]}
+
+
+def _record_security_incident(
+    db, item: JobSession, vacancy: Vacancy, exc: PromptInjectionDetected, *, context: str,
+    emit=None,
+) -> None:
+    """Stop one vacancy safely without exposing the untrusted text."""
+    data = dict(vacancy.data or {})
+    incident = _security_incident(exc, context=context)
+    already_recorded = bool(data.get("security_incident_recorded"))
+    data["security_incident"] = incident
+    vacancy.data = data
+    vacancy.state = "FILTERED_OUT"
+    counters = dict(item.counters or {})
+    if not already_recorded:
+        counters["filtered"] = counters.get("filtered", 0) + 1
+        data["security_incident_recorded"] = True
+        vacancy.data = data
+    item.counters = counters
+    if emit:
+        emit(
+            db, item.id, "security_skipped", "Вакансия пропущена из-за небезопасного содержимого", {
+            "vacancy_id": vacancy.id,
+            **incident,
+            }
+        )
+
+
+def _assert_safe_application_plan(
+    plan: ApplicationPlan,
+    profile: Any,
+    resumes: list[Any],
+    *,
+    context: str,
+    source_form: Any = None,
+) -> None:
+    """Recheck generated values while allowing source form metadata to persist.
+
+    ``form_fields`` and ``FormAnswer.field`` are copied from the employer form
+    so adapters can bind the answer to the exact live field. Those labels and
+    options are untrusted source metadata, not model instructions or free text
+    generated for submission, so scanning the whole plan would reject a valid
+    binding merely because its source label contains instruction-like text.
+    """
+    if plan.cover_letter:
+        assert_safe_outgoing_text(plan.cover_letter, profile, resumes, context=f"{context}_letter")
+    current_options = {
+        field.id: set(field.options)
+        for field in getattr(source_form, "fields", [])
+    }
+    for answer in plan.form_answers.values():
+        for value in answer.values:
+            # A fixed-choice answer is allowed when it is byte-for-byte one of
+            # the current employer form's original options. Before the live
+            # form is available, defer exact cached options until that check.
+            allowed_options = current_options.get(answer.field.id)
+            if allowed_options is None and source_form is None:
+                allowed_options = set(answer.field.options)
+            if allowed_options is not None and value in allowed_options:
+                continue
+            assert_safe_outgoing_text(value, profile, resumes, context=f"{context}_answer")
+    for value in plan.known_answers.values():
+        assert_safe_outgoing_text(value, profile, resumes, context=f"{context}_known_answer")
 
 
 def _selected_resume_records(db, profile_record: Any) -> list[Any]:
@@ -408,6 +487,20 @@ class WorkflowManager:
             item = db.get(JobSession, session_id)
             if not item or item.status in {SessionStatus.STOPPED, SessionStatus.COMPLETED, SessionStatus.PAUSED}:
                 return False
+            if isinstance(exc, PromptInjectionDetected):
+                # A security failure outside the per-vacancy boundary is
+                # terminal and must never become a model-unavailable retry.
+                item.status = SessionStatus.FAILED
+                item.stop_reason = "Обнаружено небезопасное содержимое"
+                self.emit(
+                    db,
+                    session_id,
+                    "security_failed",
+                    "Сессия остановлена из-за небезопасного содержимого",
+                    {"kind": "prompt_injection"},
+                )
+                db.commit()
+                return False
             recovery = dict(item.recovery or {})
             attempt = recovery.get("attempt", 0) + 1
             delay = min(self.retry_max_seconds, self.retry_base_seconds * 2 ** min(attempt - 1, 10))
@@ -536,14 +629,14 @@ class WorkflowManager:
             if profile_record is None:
                 raise ValueError(f"Профиль {item.profile_id} не найден")
             if profile_record.gender not in {"male", "female"}:
-                item.status = SessionStatus.NEEDS_REVIEW
-                item.stop_reason = _PROFILE_GENDER_REQUIRED_MESSAGE
+                item.status = SessionStatus.FAILED
+                item.stop_reason = "Профиль не готов для автоматической обработки"
                 item.finished_at = None
                 self.emit(
                     db,
                     session_id,
-                    "human_required",
-                    _PROFILE_GENDER_REQUIRED_MESSAGE,
+                    "session_failed",
+                    "Сессия остановлена: профиль не готов для автоматической обработки",
                     {"kind": "profile", "field": "gender"},
                 )
                 return
@@ -741,6 +834,8 @@ class WorkflowManager:
                         search_metrics.flush(db, session_id)
                         db.commit()
                     continue
+            source_posting = None
+            posting_was_sanitized = False
             try:
                 processing_started = perf_counter()
                 await adapter.open_job(executor.page, ref)
@@ -788,9 +883,51 @@ class WorkflowManager:
                             self.emit(db, session_id, "human_required", blocker.message)
                             return
                     continue
-                posting = await adapter.extract_job(executor.page)
+                source_posting = await adapter.extract_job(executor.page)
+                # Keep the adapter's original posting for the UI/audit trail,
+                # while every evaluator and model path receives a sanitized
+                # working copy. IDs and URLs are preserved by the sanitizer.
+                posting = sanitize_untrusted_input(source_posting, context="vacancy")
+                original_payload = source_posting.model_dump(mode="json")
+                working_payload = (
+                    posting.model_dump(mode="json")
+                    if hasattr(posting, "model_dump") else posting
+                )
+                posting_was_sanitized = original_payload != working_payload
             except CaptchaRequired:
                 raise
+            except PromptInjectionDetected as exc:
+                with SessionLocal() as db:
+                    item = db.get(JobSession, session_id)
+                    if not item:
+                        continue
+                    vacancy = db.scalar(
+                        select(Vacancy).where(
+                            *_vacancy_scope(adapter_id, adapter.site_id, ref.external_id, session_id)
+                        )
+                    )
+                    # A non-HH scope can find a historical record shared by
+                    # sessions; never rewrite that record because of a new
+                    # untrusted extraction.
+                    if vacancy is not None and vacancy.session_id != session_id:
+                        vacancy = None
+                    if vacancy is None:
+                        vacancy = Vacancy(
+                            session_id=session_id,
+                            source=adapter.site_id,
+                            external_id=ref.external_id,
+                            url=ref.url,
+                            title="Вакансия требует проверки безопасности",
+                            state="FILTERED_OUT",
+                            data={},
+                        )
+                        db.add(vacancy)
+                        db.flush()
+                    _record_security_incident(
+                        db, item, vacancy, exc, context="vacancy", emit=self.emit
+                    )
+                    db.commit()
+                continue
             except Exception:
                 retry_needed = True
                 with SessionLocal() as db:
@@ -834,20 +971,21 @@ class WorkflowManager:
                     continue
                 vacancy = existing
                 if vacancy is None:
+                    stored_posting = source_posting or posting
                     vacancy = Vacancy(
                         session_id=session_id,
                         source=posting.source,
                         external_id=posting.external_id,
                         url=posting.url,
-                        title=posting.title,
-                        company=posting.company,
+                        title=stored_posting.title,
+                        company=stored_posting.company,
                         state="EXTRACTED",
-                        data=posting.model_dump(mode="json"),
+                        data=stored_posting.model_dump(mode="json"),
                     )
                     db.add(vacancy)
                     db.commit()
                     db.refresh(vacancy)
-                    db.add(VacancySnapshot(vacancy_id=vacancy.id, content=posting.description))
+                    db.add(VacancySnapshot(vacancy_id=vacancy.id, content=stored_posting.description))
                     counters = dict(item.counters)
                     counters["viewed"] += 1
                     item.counters = counters
@@ -859,8 +997,67 @@ class WorkflowManager:
                         f"Извлечена вакансия: {posting.title}",
                         {"vacancy_id": vacancy.id},
                     )
+                if posting_was_sanitized and not (vacancy.data or {}).get("security_ignored_recorded"):
+                    vacancy.data = {
+                        **(vacancy.data or {}),
+                        "security_ignored_recorded": True,
+                        "security_ignored": {
+                            "count": 1,
+                            "reason_code": "instruction_like_text_sanitized",
+                        },
+                    }
+                    self.emit(
+                        db,
+                        session_id,
+                        "security_ignored",
+                        "Небезопасная инструкция в данных вакансии проигнорирована",
+                        {
+                            "vacancy_id": vacancy.id,
+                            "kind": "vacancy",
+                            "automatic": True,
+                            "sanitized": True,
+                            "count": 1,
+                            "reason_code": "instruction_like_text_sanitized",
+                        },
+                    )
 
                 if vacancy.state == "SUBMITTING":
+                    # Crash recovery must revalidate durable AI state and the
+                    # currently visible employer form before reconciliation.
+                    recovered_plan_record = db.scalar(
+                        select(ApplicationPlanRecord).where(
+                            ApplicationPlanRecord.vacancy_id == vacancy.id
+                        )
+                    )
+                    if recovered_plan_record:
+                        try:
+                            recovered_plan = ApplicationPlan.model_validate(
+                                recovered_plan_record.data
+                            )
+                            _assert_safe_application_plan(
+                                recovered_plan, profile, selected_resumes,
+                                context="recovered_application_plan",
+                            )
+                            reader = getattr(adapter, "read_application", None)
+                            if reader:
+                                current_form = await reader(executor.page)
+                                sanitize_untrusted_input(
+                                    current_form, context="recovered_application_form"
+                                )
+                                _assert_safe_application_plan(
+                                    recovered_plan,
+                                    profile,
+                                    selected_resumes,
+                                    context="recovered_application_plan_form",
+                                    source_form=current_form,
+                                )
+                        except PromptInjectionDetected as exc:
+                            _record_security_incident(
+                                db, item, vacancy, exc,
+                                context="recovered_application", emit=self.emit,
+                            )
+                            db.commit()
+                            continue
                     verifier = getattr(adapter, "verify_submission", None)
                     if verifier is None:
                         raise RecoverableFailure("Адаптер не умеет проверять отправку")
@@ -890,16 +1087,40 @@ class WorkflowManager:
                 refresh_cached_evaluation = False
                 if evaluation_record:
                     result = JobEvaluation.model_validate(evaluation_record.data)
+                    try:
+                        # Cached model output is untrusted just like a fresh response.
+                        assert_safe_output(result, context="cached_evaluation")
+                    except PromptInjectionDetected as exc:
+                        _record_security_incident(
+                            db, item, vacancy, exc, context="cached_evaluation", emit=self.emit
+                        )
+                        db.commit()
+                        continue
                     # A legacy cached apply result may contain the evaluator's
                     # defaulted all-zero red matches.  It predates the strict
                     # preference contract and must be re-evaluated before any
                     # submission can be prepared.
+                    if result.decision == "manual_review":
+                        # ``manual_review`` was emitted by older evaluator
+                        # versions. Re-evaluate it under the current policy;
+                        # never let a cached manual decision become a review
+                        # queue or authorize an application.
+                        refresh_cached_evaluation = True
                     if (
                         result.decision == "apply"
                         and preference_policy
                         and preference_policy.red_flags
                         and not result.preference_flags_verified
                     ):
+                        refresh_cached_evaluation = True
+                    if (
+                        result.decision == "apply"
+                        and (vacancy.data or {}).get("evaluation_security_version")
+                        != _EVALUATION_SECURITY_VERSION
+                    ):
+                        # Do not let a pre-guard cached apply authorize an
+                        # application. It is re-evaluated once and stamped only
+                        # after passing the current evaluator path.
                         refresh_cached_evaluation = True
                 if evaluation_record is None or refresh_cached_evaluation:
                     try:
@@ -922,6 +1143,13 @@ class WorkflowManager:
                             minimum_scores,
                             preference_policy,
                         )
+                        assert_safe_output(result, context="evaluation")
+                    except PromptInjectionDetected as exc:
+                        _record_security_incident(
+                            db, item, vacancy, exc, context="evaluation", emit=self.emit
+                        )
+                        db.commit()
+                        continue
                     except ModelUnavailable:
                         raise
                 db.refresh(item)
@@ -931,6 +1159,11 @@ class WorkflowManager:
                     db.add(Evaluation(vacancy_id=vacancy.id, data=result.model_dump()))
                 elif refresh_cached_evaluation:
                     evaluation_record.data = result.model_dump()
+                if evaluation_record is None or refresh_cached_evaluation:
+                    vacancy.data = {
+                        **(vacancy.data or {}),
+                        "evaluation_security_version": _EVALUATION_SECURITY_VERSION,
+                    }
                 if evaluation_record is None or refresh_cached_evaluation:
                     self.emit(
                         db,
@@ -960,16 +1193,22 @@ class WorkflowManager:
                     counters["filtered"] += 1
                     item.counters = counters
                 elif result.decision == "manual_review":
-                    vacancy.state = "ERROR"
-                    counters = dict(item.counters)
-                    counters["errors"] = counters.get("errors", 0) + 1
-                    item.counters = counters
+                    # This is a legacy evaluator result. Keep processing
+                    # automatic and safe by treating it as a filtered
+                    # vacancy, with no human-review state or retry.
+                    vacancy.state = "REJECTED_BY_MODEL"
+                    _increment_counter(db, item, "filtered")
                     self.emit(
                         db,
                         session_id,
                         "evaluation_skipped",
-                        result.reason,
-                        {"vacancy_id": vacancy.id},
+                        "Вакансия автоматически пропущена: решение требует ручной проверки",
+                        {
+                            "vacancy_id": vacancy.id,
+                            "decision": result.decision,
+                            "automatic": True,
+                            "reason_code": "legacy_manual_review",
+                        },
                     )
                 else:
                     if evaluation_record is None and not refresh_cached_evaluation:
@@ -979,7 +1218,7 @@ class WorkflowManager:
                     plan = ApplicationPlan(
                         vacancy_id=vacancy.id,
                         resume_file=resume_file,
-                        unknown_question_policy="manual_review",
+                        unknown_question_policy="skip",
                         submission_allowed=adapter_id != "hirehi",
                     )
                     plan_record = db.scalar(
@@ -989,6 +1228,22 @@ class WorkflowManager:
                     )
                     if plan_record:
                         plan = ApplicationPlan.model_validate(plan_record.data)
+                        if plan.unknown_question_policy == "manual_review":
+                            # Keep loading legacy durable plans, but migrate
+                            # their policy before any new form work starts.
+                            plan.unknown_question_policy = "skip"
+                            plan_record.data = plan.model_dump()
+                        try:
+                            _assert_safe_application_plan(
+                                plan, profile, selected_resumes, context="cached_application_plan"
+                            )
+                        except PromptInjectionDetected as exc:
+                            _record_security_incident(
+                                db, item, vacancy, exc,
+                                context="cached_application_plan", emit=self.emit,
+                            )
+                            db.commit()
+                            continue
                     else:
                         plan_record = ApplicationPlanRecord(
                             vacancy_id=vacancy.id, data=plan.model_dump()
@@ -999,6 +1254,17 @@ class WorkflowManager:
                     )
                     if cover_record:
                         letter = cover_record.text
+                        try:
+                            assert_safe_outgoing_text(
+                                letter, profile, selected_resumes, context="cached_cover_letter"
+                            )
+                        except PromptInjectionDetected as exc:
+                            _record_security_incident(
+                                db, item, vacancy, exc,
+                                context="cached_cover_letter", emit=self.emit,
+                            )
+                            db.commit()
+                            continue
                     else:
                         try:
                             letter = await write_cover_letter(
@@ -1010,6 +1276,15 @@ class WorkflowManager:
                                 cover_letter_auto=item.cover_letter_auto,
                                 cover_letter_template=item.cover_letter_template,
                             )
+                            assert_safe_outgoing_text(
+                                letter, profile, selected_resumes, context="cover_letter"
+                            )
+                        except PromptInjectionDetected as exc:
+                            _record_security_incident(
+                                db, item, vacancy, exc, context="cover_letter", emit=self.emit
+                            )
+                            db.commit()
+                            continue
                         except CoverLetterValidationError as exc:
                             data = dict(vacancy.data or {})
                             try:
@@ -1036,16 +1311,20 @@ class WorkflowManager:
                                     },
                                 )
                             else:
-                                vacancy.state = "NEEDS_REVIEW"
-                                counters = dict(item.counters)
-                                counters["review"] = counters.get("review", 0) + 1
-                                item.counters = counters
+                                vacancy.state = "FILTERED_OUT"
+                                _increment_counter(db, item, "filtered")
                                 self.emit(
                                     db,
                                     session_id,
-                                    "human_required",
-                                    str(exc),
-                                    {"kind": "cover_letter", "vacancy_id": vacancy.id, "attempts": attempts},
+                                    "vacancy_skipped",
+                                    "Вакансия пропущена: сопроводительное письмо не удалось подготовить автоматически",
+                                    {
+                                        "kind": "cover_letter",
+                                        "vacancy_id": vacancy.id,
+                                        "attempts": attempts,
+                                        "automatic": True,
+                                        "reason_code": "cover_letter_generation_failed",
+                                    },
                                 )
                             continue
                         except ModelUnavailable:
@@ -1092,6 +1371,7 @@ class WorkflowManager:
                         if adapter_id == "hirehi":
                             route_reader = getattr(adapter, "collect_application_route", None)
                             route = await route_reader(executor.page) if route_reader else None
+                            sanitize_untrusted_input(route, context="application_route")
                             form = None
                         else:
                             retry_check = getattr(adapter, "can_retry_application", None)
@@ -1101,6 +1381,10 @@ class WorkflowManager:
                             vacancy.state = "SUBMITTING"
                             db.commit()
                             form = await adapter.open_application(executor.page)
+                            # Keep the live form for adapter binding, while the
+                            # model sees a sanitized copy with the same IDs and
+                            # options.
+                            model_form = sanitize_untrusted_input(form, context="application_form")
                             route = getattr(form, "route", None)
                         kind = getattr(route, "kind", None)
                         if adapter_id == "hirehi":
@@ -1112,12 +1396,26 @@ class WorkflowManager:
                             )
                             if not contact_text and contact and getattr(contact, "exhausted", False):
                                 contact_text = "Лимит прямых контактов HireHi исчерпан"
+                            if plan.cover_letter:
+                                assert_safe_outgoing_text(
+                                    plan.cover_letter,
+                                    profile,
+                                    selected_resumes,
+                                    context="hirehi_report_letter",
+                                )
                             try:
                                 summary_payload = {"job": {"title": vacancy.title, "description": getattr(posting, "description", "")}}
                                 if preference_policy:
                                     summary_payload["preference_policy"] = preference_policy.model_dump(mode="json")
                                 summary = await gateway.structured("job_summary", summary_payload, JobSummary)
+                                assert_safe_output(summary, context="job_summary")
                                 short_description = summary.summary
+                            except PromptInjectionDetected as exc:
+                                _record_security_incident(
+                                    db, item, vacancy, exc, context="job_summary", emit=self.emit
+                                )
+                                db.commit()
+                                continue
                             except ModelUnavailable:
                                 raise
                             except Exception:
@@ -1165,10 +1463,21 @@ class WorkflowManager:
                                 return
                             if outcome.pending:
                                 vacancy.data = {**(vacancy.data or {}), "application_review_reasons": outcome.pending}
-                                vacancy.state = "NEEDS_REVIEW"
-                                _increment_counter(db, item, "errors")
-                                self.emit(db, session_id, "human_required", "; ".join(outcome.pending),
-                                          {"vacancy_id": vacancy.id, "kind": "application_questions"})
+                                vacancy.state = "FILTERED_OUT"
+                                _increment_counter(db, item, "filtered")
+                                self.emit(
+                                    db,
+                                    session_id,
+                                    "vacancy_skipped",
+                                    "Вакансия пропущена: форму не удалось безопасно заполнить автоматически",
+                                    {
+                                        "vacancy_id": vacancy.id,
+                                        "kind": "application_questions",
+                                        "reason_count": len(outcome.pending),
+                                        "automatic": True,
+                                        "reason_code": "application_form_unresolved",
+                                    },
+                                )
                                 db.commit()
                                 continue
                             submission = outcome.submission
@@ -1185,12 +1494,26 @@ class WorkflowManager:
                             memory=load_profile_memory(db, item.profile_id),
                             guaranteed_application=item.guaranteed_application,
                         )
+                        _assert_safe_application_plan(
+                            plan,
+                            profile,
+                            selected_resumes,
+                            context="application_plan",
+                            source_form=form,
+                        )
                         plan_record.data = plan.model_dump()
                         db.commit()
                         db.refresh(item)
                         if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
                             return
                         result = await adapter.fill_application(executor.page, plan)
+                        model_result = sanitize_untrusted_input(result, context="application_fill_result")
+                    except PromptInjectionDetected as exc:
+                        _record_security_incident(
+                            db, item, vacancy, exc, context="application_flow", emit=self.emit
+                        )
+                        db.commit()
+                        continue
                     except (ModelUnavailable, CaptchaRequired):
                         raise
                     except Exception:
@@ -1199,7 +1522,7 @@ class WorkflowManager:
                             retry_needed = True
                             continue
                         raise
-                    questions = unresolved_application_questions(form, result)
+                    questions = unresolved_application_questions(model_form, model_result)
                     if questions:
                         vacancy.data = {**(vacancy.data or {}), "application_unanswered_questions": questions}
                         vacancy.state = "UNKNOWN"
@@ -1220,7 +1543,26 @@ class WorkflowManager:
                         if item.status in {SessionStatus.STOPPED, SessionStatus.PAUSED}:
                             return
                         try:
+                            sanitize_untrusted_input(form, context="application_form_before_submit")
+                            _assert_safe_application_plan(
+                                plan, profile, selected_resumes,
+                                context="application_plan_before_submit",
+                                source_form=form,
+                            )
+                            reader = getattr(adapter, "read_application", None)
+                            if reader:
+                                current_form = await reader(executor.page)
+                                sanitize_untrusted_input(
+                                    current_form, context="application_form_before_submit"
+                                )
                             submission = await adapter.submit_application(executor.page)
+                        except PromptInjectionDetected as exc:
+                            _record_security_incident(
+                                db, item, vacancy, exc,
+                                context="application_before_submit", emit=self.emit,
+                            )
+                            db.commit()
+                            continue
                         except CaptchaRequired:
                             raise
                         except Exception:

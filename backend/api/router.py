@@ -43,6 +43,7 @@ from backend.intelligence.model_config import (
     normalize_base_url,
     validate_base_url,
 )
+from backend.intelligence.security import PromptInjectionDetected, sanitize_untrusted_input
 from backend.orchestrator.workflow import workflow_manager
 from backend.persistence.crypto import decrypt_secret, encrypt_secret
 from backend.persistence.database import get_db
@@ -346,6 +347,8 @@ async def _import_resume_for_profile(
         raise HTTPException(404, "Профиль не найден")
     try:
         path, imported = await save_and_extract(file, ModelGateway())
+    except PromptInjectionDetected as exc:
+        raise HTTPException(422, "Импортированное резюме содержит небезопасные инструкции") from exc
     except ModelUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
     except ValueError as exc:
@@ -379,6 +382,10 @@ async def _import_resume_for_profile(
         db.commit()
         db.refresh(profile)
         db.refresh(resume)
+    except PromptInjectionDetected as exc:
+        db.rollback()
+        path.unlink(missing_ok=True)
+        raise HTTPException(422, "Импортированное резюме содержит небезопасные инструкции") from exc
     except Exception as exc:
         db.rollback()
         path.unlink(missing_ok=True)
@@ -563,7 +570,7 @@ def answer_profile_question(profile_id: int, question_id: int, payload: Question
     else:
         try:
             save_user_answer(db, question, payload.answer)
-        except ValueError as error:
+        except (ValueError, PromptInjectionDetected) as error:
             raise HTTPException(422, str(error)) from error
     db.commit()
     return {"ok": True}
@@ -686,6 +693,15 @@ def session_dict(item: JobSession) -> dict:
 
 @router.post("/sessions")
 def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dict:
+    # Persist clean launch/template copies; the submitted request object stays
+    # untouched for validation and audit, and injected prose cannot alter the
+    # workflow's trusted instructions.
+    safe_description = sanitize_untrusted_input(
+        payload.desired_job_description, context="candidate search preferences"
+    )
+    safe_template = sanitize_untrusted_input(
+        payload.cover_letter_template, context="candidate letter template"
+    )
     profile = db.get(CandidateProfile, payload.profile_id)
     if not profile:
         raise HTTPException(400, "Сначала создайте профиль")
@@ -696,13 +712,13 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         raise HTTPException(400, str(exc)) from exc
     item = JobSession(
         profile_id=payload.profile_id,
-        desired_job_description=payload.desired_job_description,
+        desired_job_description=safe_description,
         minimum_scores=payload.minimum_scores or None,
         adapter_id=payload.adapter_id,
         application_limit=payload.application_limit,
         guaranteed_application=payload.guaranteed_application,
         cover_letter_auto=payload.cover_letter_auto,
-        cover_letter_template=payload.cover_letter_template,
+        cover_letter_template=safe_template,
         status=SessionStatus.CREATED,
         counters={},
     )
