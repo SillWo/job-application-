@@ -507,6 +507,17 @@ main {
   border-color: var(--ink);
   background: var(--paper);
 }
+.cover-letter-settings textarea:disabled {
+  cursor: not-allowed;
+  border-color: var(--line);
+  background: var(--line);
+  color: var(--muted);
+  opacity: 1;
+}
+.cover-letter-settings textarea:disabled::placeholder {
+  color: var(--muted);
+  opacity: .75;
+}
 input[type="checkbox"] {
   box-sizing: border-box;
   flex: 0 0 18px;
@@ -571,10 +582,10 @@ input[type="checkbox"]:disabled {
 .influence-section {
   display: grid;
   gap: 12px;
-  margin: 20px 0;
+  margin: 0;
   max-width: var(--form-content-max);
 }
-.influence-section > h3 { margin: 0; font-size: 18px; }
+.influence-section h3 { margin: 0; font-size: 18px; }
 .influence-control {
   position: relative;
   padding: 14px 16px;
@@ -908,6 +919,11 @@ button:disabled {
   display: grid;
   gap: 8px;
 }
+.session-description-textarea {
+  min-height: 120px;
+  overflow-y: hidden;
+  resize: none;
+}
 .profile-progress {
   color: var(--muted);
   font-size: 12px;
@@ -937,6 +953,64 @@ button:disabled {
   margin: 3px 0 0;
   color: var(--muted);
   font-weight: 400;
+}
+.session-collapsible-content {
+  display: grid;
+  gap: 12px;
+  padding: 20px;
+  border-top: 1px solid var(--line);
+}
+.session-collapsible-content[hidden] {
+  display: none;
+}
+.session-collapsible {
+  gap: 0;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--paper);
+  box-shadow: none;
+  overflow: hidden;
+}
+.session-collapsible + .session-collapsible {
+  margin-top: 12px;
+}
+.session-collapsible-heading {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.35;
+  letter-spacing: -0.015em;
+}
+.session-collapsible .session-collapsible-heading {
+  margin: 0;
+  font-size: 17px;
+}
+.session-collapsible-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  min-height: 64px;
+  padding: 16px 20px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-size: inherit;
+  font-weight: 600;
+  line-height: inherit;
+}
+.session-collapsible-icon {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  transition: transform var(--duration-fast) var(--ease-out);
+}
+.session-collapsible-trigger[aria-expanded="true"] .session-collapsible-icon {
+  transform: rotate(180deg);
 }
 .repeat-list {
   display: grid;

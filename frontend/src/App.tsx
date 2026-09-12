@@ -1,4 +1,4 @@
-import { ReactNode, useEffect, useId, useRef, useState } from "react";
+import { ReactNode, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { NavLink, Route, Routes, useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Toaster, toast } from "sonner";
@@ -670,6 +670,8 @@ function ProfilePage() {
 
 function SessionPage() {
   const [guaranteedApplication, setGuaranteedApplication] = useState(false);
+  const [coverLetterOpen, setCoverLetterOpen] = useState(false);
+  const [influenceOpen, setInfluenceOpen] = useState(false);
   const qc = useQueryClient();
   const profiles = useQuery({
     queryKey: ["profiles"],
@@ -694,7 +696,17 @@ function SessionPage() {
       sessionResumes.data?.some((resume) => resume.selected_for_matching),
   );
   const { draft, updateDraft, status: draftStatus, conflict: draftConflict, loadSaved } = useSessionDraft();
-  const { adapter, applicationLimit, desiredJobDescription, coverLetterAuto, coverLetterTemplate, unlimitedApplications, influence } = draft;
+  const { adapter, applicationLimit, desiredJobDescription, coverLetterAuto, coverLetterTemplate, coverLetterMaxWords, unlimitedApplications, influence } = draft;
+  const desiredJobDescriptionRef = useRef<HTMLTextAreaElement>(null);
+  const resizeDesiredJobDescription = useCallback(() => {
+    const textarea = desiredJobDescriptionRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    const styles = window.getComputedStyle(textarea);
+    const borderHeight = Number.parseFloat(styles.borderTopWidth || "0") + Number.parseFloat(styles.borderBottomWidth || "0");
+    textarea.style.height = `${textarea.scrollHeight + (styles.boxSizing === "border-box" ? borderHeight : 0)}px`;
+  }, []);
+  useLayoutEffect(() => { resizeDesiredJobDescription(); }, [desiredJobDescription, resizeDesiredJobDescription]);
   const blockedByAdapter = (sessions.data ?? []).some((session) => session.adapter_id === adapter && !terminalStatuses.includes(session.status));
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"neutral" | "success" | "warning" | "danger" | "info">("neutral");
@@ -702,6 +714,8 @@ function SessionPage() {
     unlimited || /^[1-9]\d*$/.test(value);
   const limitsAreValid = validLimit(applicationLimit, unlimitedApplications);
   const coverLetterIsValid = coverLetterAuto || coverLetterTemplate.trim().length > 0;
+  const coverLetterMaxWordsValue = coverLetterMaxWords ?? "";
+  const coverLetterMaxWordsAreValid = coverLetterMaxWordsValue === "" || (/^[1-9]\d*$/.test(coverLetterMaxWordsValue) && Number(coverLetterMaxWordsValue) <= 10000);
   const create = useMutation({
     mutationFn: async () => {
       const session = await api<JobSession>("/sessions", {
@@ -714,6 +728,7 @@ function SessionPage() {
           desired_job_description: desiredJobDescription.trim(),
           cover_letter_auto: coverLetterAuto,
           cover_letter_template: coverLetterTemplate,
+          cover_letter_max_words: coverLetterMaxWordsValue.trim() ? Number(coverLetterMaxWordsValue) : null,
           minimum_scores: { ...Object.fromEntries(Object.entries(influence).map(([key, level]) => [key, INFLUENCE_LEVELS.indexOf(level) + 1])), special_requirements: 1 },
         }),
       });
@@ -763,62 +778,75 @@ function SessionPage() {
       </Title>
         <article className="panel form">
           <span className="eyebrow">НОВАЯ СЕССИЯ</span>
-          <div className="row session-top-row">
-            <SingleSelect label="Сайт" options={[['hh', 'HH.ru'], ...(adapters.data ?? []).filter((item) => item.site_id !== "hh").map((item) => [item.site_id, item.display_name] as const)]} value={adapter} onValueChange={(adapter) => updateDraft({ adapter })} />
-            <label>
-              Лимит вакансий в работе
-              <input aria-label="Лимит вакансий в работе" type="number" min="1" step="1" value={applicationLimit} disabled={unlimitedApplications} onChange={(e) => updateDraft({ applicationLimit: e.target.value })} />
-              <small>{adapter === "hirehi" ? "Считаются выбранные вакансии." : "Считаются отклики, подтверждённые выбранной площадкой."}</small>
-              <span className="checkline"><input aria-label={adapter === "hirehi" ? "Без ограничений: выбранные вакансии" : "Без ограничений: отправка откликов"} type="checkbox" checked={unlimitedApplications} onChange={(e) => updateDraft({ unlimitedApplications: e.target.checked })} />Без ограничений</span>
+          <section className="subsection form-rail session-main-info" aria-labelledby="session-main-info-heading">
+            <div className="section-heading"><h3 id="session-main-info-heading">Основная информация</h3></div>
+            <div className="row session-top-row">
+              <SingleSelect label="Сайт" options={[['hh', 'HH.ru'], ...(adapters.data ?? []).filter((item) => item.site_id !== "hh").map((item) => [item.site_id, item.display_name] as const)]} value={adapter} onValueChange={(adapter) => updateDraft({ adapter })} />
+              <label>
+                Лимит вакансий в работе
+                <input aria-label="Лимит вакансий в работе" type="number" min="1" step="1" value={applicationLimit} disabled={unlimitedApplications} onChange={(e) => updateDraft({ applicationLimit: e.target.value })} />
+                <small>{adapter === "hirehi" ? "Считаются выбранные вакансии." : "Считаются отклики, подтверждённые выбранной площадкой."}</small>
+                <span className="checkline"><input aria-label={adapter === "hirehi" ? "Без ограничений: выбранные вакансии" : "Без ограничений: отправка откликов"} type="checkbox" checked={unlimitedApplications} onChange={(e) => updateDraft({ unlimitedApplications: e.target.checked })} />Без ограничений</span>
+              </label>
+            </div>
+            <label className="profile-full-field session-description-field">
+              Описание желаемой вакансии
+              <textarea
+                ref={desiredJobDescriptionRef}
+                className="session-description-textarea"
+                aria-label="Описание желаемой вакансии"
+                maxLength={2000}
+                rows={5}
+                value={desiredJobDescription}
+                onChange={(event) => { updateDraft({ desiredJobDescription: event.target.value }); resizeDesiredJobDescription(); }}
+                placeholder="Опишите желательные и нежелательные факторы вакансии"
+              />
+              <small>{desiredJobDescription.length} / 2000 символов</small>
+              <small role="status">{draftStatus}</small>
+              {draftConflict && <button type="button" className="secondary" onClick={() => void loadSaved()}>Заменить форму сохранённой копией</button>}
             </label>
-          </div>
-          <label className="profile-full-field session-description-field">
-            Описание желаемой вакансии
-            <textarea
-              aria-label="Описание желаемой вакансии"
-              maxLength={2000}
-              rows={5}
-              value={desiredJobDescription}
-              onChange={(event) => updateDraft({ desiredJobDescription: event.target.value })}
-              placeholder="Опишите желательные и нежелательные факторы вакансии"
-            />
-            <small>{desiredJobDescription.length} / 2000 символов</small>
-            <small role="status">{draftStatus}</small>
-            {draftConflict && <button type="button" className="secondary" onClick={() => void loadSaved()}>Заменить форму сохранённой копией</button>}
-          </label>
-          <section className="subsection form-rail cover-letter-settings" aria-labelledby="cover-letter-heading">
-            <div className="section-heading"><div><h3 id="cover-letter-heading">Сопроводительное письмо</h3><small>Можно использовать свою структуру. Фрагменты в квадратных скобках, например [ФИО], будут заменены ИИ по контексту.</small></div></div>
-            <label className="checkline"><input type="checkbox" aria-label="ИИ самостоятельно определяет структуру сопроводительного письма" checked={coverLetterAuto} onChange={(event) => updateDraft({ coverLetterAuto: event.target.checked })} />ИИ самостоятельно определяет структуру письма</label>
-            <small>В автоматическом режиме письмо включает достижение, навыки, образование, аргументы соответствия и контакты.</small>
-            <label className="field-prose">Своя структура сопроводительного письма
-              <textarea aria-label="Своя структура сопроводительного письма" maxLength={12000} rows={8} value={coverLetterTemplate} disabled={coverLetterAuto} onChange={(event) => updateDraft({ coverLetterTemplate: event.target.value })} placeholder="Например: Я [ФИО] — ..." />
-              <small>{coverLetterTemplate.length} / 12000 символов. Особые требования работодателя будут выполнены в любом режиме.</small>
-            </label>
+            <div className="guaranteed-mode">
+              <label className="checkline"><input type="checkbox" aria-label="Гарантированный отклик" checked={guaranteedApplication} onChange={(event) => setGuaranteedApplication(event.target.checked)} />Гарантированный отклик</label>
+              <small>ИИ сможет дополнять ответы правдоподобными сведениями, которых нет в резюме. Режим не гарантирует отправку отклика или оффер.</small>
+            </div>
           </section>
-          <section className="influence-section" aria-labelledby="influence-heading">
-            <h3 id="influence-heading">Влияние факторов на вакансии</h3>
-            {INFLUENCE_CRITERIA.map((criterion) => {
-              const selected = influence[criterion.key];
-              const selectedIndex = INFLUENCE_LEVELS.indexOf(selected);
-              const levels = criterion.levels;
-              const max = levels.length;
-              const levelIndex = Math.min(selectedIndex, max - 1);
-              return <div className="influence-control" key={criterion.key}>
-                <div className="influence-control-head"><strong>{criterion.title}</strong><span className="tooltip-wrap"><button type="button" className="question-button" aria-label={`Подсказка: ${criterion.title}`} data-tooltip={criterion.hint}>?</button><span className="tooltip" role="tooltip"><span>{criterion.hint.split('\n')[0]}</span><em>{criterion.hint.split('\n')[1]}</em></span><span className="sr-only">{criterion.hint}</span></span></div>
-                <div className="influence-axis">
-                  <input className="influence-range" style={{ '--range-progress': `${levelIndex / (max - 1) * 100}%` } as React.CSSProperties} type="range" min="1" max={max} step="1" value={levelIndex + 1} aria-label={`Уровень влияния: ${criterion.title}`} aria-valuetext={levels[levelIndex]} onChange={(event) => updateDraft({ influence: { ...influence, [criterion.key]: INFLUENCE_LEVELS[Number(event.target.value) - 1] } })} />
-                  <div className="influence-levels" aria-hidden="true">{levels.map((level, index) => <span key={level} style={{ '--level-position': `${index / (max - 1) * 100}%` } as React.CSSProperties}>{level}</span>)}</div>
-                </div>
-              </div>;
-            })}
+          <section className={`subsection form-rail session-collapsible cover-letter-settings${coverLetterOpen ? " is-open" : ""}`} aria-labelledby="cover-letter-heading">
+            <h3 id="cover-letter-heading" className="session-collapsible-heading"><button type="button" className="session-collapsible-trigger" aria-expanded={coverLetterOpen} aria-controls="cover-letter-fields" onClick={() => setCoverLetterOpen((open) => !open)}><span>Сопроводительное письмо</span><ChevronIcon className="session-collapsible-icon" /></button></h3>
+            <div id="cover-letter-fields" className="session-collapsible-content" hidden={!coverLetterOpen}>
+              <label className="checkline"><input type="checkbox" aria-label="ИИ самостоятельно определяет структуру сопроводительного письма" checked={coverLetterAuto} onChange={(event) => updateDraft({ coverLetterAuto: event.target.checked })} />ИИ самостоятельно определяет структуру письма</label>
+              {!coverLetterAuto && <>
+                <label className="field-prose">Своя структура сопроводительного письма
+                  <textarea aria-label="Своя структура сопроводительного письма" maxLength={12000} rows={8} value={coverLetterTemplate} onChange={(event) => updateDraft({ coverLetterTemplate: event.target.value })} placeholder="Например: Я [ФИО] — ..." />
+                  <small>{coverLetterTemplate.length} / 12000 символов. Особые требования работодателя будут выполнены в любом режиме.</small>
+                </label>
+                <label className="field-compact">Максимальная длина письма, слов
+                  <input aria-label="Максимальная длина сопроводительного письма в словах" type="number" min="1" max="10000" step="1" maxLength={5} value={coverLetterMaxWordsValue} onChange={(event) => updateDraft({ coverLetterMaxWords: event.target.value })} placeholder="По умолчанию: 150" />
+                </label>
+              </>}
+            </div>
           </section>
-          <div className="guaranteed-mode">
-            <label className="checkline"><input type="checkbox" checked={guaranteedApplication} onChange={(event) => setGuaranteedApplication(event.target.checked)} />Гарантированный отклик</label>
-            <small>ИИ сможет дополнять ответы правдоподобными сведениями, которых нет в резюме. Режим не гарантирует отправку отклика или оффер.</small>
-          </div>
+          <section className={`influence-section session-collapsible${influenceOpen ? " is-open" : ""}`} aria-labelledby="influence-heading">
+            <h3 id="influence-heading" className="session-collapsible-heading"><button type="button" className="session-collapsible-trigger" aria-expanded={influenceOpen} aria-controls="influence-fields" onClick={() => setInfluenceOpen((open) => !open)}><span>Влияние факторов на вакансии</span><ChevronIcon className="session-collapsible-icon" /></button></h3>
+            <div id="influence-fields" className="session-collapsible-content" hidden={!influenceOpen}>
+              {INFLUENCE_CRITERIA.map((criterion) => {
+                const selected = influence[criterion.key];
+                const selectedIndex = INFLUENCE_LEVELS.indexOf(selected);
+                const levels = criterion.levels;
+                const max = levels.length;
+                const levelIndex = Math.min(selectedIndex, max - 1);
+                return <div className="influence-control" key={criterion.key}>
+                  <div className="influence-control-head"><strong>{criterion.title}</strong><span className="tooltip-wrap"><button type="button" className="question-button" aria-label={`Подсказка: ${criterion.title}`} data-tooltip={criterion.hint}>?</button><span className="tooltip" role="tooltip"><span>{criterion.hint.split('\n')[0]}</span><em>{criterion.hint.split('\n')[1]}</em></span><span className="sr-only">{criterion.hint}</span></span></div>
+                  <div className="influence-axis">
+                    <input className="influence-range" style={{ '--range-progress': `${levelIndex / (max - 1) * 100}%` } as React.CSSProperties} type="range" min="1" max={max} step="1" value={levelIndex + 1} aria-label={`Уровень влияния: ${criterion.title}`} aria-valuetext={levels[levelIndex]} onChange={(event) => updateDraft({ influence: { ...influence, [criterion.key]: INFLUENCE_LEVELS[Number(event.target.value) - 1] } })} />
+                    <div className="influence-levels" aria-hidden="true">{levels.map((level, index) => <span key={level} style={{ '--level-position': `${index / (max - 1) * 100}%` } as React.CSSProperties}>{level}</span>)}</div>
+                  </div>
+                </div>;
+              })}
+            </div>
+          </section>
           <button type="button" className="primary"
             onClick={() => create.mutate()}
-            disabled={!profileReady || create.isPending || !limitsAreValid || !coverLetterIsValid || blockedByAdapter}
+            disabled={!profileReady || create.isPending || !limitsAreValid || !coverLetterIsValid || !coverLetterMaxWordsAreValid || blockedByAdapter}
           >
             {create.isPending ? "Запускаем…" : "Создать и запустить"}
           </button>
@@ -830,6 +858,9 @@ function SessionPage() {
           )}
           {!coverLetterIsValid && (
             <Notice tone="danger" role="alert">Добавьте структуру сопроводительного письма или включите автоматическую структуру.</Notice>
+          )}
+          {!coverLetterMaxWordsAreValid && (
+            <Notice tone="danger" role="alert">Укажите целое число от 1 до 10000 слов или оставьте поле пустым.</Notice>
           )}
           {!profileReady && (
             <Notice tone="warning">

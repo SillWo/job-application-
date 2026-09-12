@@ -8,6 +8,7 @@ export type SessionDraft = {
   desiredJobDescription: string
   coverLetterAuto: boolean
   coverLetterTemplate: string
+  coverLetterMaxWords?: string
   unlimitedApplications: boolean
   influence: Record<string, InfluenceLevel>
 }
@@ -27,6 +28,7 @@ function readLocal(): CachedDraft {
     for (const key of ['applicationLimit', 'desiredJobDescription', 'coverLetterTemplate'] as const) {
       if (typeof value[key] === 'string') draft[key] = value[key].slice(0, key === 'applicationLimit' ? 32 : key === 'coverLetterTemplate' ? 12000 : 2000)
     }
+    if (typeof value.coverLetterMaxWords === 'string') draft.coverLetterMaxWords = value.coverLetterMaxWords.slice(0, 5)
     if (typeof value.coverLetterAuto === 'boolean') draft.coverLetterAuto = value.coverLetterAuto
     if (typeof value.unlimitedApplications === 'boolean') draft.unlimitedApplications = value.unlimitedApplications
     if (Number.isInteger(value.revision) && value.revision >= 0) draft.revision = value.revision

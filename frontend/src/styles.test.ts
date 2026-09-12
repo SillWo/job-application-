@@ -81,6 +81,26 @@ test('all checkboxes share the resume control size and centered wrapper alignmen
   expect(css).toContain('.selection-control{display:flex;align-items:center;gap:8px;')
 })
 
+test('disabled cover letter template remains readable while clearly distinct', () => {
+  expect(css).toContain('.cover-letter-settingstextarea:disabled{cursor:not-allowed;border-color:var(--line);background:var(--line);color:var(--muted);opacity:1;}')
+  expect(css).toContain('.cover-letter-settingstextarea:disabled::placeholder{color:var(--muted);opacity:.75;}')
+})
+
+test('desired job description textarea grows without an internal scrollbar', () => {
+  expect(css).toContain('.session-description-textarea{min-height:120px;overflow-y:hidden;resize:none;}')
+})
+
+test('session disclosure groups are separated cards with full-width heading triggers', () => {
+  expect(css).toContain('.session-collapsible{gap:0;padding:0;margin:0;border:1pxsolidvar(--line);border-radius:var(--radius-card);background:var(--paper);box-shadow:none;overflow:hidden;}')
+  expect(css).toContain('.session-collapsible+.session-collapsible{margin-top:12px;}')
+  expect(css).toContain('.session-collapsible-content{display:grid;gap:12px;padding:20px;border-top:1pxsolidvar(--line);}')
+  expect(css).toContain('.session-collapsible-content[hidden]{display:none;}')
+  expect(css).toContain('.session-collapsible-trigger{display:flex;align-items:center;justify-content:space-between;gap:16px;width:100%;min-height:64px;padding:16px20px;border:0;border-radius:var(--radius-control);background:transparent;color:var(--ink);text-align:left;font-size:inherit;font-weight:600;line-height:inherit;}')
+  expect(css).toContain('.session-collapsible-icon{flex:00auto;width:18px;height:18px;transition:transformvar(--duration-fast)var(--ease-out);}')
+  expect(css).toContain('.session-collapsible-trigger[aria-expanded="true"].session-collapsible-icon{transform:rotate(180deg);}')
+  expect(css).not.toContain('.section-toggle')
+})
+
 test('profile layout keeps explicit equal and removable rails', () => {
   expect(css).toContain('.profile-pair-row,.profile-pair-remove-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));')
   expect(css).toContain('.profile-remove-row{display:grid;grid-template-columns:minmax(0,1fr)auto;')
