@@ -22,6 +22,15 @@ def test_description_is_limited_to_2000_characters():
         SessionCreate.model_validate(_payload(desired_job_description="x" * 2001))
 
 
+def test_cover_letter_word_limit_is_optional_with_safe_bounds():
+    assert SessionCreate.model_validate(_payload()).cover_letter_max_words == 150
+    assert SessionCreate.model_validate(_payload(cover_letter_max_words=240)).cover_letter_max_words == 240
+    with pytest.raises(ValidationError):
+        SessionCreate.model_validate(_payload(cover_letter_max_words=0))
+    with pytest.raises(ValidationError):
+        SessionCreate.model_validate(_payload(cover_letter_max_words=10001))
+
+
 def test_cover_letter_settings_require_template_only_in_manual_mode():
     automatic = SessionCreate.model_validate(_payload())
     assert automatic.cover_letter_auto is True
@@ -47,6 +56,7 @@ def test_session_dict_exposes_cover_letter_settings():
     result = session_dict(item)
     assert result["cover_letter_auto"] is False
     assert result["cover_letter_template"] == "Шаблон [ФИО]"
+    assert result["cover_letter_max_words"] is None
 
 
 def test_preference_policy_is_persisted_but_hidden_from_session_payload():

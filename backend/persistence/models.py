@@ -80,6 +80,9 @@ class JobSession(Base):
     application_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cover_letter_auto: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
     cover_letter_template: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    # Optional per-session cap for the generated cover letter. ``None`` keeps
+    # the writer's backwards-compatible default.
+    cover_letter_max_words: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(40), default="CREATED")
     counters: Mapped[dict] = mapped_column(JSON, default=dict)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

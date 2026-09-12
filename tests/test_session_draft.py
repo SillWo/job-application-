@@ -49,12 +49,14 @@ def test_cover_letter_settings_round_trip(client):
         "draft": {
             "coverLetterAuto": False,
             "coverLetterTemplate": "Здравствуйте, я [ФИО]...",
+            "coverLetterMaxWords": "240",
         },
     }
     saved = browser.put('/api/session-draft', json=payload)
     assert saved.status_code == 200
     assert saved.json()["draft"]["coverLetterAuto"] is False
     assert saved.json()["draft"]["coverLetterTemplate"] == "Здравствуйте, я [ФИО]..."
+    assert saved.json()["draft"]["coverLetterMaxWords"] == "240"
 
 
 def test_recovers_latest_description_but_respects_saved_empty_text(client):
@@ -77,6 +79,7 @@ def test_recovers_latest_description_but_respects_saved_empty_text(client):
 @pytest.mark.parametrize('draft', [
     {"desiredJobDescription": "x" * 2001}, {"adapter": "unknown"},
     {"cookies": "not form data"}, {"influence": {"tasks": "invalid"}},
+    {"coverLetterMaxWords": "0"}, {"coverLetterMaxWords": "100000"},
 ])
 def test_rejects_invalid_or_unrelated_data(client, draft):
     browser, _ = client

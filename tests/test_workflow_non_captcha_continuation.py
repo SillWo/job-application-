@@ -505,6 +505,49 @@ async def test_invalid_cover_letter_is_retried_before_submission(runtime, monkey
 
 
 @pytest.mark.asyncio
+async def test_cached_cover_letter_over_custom_limit_is_regenerated_and_updated(runtime, monkeypatch):
+    sessions, session_id = runtime
+    refs = [JobRef(external_id="cached", url="https://fake/cached")]
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.cover_letter_max_words = 3
+        vacancy = Vacancy(
+            session_id=session_id,
+            source="fake",
+            external_id="cached",
+            url="https://fake/cached",
+            title="Vacancy cached",
+            # Processing states are resumed by the workflow; a DISCOVERED row
+            # is intentionally skipped during a fresh search pass.
+            state="EVALUATING",
+            data={},
+        )
+        db.add(vacancy)
+        db.flush()
+        db.add(CoverLetter(vacancy_id=vacancy.id, text="одно два три четыре"))
+        db.commit()
+
+    calls = []
+
+    async def apply_all(*args, **kwargs):
+        return evaluation("apply")
+
+    async def regenerated(*args, **kwargs):
+        calls.append(kwargs.get("cover_letter_max_words"))
+        return "одно два"
+
+    monkeypatch.setattr(workflow, "write_cover_letter", regenerated)
+    await run_workflow(runtime, monkeypatch, FakeAdapter(refs), apply_all)
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        vacancy = db.scalar(select(Vacancy).where(Vacancy.external_id == "cached"))
+        assert item.status == SessionStatus.COMPLETED
+        assert calls == [3]
+        assert db.scalar(select(CoverLetter).where(CoverLetter.vacancy_id == vacancy.id)).text == "одно два"
+        assert vacancy.state == "SUBMITTED"
+
+
+@pytest.mark.asyncio
 async def test_invalid_cover_letter_becomes_manual_review_after_bounded_retries(runtime, monkeypatch):
     refs = [JobRef(external_id="bad", url="https://fake/bad"),
             JobRef(external_id="next", url="https://fake/next")]

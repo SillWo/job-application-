@@ -283,6 +283,8 @@ class SessionCreate(BaseModel):
     guaranteed_application: bool = False
     cover_letter_auto: bool = True
     cover_letter_template: str = Field(default="", max_length=12000)
+    # ``None`` means that the cover-letter writer uses its default cap.
+    cover_letter_max_words: int | None = Field(default=150, ge=1, le=10000)
 
     @classmethod
     def _minimum_limits(cls) -> dict[str, int]:
@@ -683,6 +685,7 @@ def session_dict(item: JobSession) -> dict:
         "guaranteed_application": bool(item.guaranteed_application),
         "cover_letter_auto": getattr(item, "cover_letter_auto", None) is not False,
         "cover_letter_template": getattr(item, "cover_letter_template", "") or "",
+        "cover_letter_max_words": getattr(item, "cover_letter_max_words", None),
         "status": item.status,
         "counters": item.counters or {},
         "started_at": item.started_at.isoformat() if item.started_at else None,
@@ -719,6 +722,7 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         guaranteed_application=payload.guaranteed_application,
         cover_letter_auto=payload.cover_letter_auto,
         cover_letter_template=safe_template,
+        cover_letter_max_words=payload.cover_letter_max_words,
         status=SessionStatus.CREATED,
         counters={},
     )

@@ -17,7 +17,8 @@ from backend.intelligence.security import (
 )
 from backend.schemas.domain import JobPosting
 
-_MAX_WORDS = 150
+DEFAULT_MAX_WORDS = 150
+_MAX_WORDS = DEFAULT_MAX_WORDS  # Backwards-compatible alias for existing callers.
 _GENERATION_ATTEMPTS = 3
 _PRIVATE_OR_SECRET_RE = re.compile(
     r"(?:system\s+prompt|developer\s+(?:message|prompt)|внутренн(?:яя|ие)\s+инструкц|"
@@ -131,14 +132,18 @@ def _contains_bracket_placeholder(text: str) -> bool:
 
 def validate_cover_letter(
     text: str, description: str = "", *, exempt_words: int = 0,
+    max_words: int | None = None,
 ) -> tuple[bool, str]:
     value = str(text or "").strip()
     if not value:
         return False, "пустой текст"
     if _contains_bracket_placeholder(value):
         return False, "остались служебные конструкции в квадратных скобках"
-    if _word_count(value) - exempt_words > _MAX_WORDS:
-        return False, f"объём превышает {_MAX_WORDS} слов"
+    limit = DEFAULT_MAX_WORDS if max_words is None else max_words
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("Лимит сопроводительного письма должен быть положительным целым числом")
+    if _word_count(value) - exempt_words > limit:
+        return False, f"объём превышает {limit} слов"
     return True, ""
 
 
@@ -197,11 +202,13 @@ def _validate_special_conditions(
     return True, "", exempt_words
 
 
-def _finish_cover_letter(text: str, profile_payload: Any, description: str = "") -> str:
+def _finish_cover_letter(
+    text: str, profile_payload: Any, description: str = "", *, max_words: int | None = None,
+) -> str:
     """Legacy entry point that validates, but never flattens or truncates."""
     value = str(text or "").strip()
     assert_safe_outgoing_text(value, profile_payload, context="generated_cover_letter")
-    valid, reason = validate_cover_letter(value, description)
+    valid, reason = validate_cover_letter(value, description, max_words=max_words)
     if not valid:
         raise CoverLetterValidationError(f"Сопроводительное письмо не прошло проверку: {reason}")
     return value
@@ -209,6 +216,7 @@ def _finish_cover_letter(text: str, profile_payload: Any, description: str = "")
 
 def _generation_requirements(
     *, cover_letter_auto: bool, cover_letter_template: str, description: str,
+    max_words: int = DEFAULT_MAX_WORDS,
     special_conditions: SpecialConditionBatch | None = None,
 ) -> str:
     mode = "самостоятельно выбери структуру" if cover_letter_auto else "используй пользовательский шаблон"
@@ -267,7 +275,7 @@ def _generation_requirements(
 {special_note}
 Особые условия работодателя обязательны независимо от режима и шаблона. Размести каждое по смыслу в начале, середине или конце; если требуется буквальный токен, сохрани его без изменений. В fulfilled_special_conditions верни по одному объекту на каждое условие с id и точным непересекающимся span из итогового текста. Не придумывай слова, цифры, опыт, достижения, навыки, контакты или образование. Пол уже выбран пользователем в profile.gender; не определяй его по имени и не меняй.
 
-Обычный объём — не более 150 слов, за исключением всего содержания особых условий работодателя. Используй только выбранный profile.gender: для male — мужские формы, для female — женские; не пиши формы «(а)» и не определяй пол по имени. Верни только тело письма.{structure_note}"""
+Обычный объём — не более {max_words} слов, за исключением всего содержания особых условий работодателя. Используй только выбранный profile.gender: для male — мужские формы, для female — женские; не пиши формы «(а)» и не определяй пол по имени. Верни только тело письма.{structure_note}"""
 
 
 def _fallback_special_conditions(description: str) -> SpecialConditionBatch:
@@ -390,6 +398,7 @@ async def write_cover_letter(
     *,
     cover_letter_auto: bool = True,
     cover_letter_template: str = "",
+    cover_letter_max_words: int | None = None,
 ) -> str:
     # Preserve caller-owned values for URL allowlisting and UI audit, while
     # sending only sanitized semantic copies to the model and local extractor.
@@ -397,6 +406,9 @@ async def write_cover_letter(
     safe_profile = sanitize_untrusted_input(profile, context="candidate profile")
     safe_resumes = sanitize_untrusted_input(list(resumes), context="candidate resumes")
     safe_template = sanitize_untrusted_input(cover_letter_template, context="candidate letter template")
+    max_words = DEFAULT_MAX_WORDS if cover_letter_max_words is None else cover_letter_max_words
+    if isinstance(max_words, bool) or not isinstance(max_words, int) or max_words < 1:
+        raise ValueError("Лимит сопроводительного письма должен быть положительным целым числом")
     safe_preferences = (
         sanitize_untrusted_input(preference_policy, context="candidate preferences")
         if preference_policy is not None else None
@@ -428,10 +440,12 @@ async def write_cover_letter(
         "resumes": model_resume_payloads,
         "cover_letter_auto": bool(cover_letter_auto),
         "cover_letter_template": effective_template,
+        "cover_letter_max_words": max_words,
         "special_conditions": [item.model_dump(mode="json") for item in special_conditions.conditions],
         "requirements": _generation_requirements(
             cover_letter_auto=cover_letter_auto,
             cover_letter_template=effective_template,
+            max_words=max_words,
             description=safe_description,
             special_conditions=special_conditions,
         ),
@@ -463,6 +477,7 @@ async def write_cover_letter(
         if valid:
             valid, reason = validate_cover_letter(
                 draft.text, safe_description, exempt_words=exempt_words,
+                max_words=max_words,
             )
         if valid:
             return str(draft.text).strip()

@@ -16,7 +16,11 @@ from backend.intelligence.evaluator import _payload, evaluate
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
 from backend.intelligence.hirehi_category import JobSummary, choose_hirehi_category
 from backend.intelligence.hirehi_grade import hirehi_grades
-from backend.intelligence.letter_writer import CoverLetterValidationError, write_cover_letter
+from backend.intelligence.letter_writer import (
+    CoverLetterValidationError,
+    validate_cover_letter,
+    write_cover_letter,
+)
 from backend.intelligence.preference_policy import compile_preference_policy
 from backend.intelligence.search_planner import plan_search_queries
 from backend.intelligence.security import (
@@ -1252,6 +1256,7 @@ class WorkflowManager:
                     cover_record = db.scalar(
                         select(CoverLetter).where(CoverLetter.vacancy_id == vacancy.id)
                     )
+                    stale_cover_record = None
                     if cover_record:
                         letter = cover_record.text
                         try:
@@ -1265,16 +1270,35 @@ class WorkflowManager:
                             )
                             db.commit()
                             continue
-                    else:
+                        valid, _reason = validate_cover_letter(
+                            letter,
+                            posting.description,
+                            max_words=item.cover_letter_max_words,
+                        )
+                        if not valid:
+                            # A cached letter may have been created with a
+                            # different session cap. Keep its row so the
+                            # regenerated result replaces it below.
+                            stale_cover_record = cover_record
+                            cover_record = None
+                    if cover_record is None:
                         try:
+                            letter_kwargs: dict[str, Any] = {
+                                "cover_letter_auto": item.cover_letter_auto,
+                                "cover_letter_template": item.cover_letter_template,
+                            }
+                            # Keep the omitted value backwards-compatible for
+                            # integrations that wrap the writer, while an
+                            # explicit session setting is passed through.
+                            if item.cover_letter_max_words is not None:
+                                letter_kwargs["cover_letter_max_words"] = item.cover_letter_max_words
                             letter = await write_cover_letter(
                                 posting,
                                 profile,
                                 selected_resumes,
                                 gateway,
                                 preference_policy,
-                                cover_letter_auto=item.cover_letter_auto,
-                                cover_letter_template=item.cover_letter_template,
+                                **letter_kwargs,
                             )
                             assert_safe_outgoing_text(
                                 letter, profile, selected_resumes, context="cover_letter"
@@ -1340,8 +1364,10 @@ class WorkflowManager:
                         vacancy.data = data
                     plan.allow_foreign_application = adapter_id == "hh"
                     plan_record.data = plan.model_dump()
-                    if cover_record is None:
+                    if cover_record is None and stale_cover_record is None:
                         db.add(CoverLetter(vacancy_id=vacancy.id, text=letter))
+                    elif stale_cover_record is not None:
+                        stale_cover_record.text = letter
                     vacancy.state = "READY_TO_REPORT" if adapter_id == "hirehi" else "READY_TO_SUBMIT"
                 if vacancy.state in {"READY_TO_SUBMIT", "READY_TO_REPORT"}:
                     db.commit()

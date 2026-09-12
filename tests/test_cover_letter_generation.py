@@ -61,6 +61,33 @@ async def test_auto_mode_ignores_stale_template_and_sends_full_description():
 
 
 @pytest.mark.asyncio
+async def test_custom_word_limit_is_forwarded_and_used_for_validation():
+    text = " ".join(["слово"] * 151)
+
+    def draft(schema, payload, _count):
+        assert payload["cover_letter_max_words"] == 200
+        assert "не более 200 слов" in payload["requirements"]
+        return schema.model_validate({"text": text, "fulfilled_special_conditions": []})
+
+    result = await write_cover_letter(
+        _job(), {"gender": "female"}, [{"name": "Резюме"}], Gateway(draft),
+        cover_letter_max_words=200,
+    )
+    assert result == text
+
+
+@pytest.mark.asyncio
+async def test_default_word_limit_remains_150_words():
+    text = " ".join(["слово"] * 151)
+    gateway = Gateway(lambda schema, _payload, _count: schema.model_validate({
+        "text": text, "fulfilled_special_conditions": [],
+    }))
+    with pytest.raises(CoverLetterValidationError):
+        await write_cover_letter(_job(), {"gender": "female"}, [{"name": "Резюме"}], gateway)
+    assert len([role for role, *_ in gateway.calls if role == "writer"]) == 3
+
+
+@pytest.mark.asyncio
 async def test_ordinary_quoted_site_instruction_is_not_letter_condition():
     captured = {}
 

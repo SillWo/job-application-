@@ -40,22 +40,28 @@ def test_cover_letter_settings_migrate_legacy_rows_and_round_trip(tmp_path):
 
     command.upgrade(config, "head")
     with sqlite3.connect(path) as db:
-        gender, auto, template = db.execute(
-            "select gender, cover_letter_auto, cover_letter_template from candidate_profiles cross join sessions"
+        gender, auto, template, max_words = db.execute(
+            "select gender, cover_letter_auto, cover_letter_template, cover_letter_max_words from candidate_profiles cross join sessions"
         ).fetchone()
         assert gender is None
         assert auto == 1
         assert template == ""
+        assert max_words is None
         db.execute("update candidate_profiles set gender = 'female'")
-        db.execute("update sessions set cover_letter_auto = 0, cover_letter_template = 'Я [ФИО]'")
+        db.execute("update sessions set cover_letter_auto = 0, cover_letter_template = 'Я [ФИО]', cover_letter_max_words = 240")
         db.commit()
         assert db.execute("select gender from candidate_profiles").fetchone()[0] == "female"
         assert db.execute("select cover_letter_auto, cover_letter_template from sessions").fetchone() == (0, "Я [ФИО]")
+        assert db.execute("select cover_letter_max_words from sessions").fetchone() == (240,)
         db.execute("update sessions set cover_letter_auto = 1, cover_letter_template = ''")
         db.commit()
         assert db.execute("select cover_letter_auto, cover_letter_template from sessions").fetchone() == (1, "")
+        db.execute("update sessions set cover_letter_max_words = NULL")
+        db.commit()
+        assert db.execute("select cover_letter_max_words from sessions").fetchone() == (None,)
 
     command.downgrade(config, "0024")
     with sqlite3.connect(path) as db:
         assert "gender" not in {row[1] for row in db.execute("pragma table_info(candidate_profiles)")}
         assert "cover_letter_auto" not in {row[1] for row in db.execute("pragma table_info(sessions)")}
+        assert "cover_letter_max_words" not in {row[1] for row in db.execute("pragma table_info(sessions)")}
