@@ -72,13 +72,14 @@ async def test_failed_extraction_is_retried_even_if_listing_loses_the_ref(runtim
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["open", "submit"])
 async def test_process_crash_after_send_is_reconciled_without_second_click(runtime, monkeypatch, phase):
-    server = {"sent": False, "clicks": 0}
+    server = {"sent": False, "clicks": 0, "verifications": 0}
 
     class Adapter(FakeAdapter):
         async def can_retry_application(self, page):
             return not server["sent"]
 
         async def verify_submission(self, page):
+            server["verifications"] += 1
             return SubmissionResult(status="already_applied" if server["sent"] else "unknown", message="server state")
 
         async def open_application(self, page):
@@ -106,6 +107,74 @@ async def test_process_crash_after_send_is_reconciled_without_second_click(runti
         assert db.get(JobSession, runtime[1]).counters["submitted"] == 1
         assert len(list(db.scalars(select(Application)))) == 1
     assert server["clicks"] == 1
+    assert server["verifications"] == 1
+
+
+@pytest.mark.asyncio
+async def test_submitting_without_verifier_is_unconfirmed_and_next_vacancy_runs(runtime, monkeypatch):
+    class Adapter(FakeAdapter):
+        verify_submission = None
+
+    adapter = Adapter(refs("stuck", "healthy"))
+    configure(monkeypatch, adapter)
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        item.status = SessionStatus.RUNNING
+        item.counters = {"viewed": 0, "filtered": 0, "matched": 0, "submitted": 0, "errors": 0}
+        db.add(
+            Vacancy(
+                session_id=runtime[1],
+                source="fake",
+                external_id="stuck",
+                url="https://fake/stuck",
+                title="Stuck submission",
+                state="SUBMITTING",
+                data={},
+            )
+        )
+        db.commit()
+
+    await asyncio.wait_for(workflow.WorkflowManager().run(runtime[1]), timeout=5)
+
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        rows = {vacancy.external_id: vacancy for vacancy in db.scalars(select(Vacancy))}
+        assert item.status == SessionStatus.COMPLETED
+        assert item.counters["errors"] == 1
+        assert item.counters["submitted"] == 1
+        assert rows["stuck"].state == "UNCONFIRMED"
+        assert rows["stuck"].data["error_code"] == "SUBMISSION_UNCONFIRMED"
+        assert db.scalar(select(Application).where(Application.vacancy_id == rows["stuck"].id)).status == "unknown"
+        assert rows["healthy"].state == "SUBMITTED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_blocked_submission_distinguishes_ambiguous_from_confirmed(
+    runtime, monkeypatch, confirmed
+):
+    class Adapter(FakeAdapter):
+        async def submit_application(self, page):
+            return SubmissionResult(
+                status="blocked", message="site response", confirmed=confirmed
+            )
+
+    configure(monkeypatch, Adapter(refs("blocked")))
+    await asyncio.wait_for(workflow.WorkflowManager().run(runtime[1]), timeout=8)
+
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        vacancy = db.scalar(select(Vacancy))
+        if confirmed:
+            assert vacancy.state == "ERROR"
+            assert vacancy.data["error_code"] == "SUBMISSION_BLOCKED"
+            assert item.counters["errors"] == 1
+        else:
+            assert vacancy.state == "UNCONFIRMED"
+            assert vacancy.data["error_code"] == "SUBMISSION_UNCONFIRMED"
+            assert item.counters.get("errors") == 1
+            application = db.scalar(select(Application).where(Application.vacancy_id == vacancy.id))
+            assert application.status == "unknown"
 
 
 @pytest.mark.asyncio
@@ -185,13 +254,43 @@ async def test_stop_interrupts_backoff_and_preserves_user_stop(runtime, monkeypa
         assert db.get(JobSession, runtime[1]).stop_reason == "user stop"
 
 
+@pytest.mark.asyncio
+async def test_recovery_budget_exhaustion_fails_stalled_session(runtime, monkeypatch):
+    manager = workflow.WorkflowManager()
+    manager.retry_base_seconds = 0
+    manager.retry_max_seconds = 0
+    calls = 0
+
+    async def no_progress(_session_id):
+        nonlocal calls
+        calls += 1
+        raise workflow.RecoverableFailure("same stage remains pending")
+
+    monkeypatch.setattr(manager, "_run", no_progress)
+    await asyncio.wait_for(manager.run(runtime[1]), timeout=3)
+
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        events = list(db.scalars(select(BrowserEvent).where(
+            BrowserEvent.session_id == runtime[1],
+            BrowserEvent.event_type == "session_failed",
+        )))
+        assert item.status == SessionStatus.FAILED
+        assert item.recovery["attempt"] == workflow._SESSION_RECOVERY_RETRY_LIMIT
+        assert calls == workflow._SESSION_RECOVERY_RETRY_LIMIT + 1
+        assert events[-1].data == {
+            "kind": "recovery_exhausted",
+            "attempts": workflow._SESSION_RECOVERY_RETRY_LIMIT,
+        }
+
+
 def test_startup_recovers_only_accepted_active_work(runtime, monkeypatch):
     sessions, session_id = runtime
     with sessions() as db:
         item = db.get(JobSession, session_id)
         item.status = SessionStatus.RUNNING
         for status in (SessionStatus.CREATED, SessionStatus.PAUSED, SessionStatus.STOPPED, SessionStatus.COMPLETED):
-            db.add(JobSession(profile_id=item.profile_id, adapter_id="fake", status=status))
+            db.add(JobSession(adapter_id="fake", status=status))
         db.commit()
     launched = []
     monkeypatch.setattr(workflow.workflow_manager, "launch", lambda ident: launched.append(ident))
@@ -283,7 +382,9 @@ async def test_target_reached_does_not_depend_on_model_or_browser(runtime, monke
     monkeypatch.setattr(workflow, "get_browser", lambda _: pytest.fail("already at goal"))
     await workflow.WorkflowManager().run(runtime[1])
     with runtime[0]() as db:
-        assert db.get(JobSession, runtime[1]).status == SessionStatus.COMPLETED
+        item = db.get(JobSession, runtime[1])
+        assert item.status == SessionStatus.COMPLETED
+        assert item.counters["errors"] == 0
 
 
 @pytest.mark.asyncio

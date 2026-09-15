@@ -29,7 +29,7 @@ def _title(resume: dict[str, Any]) -> str:
         value = resume.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    for key in ("general", "general_info", "common"):
+    for key in ("target", "general", "general_info", "common"):
         if isinstance(resume.get(key), dict):
             found = _title(resume[key])
             if found:

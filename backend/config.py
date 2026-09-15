@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     frontend_dist: Path = ROOT / "frontend" / "dist"
     browser_headless: bool = False
     pointer_overlay: bool = True
+    # Use a normal Chromium UA for public pages; HeadlessChrome is rejected by
+    # several sites and is not representative of the user-facing browser.
+    browser_user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/128 Safari/537.36"
+    )
 
 
 settings = Settings()

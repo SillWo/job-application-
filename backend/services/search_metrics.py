@@ -167,7 +167,7 @@ def summary(db, item: JobSession) -> dict:
         "time_to_relevant_seconds": {str(k): reached[k - 1] if len(reached) >= k else None for k in (1, 20, 50, 100)},
         "recovery_retries": retries, "stages": stages, "sources": sources,
         "token_usage": token_usage if token_usage["reported_calls"] else None,
-        "applications": {key: (item.counters or {}).get(key, 0) for key in ("submitted", "already_applied", "errors", "skipped_test")},
+        "applications": {key: (item.counters or {}).get(key, 0) for key in ("submitted", "already_applied", "errors")},
         "limitations": ["Relevance is the configured model decision, not independent human ground truth.",
                          "Historical overlaps and unjudged vacancies are not negative labels.",
                          "HH recommendations change after activity; run order can affect results.",

@@ -63,9 +63,9 @@ def test_recovers_latest_description_but_respects_saved_empty_text(client):
     browser, engine = client
     with Session(engine) as db:
         db.add_all([
-            JobSession(profile_id=1, adapter_id='hh', desired_job_description='Первое'),
-            JobSession(profile_id=1, adapter_id='hirehi', desired_job_description='Последнее', application_limit=None),
-            JobSession(profile_id=1, adapter_id='hh', desired_job_description=''),
+            JobSession(adapter_id='hh', desired_job_description='Первое'),
+            JobSession(adapter_id='hirehi', desired_job_description='Последнее', application_limit=None),
+            JobSession(adapter_id='hh', desired_job_description=''),
         ])
         db.commit()
     restored = browser.get('/api/session-draft').json()

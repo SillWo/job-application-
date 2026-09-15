@@ -40,7 +40,7 @@ async def run(adapter, checkpoint=lambda _: True, **kwargs):
 async def test_unchanged_form_after_submit_is_never_submitted_twice():
     adapter = Adapter()
     outcome = await run(adapter)
-    assert outcome.pending
+    assert outcome.error_code == "APPLICATION_FORM_STUCK"
     assert adapter.submits == 1
 
 
@@ -109,7 +109,7 @@ async def test_step_limit_stops_endless_new_forms(monkeypatch):
     monkeypatch.setattr(hh_application, "prepare_answers", prepare)
     adapter = Adapter([ApplicationForm(fields=[ApplicationField(id=str(i), label=f"Вопрос {i}")]) for i in range(10)])
     outcome = await run(adapter, max_steps=3)
-    assert outcome.pending
+    assert outcome.error_code == "APPLICATION_FORM_STUCK"
     assert adapter.submits == 3
 
 
@@ -117,5 +117,5 @@ async def test_step_limit_stops_endless_new_forms(monkeypatch):
 async def test_unconfirmed_country_does_not_submit():
     adapter = Adapter([ApplicationForm(confirmation="foreign_country")])
     outcome = await run(adapter)
-    assert outcome.pending
+    assert outcome.error_code == "FOREIGN_APPLICATION_CONFIRMATION_FAILED"
     assert adapter.fills == adapter.submits == 0

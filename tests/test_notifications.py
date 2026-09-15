@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.api.router import mark_all_notifications_read, mark_notification_read, notifications
 from backend.persistence.database import Base
-from backend.persistence.models import CandidateProfile, JobSession, Notification, Vacancy
+from backend.persistence.models import JobSession, Notification, Vacancy
 
 
 def _db():
@@ -14,32 +14,26 @@ def _db():
     return sessionmaker(engine, expire_on_commit=False)
 
 
-def test_session_status_notifications_are_atomic_and_skip_login_resume():
+def test_session_status_notifications_are_atomic():
     Sessions = _db()
     with Sessions() as db:
-        profile = CandidateProfile()
-        db.add(profile)
-        db.flush()
-        item = JobSession(profile_id=profile.id, adapter_id="hh", status="CREATED", counters={})
+        item = JobSession(adapter_id="hh", status="CREATED", counters={})
         db.add(item)
         db.commit()
         item.status = "RUNNING"
         db.commit()
-        item.status = "WAITING_FOR_LOGIN"
+        item.status = "PAUSED"
         db.commit()
         item.status = "RUNNING"
         db.commit()
         rows = db.scalars(select(Notification)).all()
-        assert [(row.kind, row.message) for row in rows] == [("session_started", f"Сессия {item.id} запущена"), ("session_status_changed", f"Сессия {item.id}: статус изменён на WAITING_FOR_LOGIN")]
+        assert [row.kind for row in rows] == ["session_started", "session_status_changed", "session_status_changed"]
 
 
 def test_creating_session_does_not_create_notification():
     Sessions = _db()
     with Sessions() as db:
-        profile = CandidateProfile()
-        db.add(profile)
-        db.flush()
-        db.add(JobSession(profile_id=profile.id, adapter_id="hh", status="CREATED", counters={}))
+        db.add(JobSession(adapter_id="hh", status="CREATED", counters={}))
         db.commit()
         assert db.scalar(select(Notification.id)) is None
 
@@ -51,8 +45,7 @@ def test_creating_session_does_not_create_notification():
 def test_status_notification_matrix(old, new, expected):
     Sessions = _db()
     with Sessions() as db:
-        profile = CandidateProfile(); db.add(profile); db.flush()
-        item = JobSession(profile_id=profile.id, adapter_id="hh", status=old, counters={})
+        item = JobSession(adapter_id="hh", status=old, counters={})
         db.add(item); db.commit()
         item.status = new; db.commit()
         assert (db.scalar(select(Notification.id)) is not None) is expected
@@ -61,8 +54,7 @@ def test_status_notification_matrix(old, new, expected):
 def test_status_notification_rollback_is_atomic():
     Sessions = _db()
     with Sessions() as db:
-        profile = CandidateProfile(); db.add(profile); db.flush()
-        item = JobSession(profile_id=profile.id, adapter_id="hh", status="CREATED", counters={})
+        item = JobSession(adapter_id="hh", status="CREATED", counters={})
         db.add(item); db.commit()
         item.status = "RUNNING"
         db.flush()
@@ -73,7 +65,7 @@ def test_status_notification_rollback_is_atomic():
         assert db.scalar(select(Notification.id)) is None
 
 
-@pytest.mark.parametrize("state", ["ERROR", "UNKNOWN", "NEEDS_REVIEW"])
+@pytest.mark.parametrize("state", ["ERROR"])
 def test_vacancy_insert_notification_contract(state):
     Sessions = _db()
     with Sessions() as db:
@@ -94,23 +86,23 @@ def test_vacancy_insert_notification_contract(state):
 def test_vacancy_transitions_notify_once_and_skip_non_target_states():
     Sessions = _db()
     with Sessions() as db:
-        vacancy = Vacancy(source="hh", external_id="1", url="u", title="T", state="DISCOVERED", data={})
+        vacancy = Vacancy(source="hh", external_id="1", url="u", title="T", state="EXTRACTED", data={})
         db.add(vacancy); db.commit()
         vacancy.state = "ERROR"; db.flush(); db.flush(); db.commit()
         vacancy.state = "ERROR"; db.commit()
         vacancy.state = "EXTRACTED"; db.commit()
-        vacancy.state = "UNKNOWN"; db.commit()
-        assert db.scalar(select(Notification).where(Notification.source_type == "vacancy").order_by(Notification.id.desc())).kind == "vacancy_unknown"
+        vacancy.state = "ERROR"; db.commit()
+        assert db.scalar(select(Notification).where(Notification.source_type == "vacancy").order_by(Notification.id.desc())).kind == "vacancy_error"
         assert len(db.scalars(select(Notification).where(Notification.source_type == "vacancy")).all()) == 2
 
 
-def test_questionnaire_review_notification_includes_the_missing_information():
+def test_questionnaire_error_notification_includes_the_missing_information():
     Sessions = _db()
     with Sessions() as db:
         vacancy = Vacancy(source="hh", external_id="q", url="u", title="T", state="SUBMITTING", data={})
         db.add(vacancy); db.commit()
-        vacancy.data = {"application_review_reasons": ["Зарплата: не указан формат работы"]}
-        vacancy.state = "NEEDS_REVIEW"
+        vacancy.data = {"application_error_reasons": ["Зарплата: не указан формат работы"]}
+        vacancy.state = "ERROR"
         db.commit()
         row = db.scalar(select(Notification).where(Notification.source_type == "vacancy"))
         assert "Зарплата: не указан формат работы" in row.message
@@ -127,11 +119,11 @@ def test_vacancy_insert_flush_then_same_state_no_duplicate():
 def test_vacancy_notification_rollback_is_atomic():
     Sessions = _db()
     with Sessions() as db:
-        vacancy = Vacancy(source="hh", external_id="1", url="u", title="T", state="DISCOVERED", data={})
+        vacancy = Vacancy(source="hh", external_id="1", url="u", title="T", state="EXTRACTED", data={})
         db.add(vacancy); db.commit()
         vacancy.state = "ERROR"; db.flush(); db.rollback()
         assert db.scalar(select(Notification).where(Notification.source_type == "vacancy")) is None
-        assert db.get(Vacancy, vacancy.id).state == "DISCOVERED"
+        assert db.get(Vacancy, vacancy.id).state == "EXTRACTED"
 
 
 def test_notification_api_list_read_one_read_all_and_404():

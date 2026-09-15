@@ -5,13 +5,6 @@ import pytest
 from backend.api import router
 from backend.orchestrator import workflow
 from backend.schemas.domain import SessionStatus
-from backend.services import profile_memory
-
-
-@pytest.fixture(autouse=True)
-def isolate_profile_memory(monkeypatch):
-    # These tests exercise browser ownership, independently of question persistence.
-    monkeypatch.setattr(profile_memory, "collect_session_questions", lambda db, item: 0)
 
 
 class _DB:
@@ -20,6 +13,10 @@ class _DB:
 
     def get(self, model, session_id):
         return self.item
+
+    def scalar(self, statement):
+        # This double represents a legacy session with no resume snapshot.
+        return None
 
     def commit(self):
         pass
@@ -47,6 +44,7 @@ def _session(status=SessionStatus.RUNNING, adapter_id="hh"):
         stop_reason=None,
         finished_at=None,
         counters={},
+        recovery={},
     )
 
 
@@ -55,7 +53,6 @@ def _session(status=SessionStatus.RUNNING, adapter_id="hh"):
     "status, closes",
     [
         (SessionStatus.PAUSED, False),
-        (SessionStatus.WAITING_FOR_LOGIN, False),
         (SessionStatus.COMPLETED, True),
         (SessionStatus.STOPPED, True),
         (SessionStatus.FAILED, True),
@@ -88,7 +85,7 @@ async def test_workflow_run_closes_browser_only_for_terminal_status(monkeypatch,
 
 @pytest.mark.asyncio
 async def test_open_session_browser_releases_lease_when_start_fails(monkeypatch):
-    item = _session(SessionStatus.WAITING_FOR_LOGIN, "hh")
+    item = _session(SessionStatus.RUNNING, "hh")
     db = _DB(item)
     adapter = SimpleNamespace(site_id="hh", allowed_domains=["hh.ru"], display_name="HH")
     released = []

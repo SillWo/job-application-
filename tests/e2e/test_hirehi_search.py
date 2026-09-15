@@ -15,8 +15,9 @@ from backend.browser.executor import BrowserExecutor
 from backend.intelligence.hirehi_category import HireHiCategoryChoice
 from backend.orchestrator import workflow
 from backend.persistence.database import Base
-from backend.persistence.models import BrowserEvent, CandidateProfile, JobSession, Resume, Vacancy
+from backend.persistence.models import BrowserEvent, JobSession, Vacancy
 from backend.schemas.domain import JobEvaluation, SessionStatus
+from backend.services.resume_session import _normalize_extracted, persist_session_snapshot
 
 
 @pytest.mark.e2e
@@ -86,12 +87,18 @@ async def test_hirehi_category_pagination_and_recovery(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        profile = CandidateProfile(full_name="Fixture", gender="male")
-        db.add(profile)
-        db.flush()
-        db.add(Resume(profile_id=profile.id, name="Fixture", selected_for_matching=True))
-        item = JobSession(profile_id=profile.id, adapter_id="hirehi", application_limit=None)
+        item = JobSession(adapter_id="hirehi", application_limit=None)
         db.add(item)
+        db.flush()
+        persist_session_snapshot(
+            db, item.id,
+            _normalize_extracted(
+                {"external_id": "fixture", "identity": {"full_name": "Fixture", "gender": "male"},
+                 "target": {"title": "Engineer"}, "about": "Fixture professional background",
+                 "skills": [{"name": "Python"}]},
+                adapter_id="hirehi", source_url="https://hirehi.ru/resume/fixture",
+            ),
+        )
         db.commit()
         session_id = item.id
 

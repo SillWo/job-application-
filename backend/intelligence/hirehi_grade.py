@@ -50,7 +50,10 @@ def _full_months(left: date, right: date) -> int:
 def hirehi_grades(resume: Any, *, today: date | None = None) -> tuple[float, list[str]]:
     """Return total non-overlapping experience in years and HireHi grades."""
     today = today or date.today()
-    experiences = resume.get("experiences", []) if isinstance(resume, dict) else getattr(resume, "experiences", [])
+    if isinstance(resume, dict):
+        experiences = resume.get("experiences", resume.get("experience", []))
+    else:
+        experiences = getattr(resume, "experiences", getattr(resume, "experience", []))
     months = sum(_full_months(left, right) for left, right in _intervals(experiences, today))
     years = months / 12
     if months < 12:

@@ -158,7 +158,7 @@ async def test_unknown_required_checkbox_stops_and_same_form_is_not_resubmitted(
             ApplicationPlan(vacancy_id=1, resume_file="", submission_allowed=True),
             JobPosting(source="hh", url="https://hh.ru/vacancy/1", title="Роль", description="Описание"),
             {}, [{}], "", Gateway(), lambda _: True)
-        assert outcome.pending
+        assert outcome.error_code == "APPLICATION_FORM_UNRESOLVED"
         assert not await page.locator("input").is_checked()
     finally:
         await executor.close()

@@ -41,15 +41,16 @@ def test_relevance_counts_before_application_and_duplicates_do_not_inflate(runti
             ("metric_discovery", {"source": "query", "ids": ["1", "3"]}),
             ("evaluation", {"external_id": "1", "decision": "apply"}),
             ("evaluation", {"external_id": "1", "decision": "apply"}),
-            ("evaluation", {"external_id": "2", "decision": "manual_review"}),
+            ("evaluation", {"external_id": "2", "decision": "skip"}),
         ]:
             db.add(BrowserEvent(session_id=ident, event_type=kind, message="fixture", data=data))
         db.commit()
         report = metrics.summary(db, db.get(JobSession, ident))
-        assert report["relevant"] == report["judged"] == 1
-        assert report["unjudged"] == 2
+        assert report["relevant"] == 1
+        assert report["judged"] == 2
+        assert report["unjudged"] == 1
         assert report["relevant_per_discovered"] == 1 / 3
-        assert report["relevant_per_judged"] == 1
+        assert report["relevant_per_judged"] == 1 / 2
         assert report["sources"]["rec"]["relevant"] == 1
         assert report["applications"]["submitted"] == 0
 

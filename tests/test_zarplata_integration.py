@@ -47,7 +47,7 @@ async def test_login_status_is_read_only_and_sanitizes_url(monkeypatch):
     page = SimpleNamespace(
         url="https://krasnoyarsk.zarplata.ru/applicant/resumes?token=secret#section"
     )
-    executor = SimpleNamespace(page=page)
+    executor = SimpleNamespace(page=page, validate_navigation_url=lambda url: url)
 
     class Adapter:
         display_name = "Zarplata.ru"
@@ -70,7 +70,7 @@ async def test_login_status_is_read_only_and_sanitizes_url(monkeypatch):
     assert result == {
         "authenticated": True,
         "message": "Вход выполнен",
-        "url": "https://krasnoyarsk.zarplata.ru/applicant/resumes",
+        "url": "https://krasnoyarsk.zarplata.ru/",
     }
 
 

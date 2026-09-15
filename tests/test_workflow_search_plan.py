@@ -10,8 +10,9 @@ from backend.adapters.base.protocol import LoginState
 from backend.intelligence.hirehi_category import HireHiCategoryChoice
 from backend.orchestrator import workflow
 from backend.persistence.database import Base
-from backend.persistence.models import CandidateProfile, JobSession, Resume
+from backend.persistence.models import JobSession
 from backend.schemas.domain import SessionStatus
+from backend.services.resume_session import _normalize_extracted, persist_session_snapshot
 
 
 class _Page:
@@ -53,14 +54,19 @@ def search_runtime(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     with sessions() as db:
-        profile = CandidateProfile(full_name="Test", gender="male", contacts={}, education=[], languages=[])
-        db.add(profile)
-        db.flush()
-        db.add(Resume(profile_id=profile.id, name="Resume", desired_title="Python developer",
-                      selected_for_matching=True))
-        item = JobSession(profile_id=profile.id, adapter_id="test", status=SessionStatus.CREATED,
+        item = JobSession(adapter_id="test", status=SessionStatus.CREATED,
                           counters={})
         db.add(item)
+        db.flush()
+        persist_session_snapshot(
+            db, item.id,
+            _normalize_extracted(
+                {"external_id": "fixture", "identity": {"full_name": "Test", "gender": "male"},
+                 "target": {"title": "Python developer"}, "about": "Fixture professional background",
+                 "skills": [{"name": "Python"}]},
+                adapter_id="test", source_url="https://test/resume/fixture",
+            ),
+        )
         db.commit()
         session_id = item.id
     monkeypatch.setattr(workflow, "SessionLocal", sessions)
@@ -99,7 +105,18 @@ async def test_hh_passes_only_planned_queries_and_emits_plan(search_runtime, mon
 async def test_hirehi_keeps_category_flow_without_search_planner(search_runtime, monkeypatch):
     sessions, session_id = search_runtime
     with sessions() as db:
-        db.get(JobSession, session_id).adapter_id = "hirehi"
+        item = db.get(JobSession, session_id)
+        item.adapter_id = "hirehi"
+        persist_session_snapshot(
+            db,
+            session_id,
+            _normalize_extracted(
+                {"external_id": "fixture", "identity": {"full_name": "Test", "gender": "male"},
+                 "target": {"title": "Python developer"}, "about": "Fixture professional background",
+                 "skills": [{"name": "Python"}]},
+                adapter_id="hirehi", source_url="https://hirehi.ru/resume/fixture",
+            ),
+        )
         db.commit()
     adapter = _Adapter("hirehi")
 

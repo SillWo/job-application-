@@ -19,17 +19,23 @@ from backend.adapters.base.protocol import (
 )
 from backend.api.router import pause_session
 from backend.intelligence.letter_writer import CoverLetterValidationError
-from backend.orchestrator import workflow
+from backend.orchestrator import hh_application, workflow
 from backend.persistence.database import Base
 from backend.persistence.models import (
-    CandidateProfile,
     CoverLetter,
     JobSession,
     Notification,
-    Resume,
     Vacancy,
 )
-from backend.schemas.domain import JobEvaluation, JobPosting, SessionStatus
+from backend.schemas.domain import (
+    ApplicationField,
+    ApplicationPlan,
+    FormAnswer,
+    JobEvaluation,
+    JobPosting,
+    SessionStatus,
+)
+from backend.services.resume_session import _normalize_extracted, persist_session_snapshot
 
 
 def evaluation(decision: str = "skip") -> JobEvaluation:
@@ -121,15 +127,18 @@ def runtime(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     with sessions() as db:
-        profile = CandidateProfile(full_name="Test", gender="male", contacts={}, education=[], languages=[])
-        db.add(profile)
-        db.flush()
-        db.add(Resume(profile_id=profile.id, name="Resume", desired_title="Role",
-                      selected_for_matching=True))
-        item = JobSession(profile_id=profile.id, adapter_id="fake",
+        item = JobSession(adapter_id="fake",
                           application_limit=None,
                           status=SessionStatus.CREATED, counters={})
         db.add(item)
+        db.flush()
+        snapshot = _normalize_extracted(
+            {"external_id": "fixture", "identity": {"full_name": "Test", "gender": "male"},
+             "target": {"title": "Role"}, "about": "Fixture professional background",
+             "skills": [{"name": "Python"}]},
+            adapter_id="fake", source_url="https://fake/resume/fixture",
+        )
+        persist_session_snapshot(db, item.id, snapshot)
         db.commit()
         session_id = item.id
     monkeypatch.setattr(workflow.WorkflowManager, "retry_base_seconds", 0)
@@ -150,7 +159,7 @@ async def run_workflow(runtime, monkeypatch, adapter, evaluate_impl=None):
     return sessions, session_id
 
 
-def test_internal_form_transition_is_not_persisted_as_a_terminal_state(runtime):
+def test_internal_form_transition_is_recorded_as_an_error(runtime):
     sessions, session_id = runtime
     with sessions() as db:
         item = db.get(JobSession, session_id)
@@ -160,7 +169,8 @@ def test_internal_form_transition_is_not_persisted_as_a_terminal_state(runtime):
             db, item, vacancy, SubmissionResult(status="needs_input", message="HH.ru ожидает ответа"),
         )
         db.commit()
-        assert vacancy.state == "UNKNOWN"
+        assert vacancy.state == "ERROR"
+        assert vacancy.data["error_code"] == "APPLICATION_FORM_UNRESOLVED"
         assert item.counters["errors"] == 1
 
 
@@ -201,7 +211,7 @@ async def test_high_viewed_count_does_not_stop_session_but_application_limit_doe
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("kind", "state"), [
-    ("test", "NEEDS_REVIEW"), ("unknown_form", "UNKNOWN"),
+    ("test", "REJECTED_BY_MODEL"), ("unknown_form", "ERROR"),
     ("mfa", "ERROR"),
     ("blocked", "ERROR"),
     ("sensitive", "ERROR"),
@@ -233,11 +243,9 @@ async def test_test_assignment_is_filtered_and_next_ref_runs(runtime, monkeypatc
         item = db.get(JobSession, session_id)
         vacancies = {v.external_id: v for v in db.scalars(select(Vacancy))}
         assert item.status == SessionStatus.COMPLETED
-        assert vacancies["test"].state == "NEEDS_REVIEW"
+        assert vacancies["test"].state == "REJECTED_BY_MODEL"
         assert vacancies["next"].state == "REJECTED_BY_MODEL"
-        assert item.counters["filtered"] == 1
-        assert item.counters["skipped_test"] == 1
-        assert item.counters["review"] == 1
+        assert item.counters["filtered"] == 2
 
 
 @pytest.mark.asyncio
@@ -287,36 +295,6 @@ async def test_model_unavailable_recovers_without_error_and_continues(runtime, m
 
 
 @pytest.mark.asyncio
-async def test_missing_profile_gender_blocks_recovered_session_before_model(runtime, monkeypatch):
-    sessions, session_id = runtime
-    with sessions() as db:
-        profile = db.scalar(select(CandidateProfile))
-        profile.gender = None
-        db.commit()
-
-    evaluated = False
-
-    async def evaluate_impl(*args, **kwargs):
-        nonlocal evaluated
-        evaluated = True
-        return evaluation("skip")
-
-    monkeypatch.setattr(workflow, "evaluate", evaluate_impl)
-    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=5)
-    with sessions() as db:
-        item = db.get(JobSession, session_id)
-        events = list(db.scalars(select(workflow.BrowserEvent).where(
-            workflow.BrowserEvent.session_id == session_id,
-            workflow.BrowserEvent.event_type == "human_required",
-        )))
-        assert item.status == SessionStatus.NEEDS_REVIEW
-        assert item.stop_reason == "Укажите пол соискателя в профиле перед запуском сессии"
-        assert evaluated is False
-        assert any(event.data == {"kind": "profile", "field": "gender"} for event in events)
-
-
-
-@pytest.mark.asyncio
 async def test_application_attempt_failure_increments_error_once(runtime, monkeypatch):
     refs = [JobRef(external_id="apply", url="https://fake/apply")]
 
@@ -338,7 +316,8 @@ async def test_application_attempt_failure_increments_error_once(runtime, monkey
         vacancy = db.scalar(select(Vacancy))
         assert item.status == SessionStatus.COMPLETED
         assert item.counters["errors"] == 1
-        assert vacancy.state == "UNKNOWN"
+        assert vacancy.state == "ERROR"
+        assert vacancy.data["error_code"] == "VACANCY_PROCESSING_FAILED"
 
 
 @pytest.mark.asyncio
@@ -351,9 +330,9 @@ async def test_apply_branch_uses_cover_letter_contract_without_extra_kwargs(runt
 
     async def strict_writer(
         job, profile, resumes, gateway, preference_policy=None, *,
-        cover_letter_auto=True, cover_letter_template="",
+        cover_letter_auto=True, cover_letter_template="", private_view=None,
     ):
-        calls.append((job.external_id, cover_letter_auto, cover_letter_template))
+        calls.append((job.external_id, profile.get("gender"), cover_letter_auto, cover_letter_template))
         return "Сопроводительное письмо для тестовой вакансии"
 
     monkeypatch.setattr(workflow, "write_cover_letter", strict_writer)
@@ -367,7 +346,56 @@ async def test_apply_branch_uses_cover_letter_contract_without_extra_kwargs(runt
         assert item.counters["matched"] == 1
         assert item.counters["submitted"] == 1
         assert vacancy.state == "SUBMITTED"
-    assert calls == [("apply", True, "")]
+    assert calls == [("apply", "male", True, "")]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_application_answers_do_not_use_session_memory(monkeypatch):
+    field = ApplicationField(id="city", label="Город")
+    form = ApplicationForm(fields=[field])
+    filled = []
+
+    class FormAdapter:
+        async def prepare_application(self, page, plan):
+            return form
+
+        async def read_application(self, page):
+            return form
+
+        async def fill_application(self, page, plan):
+            filled.append(plan.form_answers["city"].values)
+            return FillResult(success=True, answered_fields=["city"])
+
+        async def submit_application(self, page):
+            return SubmissionResult(status="submitted", message="submitted")
+
+    async def prepare_answers(*args, memory=None, **kwargs):
+        assert memory is None
+        plan = args[2]
+        plan.form_answers = {
+            "city": FormAnswer(field=field, values=["Красноярск"], source="snapshot")
+        }
+        plan.unanswered_fields = {}
+        return plan
+
+    monkeypatch.setattr(hh_application, "prepare_answers", prepare_answers)
+    outcome = await hh_application.complete_application(
+        FormAdapter(),
+        object(),
+        ApplicationPlan(vacancy_id=1, resume_file="", submission_allowed=True),
+        JobPosting(source="fake", external_id="one", url="https://fake/one",
+                   title="Role", description="Description"),
+        {},
+        [{"about": "Fixture professional background"}],
+        "",
+        object(),
+        lambda plan: True,
+    )
+
+    assert outcome.error_code is None
+    assert outcome.submission is not None
+    assert outcome.submission.status == "submitted"
+    assert filled == [["Красноярск"]]
 
 
 @pytest.mark.asyncio
@@ -388,7 +416,7 @@ async def test_long_mixed_blocker_run_finishes(runtime, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("kind", "state"), [
-    ("test", "NEEDS_REVIEW"), ("unknown_form", "UNKNOWN"), ("blocked", "ERROR"),
+    ("test", "REJECTED_BY_MODEL"), ("unknown_form", "ERROR"), ("blocked", "ERROR"),
 ])
 async def test_pre_submit_non_captcha_blocker_continues(runtime, monkeypatch, kind, state):
     refs = [JobRef(external_id="bad", url="https://fake/bad"),
@@ -410,30 +438,14 @@ async def test_pre_submit_non_captcha_blocker_continues(runtime, monkeypatch, ki
         assert db.get(JobSession, session_id).status == SessionStatus.COMPLETED
         assert vacancies == {"bad": state, "next": "SUBMITTED"}
         notifications = list(db.scalars(select(Notification).where(Notification.source_type == "vacancy")))
-        assert len(notifications) == 1
-        assert notifications[0].source_id == str(rows["bad"].id)
-        assert notifications[0].kind == f"vacancy_{state.lower()}"
-        assert notifications[0].target_path == "/vacancies"
+        assert len(notifications) == (0 if state == "REJECTED_BY_MODEL" else 1)
+        if notifications:
+            assert notifications[0].source_id == str(rows["bad"].id)
+            assert notifications[0].kind == f"vacancy_{state.lower()}"
+            assert notifications[0].target_path == "/vacancies"
 
 
 @pytest.mark.asyncio
-async def test_manual_review_decision_becomes_error_and_continues(runtime, monkeypatch):
-    refs = [JobRef(external_id="bad", url="https://fake/bad"),
-            JobRef(external_id="next", url="https://fake/next")]
-    calls = 0
-
-    async def evaluate_impl(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return evaluation("manual_review" if calls == 1 else "skip")
-
-    sessions, session_id = await run_workflow(runtime, monkeypatch, FakeAdapter(refs), evaluate_impl)
-    with sessions() as db:
-        states = {v.external_id: v.state for v in db.scalars(select(Vacancy))}
-        assert db.get(JobSession, session_id).status == SessionStatus.COMPLETED
-        assert states == {"bad": "ERROR", "next": "REJECTED_BY_MODEL"}
-
-
 @pytest.mark.asyncio
 async def test_letter_model_unavailable_recovers_without_duplicate_match_count(runtime, monkeypatch):
     refs = [JobRef(external_id="bad", url="https://fake/bad"),
@@ -489,7 +501,6 @@ async def test_invalid_cover_letter_is_retried_before_submission(runtime, monkey
         rows = {v.external_id: v for v in db.scalars(select(Vacancy))}
         assert item.status == SessionStatus.COMPLETED
         assert letter_calls == 3
-        assert item.counters.get("review", 0) == 0
         assert item.counters["matched"] == 2
         assert item.counters["submitted"] == 2
         assert rows["bad"].state == "SUBMITTED"
@@ -517,7 +528,7 @@ async def test_cached_cover_letter_over_custom_limit_is_regenerated_and_updated(
             external_id="cached",
             url="https://fake/cached",
             title="Vacancy cached",
-            # Processing states are resumed by the workflow; a DISCOVERED row
+            # Processing states are resumed by the workflow; an EXTRACTED row
             # is intentionally skipped during a fresh search pass.
             state="EVALUATING",
             data={},
@@ -548,7 +559,7 @@ async def test_cached_cover_letter_over_custom_limit_is_regenerated_and_updated(
 
 
 @pytest.mark.asyncio
-async def test_invalid_cover_letter_becomes_manual_review_after_bounded_retries(runtime, monkeypatch):
+async def test_invalid_cover_letter_is_filtered_after_bounded_retries(runtime, monkeypatch):
     refs = [JobRef(external_id="bad", url="https://fake/bad"),
             JobRef(external_id="next", url="https://fake/next")]
     letter_calls = 0
@@ -570,9 +581,9 @@ async def test_invalid_cover_letter_becomes_manual_review_after_bounded_retries(
         rows = {v.external_id: v for v in db.scalars(select(Vacancy))}
         assert item.status == SessionStatus.COMPLETED
         assert letter_calls == workflow._COVER_LETTER_RETRY_LIMIT + 1
-        assert item.counters["review"] == 1
         assert item.counters["submitted"] == 1
-        assert rows["bad"].state == "NEEDS_REVIEW"
+        assert rows["bad"].state == "ERROR"
+        assert rows["bad"].data["error_code"] == "VACANCY_PROCESSING_FAILED"
         assert "не выполнено особое условие" in rows["bad"].data["cover_letter_error"]
         assert rows["bad"].data["cover_letter_attempts"] == workflow._COVER_LETTER_RETRY_LIMIT
         assert rows["next"].state == "SUBMITTED"
@@ -581,7 +592,7 @@ async def test_invalid_cover_letter_becomes_manual_review_after_bounded_retries(
             workflow.BrowserEvent.session_id == session_id,
             workflow.BrowserEvent.event_type == "human_required",
         )))
-        assert any(event.data.get("kind") == "cover_letter" for event in events)
+        assert not any(event.data.get("kind") == "cover_letter" for event in events)
 
 
 
@@ -633,8 +644,10 @@ async def test_model_unavailable_resume_retries_same_vacancy(runtime, monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("adapter_kwargs", "state"), [
-    ({"questions": ["Неизвестный вопрос"]}, "UNKNOWN"),
-    ({"submission_error": "submit failed"}, "UNKNOWN"),
+    ({"questions": ["Неизвестный вопрос"]}, "ERROR"),
+    # A submit transport failure is ambiguous: the click may have reached
+    # the site, so reconciliation ends in UNCONFIRMED rather than ERROR.
+    ({"submission_error": "submit failed"}, "UNCONFIRMED"),
 ])
 async def test_form_and_submission_failures_do_not_pause(runtime, monkeypatch, adapter_kwargs, state):
     refs = [JobRef(external_id="one", url="https://fake/one"),
@@ -653,6 +666,9 @@ async def test_form_and_submission_failures_do_not_pause(runtime, monkeypatch, a
     with sessions() as db:
         assert db.get(JobSession, session_id).status == SessionStatus.COMPLETED
         assert {v.state for v in db.scalars(select(Vacancy))} == {state}
+        item = db.get(JobSession, session_id)
+        if state == "UNCONFIRMED":
+            assert item.counters.get("errors") == 2
 
 
 @pytest.mark.asyncio

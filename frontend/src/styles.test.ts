@@ -58,27 +58,21 @@ test('vacancy filters preserve the centered page rail', () => {
   expect(css).toContain('.vacancy-filters{display:grid;gap:1rem;margin-block:1rem;margin-inline:auto;')
 })
 
-test('resume editor fields and repeated experience cards have explicit boundaries', () => {
-  expect(css).toContain('.resume-editor.form-contentinput:not([type="checkbox"]),.resume-editor.form-contentselect,.resume-editor.form-contenttextarea{')
-  expect(css).toContain('.experience-card{border:1pxsolidvar(--line);background:var(--paper);border-radius:var(--radius-subcard);box-shadow:none;}')
-  expect(css).toContain('.experience-card>.repeat-row{padding-bottom:10px;border-bottom:1pxsolidvar(--line);}')
+test('resume source cards have explicit responsive boundaries', () => {
+  expect(css).toContain('.resume-source-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));')
+  expect(css).toContain('.resume-source-card{display:grid;gap:16px;min-width:0;}')
+  expect(css).toContain('@media(max-width:900px){.resume-source-grid{grid-template-columns:1fr;}}')
 })
 
-test('multi-select uses aligned bordered rows and a full-width confirmation action', () => {
-  expect(css).toContain('.multi-select-trigger{display:flex;align-items:center;justify-content:space-between;')
-  expect(css).toContain('.multi-select-chevron.is-open{transform:rotate(180deg);}')
-  expect(css).toContain('.multi-select-popover{display:grid;gap:10px;padding:12px;border:1pxsolidvar(--line);')
-  expect(css).toContain('label.multi-select-option,.multi-select-option{display:flex;align-items:center;gap:12px;')
-  expect(css).toContain('label.multi-select-option.is-selected,.multi-select-option.is-selected{border-color:var(--ink);background:var(--surface);}')
-  expect(css).not.toContain('.formlabel.multi-select-option{')
-  expect(css).toContain('.multi-select-confirm{width:100%;}')
+test('legacy resume editor multi-select styles are removed', () => {
+  expect(css).not.toContain('.multi-select-trigger')
+  expect(css).not.toContain('.multi-select-popover')
 })
 
 test('all checkboxes share the resume control size and centered wrapper alignment', () => {
   expect(css).toContain('input[type="checkbox"]{box-sizing:border-box;flex:0018px;width:18px;height:18px;margin:0;padding:0;accent-color:var(--ink);cursor:pointer;}')
   expect(css).toContain('input[type="checkbox"]:disabled{cursor:not-allowed;}')
   expect(css).toContain('.checkline,.formlabel.checkline{display:flex;align-items:center;gap:8px;')
-  expect(css).toContain('.selection-control{display:flex;align-items:center;gap:8px;')
 })
 
 test('disabled cover letter template remains readable while clearly distinct', () => {
@@ -101,13 +95,23 @@ test('session disclosure groups are separated cards with full-width heading trig
   expect(css).not.toContain('.section-toggle')
 })
 
-test('profile layout keeps explicit equal and removable rails', () => {
-  expect(css).toContain('.profile-pair-row,.profile-pair-remove-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));')
-  expect(css).toContain('.profile-remove-row{display:grid;grid-template-columns:minmax(0,1fr)auto;')
-  expect(css).toContain('.profile-pair-remove-row{grid-template-columns:repeat(2,minmax(0,1fr))auto;}')
-  expect(css).toContain('.profile-pair-row,.profile-pair-remove-row{grid-template-columns:minmax(0,1fr);}')
-  expect(css).toContain('.profile-pair-remove-row>:nth-child(1),.profile-pair-remove-row>:nth-child(2){grid-column:1;}')
-  expect(css).toContain('.profile-pair-remove-row>.icon-button{grid-column:2;grid-row:1/3;')
+test('profile only exposes source link cards', () => {
+  expect(css).toContain('.profile-sources-page>.notice{max-width:760px;}')
+  expect(css).toContain('.resume-source-preview{display:grid;gap:16px;')
+  expect(css).toContain('.resume-source-consent{align-items:flex-start;line-height:1.4;}')
+})
+
+test('resume source questions use the same controls as the rest of the form', () => {
+  expect(css).toContain('.resume-source-questioninput,.resume-source-questionselect{box-sizing:border-box;width:100%;min-height:var(--field-height);border:1pxsolidtransparent;border-radius:var(--radius-control);padding:11px14px;background:var(--canvas);color:var(--ink);}')
+  expect(css).toContain('.resume-source-questioninput:focus,.resume-source-questionselect:focus{border-color:var(--ink);background:var(--paper);}')
+})
+
+test('direct controls in profile fields use the shared form treatment without styling checkboxes', () => {
+  expect(css).toContain('.profile-full-field>input:not([type="checkbox"]):not([type="range"]):not([type="file"]):not([aria-hidden="true"]),.profile-full-field>select,.profile-full-field>textarea{box-sizing:border-box;width:100%;min-height:var(--field-height);border:1pxsolidtransparent;border-radius:var(--radius-control);padding:11px14px;background:var(--canvas);color:var(--ink);}')
+  expect(css).toContain('.profile-full-field>input:not([type="checkbox"]):not([type="range"]):not([type="file"]):not([aria-hidden="true"]):focus,.profile-full-field>select:focus,.profile-full-field>textarea:focus{border-color:var(--ink);background:var(--paper);}')
+  expect(css).toContain('.profile-full-field>input:not([type="checkbox"]):not([type="range"]):not([type="file"]):not([aria-hidden="true"]):disabled,.profile-full-field>select:disabled,.profile-full-field>textarea:disabled{cursor:not-allowed;border-color:var(--line);background:var(--line);color:var(--muted);opacity:1;}')
+  expect(css).toContain('.profile-full-field>input:not([type="checkbox"]):not([type="range"]):not([type="file"]):not([aria-hidden="true"])::placeholder,.profile-full-field>textarea::placeholder{color:var(--muted);opacity:1;}')
+  expect(css).toContain('@media(hover:hover)and(pointer:fine){.profile-full-field>input:not([type="checkbox"]):not([type="range"]):not([type="file"]):not([aria-hidden="true"]):hover,.profile-full-field>select:hover,.profile-full-field>textarea:hover{border-color:var(--line);background:var(--paper);}}')
 })
 
 test('notification items remain readable and opaque despite global button styles', () => {
@@ -145,7 +149,7 @@ test('motion contracts expose shared tokens, reduced motion, and anchored overla
   expect(css).toContain('--duration-fast:120ms;')
   expect(css).toContain('--duration-ui:180ms;')
   expect(css).toContain('.notification-popover[data-starting-style],.notification-popover[data-ending-style]')
-  expect(css).toContain('.multi-select-positioner{z-index:var(--z-popover);')
+  expect(css).not.toContain('.multi-select-positioner')
   expect(css).toContain('.vacancy-disclosuresummary{display:grid;grid-template-columns:minmax(0,1fr)90pxauto40px;}')
   expect(css).toContain('.vacancy-disclosure-control{display:inline-grid;width:38px;height:38px;place-items:center;border:1pxsolidvar(--line);border-radius:50%;')
   expect(css).toContain('.vacancy-chevron{display:block;width:18px;height:18px;transition:transform140msvar(--ease-out);}')
@@ -175,13 +179,11 @@ test('model settings fields use the shared platform field treatment', () => {
   expect(css).toContain('.model-settingsinput:focus,.model-settingsselect:focus{border-color:var(--ink);background:var(--paper);box-shadow:var(--focus-ring);}')
 })
 
-test('profile save bar is compact on desktop and clears the bottom nav on mobile', () => {
-  expect(css).toContain('.profile-save-bar{width:fit-content;max-width:100%;margin-left:auto;padding:8px;border-radius:18px;}')
-  expect(css).toContain('.profile-save-bar{width:fit-content;margin-left:auto;bottom:calc(76px+env(safe-area-inset-bottom));}')
-  expect(css).not.toContain('.profile-save-bar>button{width:100%;}')
+test('legacy profile save bar is removed from the source flow', () => {
+  expect(css).not.toContain('.profile-save-bar')
 })
 
-test('single select and experience duties match platform field contracts', () => {
+test('single select keeps the platform field contract', () => {
   expect(css).toContain('.single-select{position:relative;display:grid;gap:8px;width:100%;}')
   expect(css).toContain('.single-select-label{font-size:14px;font-weight:500;color:var(--soft);}')
   expect(css).toContain('.single-select-trigger{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;min-height:var(--field-height);')
@@ -196,9 +198,6 @@ test('single select and experience duties match platform field contracts', () =>
   expect(css).toContain('.single-select-indicator{flex:00auto;color:var(--ink);}')
   expect(css).not.toContain('.single-select-check{')
   expect(css).toContain('.single-select-popup[data-starting-style],.single-select-popup[data-ending-style]{opacity:0;transform:translateY(-4px)scale(.98);}')
-  expect(css).toContain('.resume-editor.form-contenttextarea.experience-duties{min-height:160px;padding:14px16px;font-size:14px;')
-  expect(css).toContain('.resume-editor.form-contenttextarea.experience-duties:hover{')
-  expect(css).toContain('.resume-editor.form-contenttextarea.experience-duties:focus{border-color:var(--ink);background:var(--paper);}')
   expect(css).toContain('.single-select-popup{transition:opacity120mslinear!important;transform:none!important;}')
 })
 

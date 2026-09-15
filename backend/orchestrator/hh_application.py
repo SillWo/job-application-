@@ -1,6 +1,7 @@
 """Bounded HH response steps; persistence and cancellation stay with the workflow."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from backend.adapters.base.protocol import SubmissionResult
@@ -10,22 +11,29 @@ from backend.intelligence.security import (
     sanitize_untrusted_input,
 )
 from backend.orchestrator.application_guard import unresolved_application_questions
+from backend.services.resume_session import render_local_private
 
 
 @dataclass
 class ApplicationOutcome:
     submission: SubmissionResult | None = None
-    pending: list[str] = field(default_factory=list)
+    error_code: str | None = None
+    error_message: str | None = None
+    unanswered_questions: list[str] = field(default_factory=list)
     stopped: bool = False
 
 
 def _signature(form) -> str:
-    return form.model_dump_json(include={"fields", "questions", "confirmation"})
+    payload = form.model_dump(include={"fields", "questions", "confirmation"})
+    # Sanitizing an instruction-only legacy question leaves an empty semantic
+    # placeholder. It must not make an unchanged form look like a new step.
+    payload["questions"] = [question for question in payload.get("questions", []) if str(question).strip()]
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 async def complete_application(adapter, page, plan, job, profile, resumes, description,
                                gateway, checkpoint, max_steps=5, *, memory=None,
-                               guaranteed_application=False) -> ApplicationOutcome:
+                               guaranteed_application=False, private_view=None) -> ApplicationOutcome:
     submitted_forms: set[str] = set()
 
     def assert_plan_outgoing(current_plan, *, context: str, source_form=None) -> None:
@@ -60,14 +68,29 @@ async def complete_application(adapter, page, plan, job, profile, resumes, descr
         form = await adapter.prepare_application(page, plan)
         model_form = sanitize_untrusted_input(form, context="application_form")
         if form.confirmation:
-            return ApplicationOutcome(pending=["Не удалось подтвердить отклик в другой стране"])
+            return ApplicationOutcome(
+                error_code="FOREIGN_APPLICATION_CONFIRMATION_FAILED",
+                error_message="Не удалось автоматически подтвердить отклик в другой стране",
+            )
         # Dynamic-form detection compares semantic sanitized content; the
         # original form remains available for adapter binding and submission.
         signature = _signature(model_form)
         if signature in submitted_forms:
-            return ApplicationOutcome(pending=["HH.ru оставил ту же форму после отправки; проверьте ответы и сообщения об ошибках"])
+            return ApplicationOutcome(
+                error_code="APPLICATION_FORM_STUCK",
+                error_message="HH.ru оставил ту же форму после отправки; автоматическое заполнение остановлено",
+            )
         plan = await prepare_answers(gateway, form, plan, job, profile, resumes, description,
-                                     memory=memory, guaranteed_application=guaranteed_application)
+                                     memory=memory, guaranteed_application=guaranteed_application,
+                                     private_view=private_view)
+        if private_view is not None:
+            plan.cover_letter = render_local_private(plan.cover_letter, private_view) if plan.cover_letter else ""
+            for answer in plan.form_answers.values():
+                answer.values = [render_local_private(value, private_view) for value in answer.values]
+            plan.known_answers = {
+                key: render_local_private(value, private_view)
+                for key, value in plan.known_answers.items()
+            }
         # The freshly read form is the authority for fixed-choice values.  It
         # also lets legitimate employer options contain instruction-like
         # wording without treating them as free-form model output.
@@ -87,7 +110,12 @@ async def complete_application(adapter, page, plan, job, profile, resumes, descr
         if pending:
             reasons = [f"{field.label}: {plan.unanswered_fields[field.id]}" for field in form.fields
                        if field.required and field.id in plan.unanswered_fields]
-            return ApplicationOutcome(pending=reasons or pending)
+            unanswered = reasons or pending
+            return ApplicationOutcome(
+                error_code="APPLICATION_FORM_UNRESOLVED",
+                error_message="Не удалось безопасно заполнить обязательные вопросы анкеты: " + "; ".join(unanswered[:3]),
+                unanswered_questions=unanswered,
+            )
         if not checkpoint(plan):
             return ApplicationOutcome(stopped=True)
         sanitize_untrusted_input(current, context="application_form_before_submit")
@@ -96,4 +124,7 @@ async def complete_application(adapter, page, plan, job, profile, resumes, descr
         submission = await adapter.submit_application(page)
         if submission.status != "needs_input":
             return ApplicationOutcome(submission=submission)
-    return ApplicationOutcome(pending=["Форма содержит слишком много переходов для автоматической обработки"])
+    return ApplicationOutcome(
+        error_code="APPLICATION_FORM_STUCK",
+        error_message="Форма содержит слишком много переходов для автоматической обработки",
+    )

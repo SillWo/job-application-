@@ -26,6 +26,74 @@ _PRIVATE_OR_SECRET_RE = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk|ghp|xoxb)-[A-Za-z0-9_-]{12,})",
     re.IGNORECASE,
 )
+_PRIVATE_PLACEHOLDER = re.compile(r"\{\{\s*([\wа-яё.-]+)\s*\}\}")
+_ALLOWED_PRIVATE_PLACEHOLDERS = {"full_name", "phone", "email", "messengers"}
+_PRIVATE_FIELD_NAMES = {
+    "identity", "contacts", "full_name", "name", "fio", "phone", "email",
+    "messengers", "links", "professional_links", "age", "birth_date", "has_photo",
+}
+
+
+def _private_values(value: Any) -> dict[str, str]:
+    """Collect only identity/contact values for local substitution/redaction."""
+    result: dict[str, str] = {}
+
+    def walk(item: Any, key: str | None = None) -> None:
+        if isinstance(item, dict):
+            if "value" in item and "availability" in item:
+                if item.get("availability") == "present":
+                    walk(item.get("value"), key)
+                return
+            for child_key, child in item.items():
+                normalized = str(child_key).casefold()
+                if normalized in {"full_name", "name", "fio"}:
+                    walk(child, "full_name")
+                elif normalized in {"phone", "email", "messengers"}:
+                    walk(child, normalized)
+                elif normalized in {"identity", "contacts"}:
+                    walk(child)
+        elif isinstance(item, (list, tuple)):
+            values = [str(child).strip() for child in item if str(child).strip()]
+            if values and key:
+                result[key] = ", ".join(values)
+        elif item is not None and key and str(item).strip():
+            result[key] = str(item).strip()
+
+    walk(value)
+    if "full_name" in result:
+        result.setdefault("name", result["full_name"])
+        result.setdefault("fio", result["full_name"])
+    return result
+
+
+def _private_placeholder_text(text: str, private: Any) -> str:
+    """Replace known private literals with stable placeholders for persistence."""
+    values = _private_values(private)
+    result = str(text or "")
+    for key, value in sorted(values.items(), key=lambda pair: len(pair[1]), reverse=True):
+        if len(value) < 2:
+            continue
+        result = re.sub(re.escape(value), "{{" + ("full_name" if key in {"name", "fio"} else key) + "}}", result, flags=re.I)
+    # A model must not be able to smuggle an unprovided direct contact into a
+    # durable draft.  These patterns intentionally cover only contact-shaped
+    # values, not arbitrary vacancy text.
+    result = re.sub(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])", "{{email}}", result)
+    result = re.sub(r"(?<!\w)(?:\+?\d[\d ()-]{7,}\d)(?!\w)", "{{phone}}", result)
+    return result
+
+
+def _professional_model_payload(value: Any) -> Any:
+    """Drop direct identifiers recursively before a value enters the model."""
+    if isinstance(value, dict):
+        result = {}
+        for key, child in value.items():
+            if str(key).casefold() in _PRIVATE_FIELD_NAMES:
+                continue
+            result[key] = _professional_model_payload(child)
+        return result
+    if isinstance(value, list):
+        return [_professional_model_payload(child) for child in value]
+    return value
 
 
 class CoverLetterValidationError(ModelUnavailable):
@@ -214,6 +282,12 @@ def _finish_cover_letter(
     return value
 
 
+def _validate_private_placeholders(text: str) -> None:
+    for marker in _PRIVATE_PLACEHOLDER.findall(text):
+        if marker.casefold() not in _ALLOWED_PRIVATE_PLACEHOLDERS:
+            raise CoverLetterValidationError("Письмо содержит недопустимый служебный маркер")
+
+
 def _generation_requirements(
     *, cover_letter_auto: bool, cover_letter_template: str, description: str,
     max_words: int = DEFAULT_MAX_WORDS,
@@ -233,15 +307,17 @@ def _generation_requirements(
         special_note = "Проверенных особых условий работодателя не обнаружено. Если в вакансии есть требование к письму, выполни его по смыслу после проверки extraction."
     default_structure = '''[выполнение особых условий, написания сопроводительного письма, начало] Здравствуйте!
 
-Я [ФИО], кратко обо мне:
+Я {{full_name}}, кратко обо мне:
 
-- [Самое сильное рабочее достижение, в формате «Я %описание действия%»]
+- [Самое сильное рабочее достижение, в формате «Я %описание действия%». Либо оно должно быть связано с бизнес показателями, либо с денежными показателями. Обязательно указание в каком проекте
+было достижение]
 
 - [Список ключевых навыков соискателя, в формате «В работе использую/Хорошо знаком с %список навыков или стек%»]
 
-- [Уровень образования]
+- [Уровень образования в формате: %Уровень образования%, %Университет%, %Специальность%]
 
-Уверен, что стану отличным кандидатом на вашу вакансию, ведь [список аргументов, почему соискатель подойдёт под вакансию, не больше 3, не меньше 2]
+Уверен, что стану отличным кандидатом на вашу вакансию, ведь [список аргументов, почему соискатель подойдёт под вакансию, не больше 3, не меньше 2. Они обязательно должны следовать из описания вакансии,
+иметь ссылки на вакансию и/или на саму компанию]
 
 [выполнение особых условий, написания сопроводительного письма, середина]
 
@@ -249,11 +325,11 @@ def _generation_requirements(
 
 Мои контакты:
 
-- [мессенджеры, один мессенджер — один пункт списка, нельзя все в одну строчку]
-- Телефон: [номер телефона]
-- Почта: [почта]
+- Мессенджеры: {{messengers}}
+- Телефон: {{phone}}
+- Почта: {{email}}
 
-С уважением, [ФИО]
+С уважением, {{full_name}}
 
 [выполнение особых условий, написания сопроводительного письма, конец]'''
     default_structure += '''
@@ -271,6 +347,8 @@ def _generation_requirements(
 {template_note}
 
 Каждую конструкцию вида [...] в шаблоне обработай как смысловой слот: подставь только подтверждённые данные из профиля, резюме и вакансии, затем удали квадратные скобки. Не оставляй ни одного символа [ или ] в результате. Если факт отсутствует, аккуратно пропусти соответствующий фрагмент.
+
+ФИО и контакты не передаются модели. Если они нужны в письме, выведи только точные маркеры {{{{full_name}}}}, {{{{phone}}}}, {{{{email}}}} или {{{{messengers}}}}; не заменяй их вымышленными значениями. Эти четыре маркера будут заменены локально перед отправкой.
 
 {special_note}
 Особые условия работодателя обязательны независимо от режима и шаблона. Размести каждое по смыслу в начале, середине или конце; если требуется буквальный токен, сохрани его без изменений. В fulfilled_special_conditions верни по одному объекту на каждое условие с id и точным непересекающимся span из итогового текста. Не придумывай слова, цифры, опыт, достижения, навыки, контакты или образование. Пол уже выбран пользователем в profile.gender; не определяй его по имени и не меняй.
@@ -399,11 +477,12 @@ async def write_cover_letter(
     cover_letter_auto: bool = True,
     cover_letter_template: str = "",
     cover_letter_max_words: int | None = None,
+    private_view: Any = None,
 ) -> str:
     # Preserve caller-owned values for URL allowlisting and UI audit, while
     # sending only sanitized semantic copies to the model and local extractor.
     safe_job = sanitize_untrusted_input(job.model_dump(mode="json"), context="vacancy data")
-    safe_profile = sanitize_untrusted_input(profile, context="candidate profile")
+    sanitize_untrusted_input(profile, context="candidate profile")
     safe_resumes = sanitize_untrusted_input(list(resumes), context="candidate resumes")
     safe_template = sanitize_untrusted_input(cover_letter_template, context="candidate letter template")
     max_words = DEFAULT_MAX_WORDS if cover_letter_max_words is None else cover_letter_max_words
@@ -414,19 +493,25 @@ async def write_cover_letter(
         if preference_policy is not None else None
     )
     profile_payload = _payload(profile)
-    model_profile_payload = _payload(safe_profile)
+    # Gender is the only profile attribute needed by the writer.  Keep the
+    # full payload local for validation/legacy compatibility, but never send
+    # identity or contact fields to the model.
+    model_profile_payload = {
+        "gender": profile_payload.get("gender")
+    } if isinstance(profile_payload, dict) and profile_payload.get("gender") else {}
     gender = profile_payload.get("gender") if isinstance(profile_payload, dict) else None
     if gender not in {"male", "female"}:
         raise CoverLetterValidationError(
             "Укажите пол в профиле кандидата: выберите мужской или женский вариант"
         )
     resume_payloads = [_payload(resume) for resume in resumes]
-    model_resume_payloads = [_payload(resume) for resume in safe_resumes]
+    model_resume_payloads = [_professional_model_payload(_payload(resume)) for resume in safe_resumes]
     if not model_resume_payloads:
         raise ValueError("Для сопроводительного письма не выбрано ни одного резюме")
     safe_description = str(safe_job.get("description") or "")
     special_conditions = await _extract_special_conditions(safe_description, gateway)
-    effective_template = "" if cover_letter_auto else (safe_template or "")
+    private_source = private_view if private_view is not None else [profile_payload, *resume_payloads]
+    effective_template = "" if cover_letter_auto else _private_placeholder_text(safe_template or "", private_source)
     ai_payload: dict[str, Any] = {
         "vacancy": {
             "title": safe_job.get("title", ""),
@@ -467,20 +552,48 @@ async def write_cover_letter(
             raise
         except ModelUnavailable:
             raise
-        assert_safe_output(draft.model_dump(mode="json"), context="generated_cover_letter")
-        assert_safe_outgoing_text(draft.text, profile_payload, resume_payloads, context="generated_cover_letter")
+        try:
+            assert_safe_output(draft.model_dump(mode="json"), context="generated_cover_letter")
+            draft_text = (
+                _private_placeholder_text(draft.text, private_source)
+                if private_view is not None else str(draft.text)
+            )
+            _validate_private_placeholders(draft_text)
+            assert_safe_outgoing_text(draft_text, profile_payload, resume_payloads, context="generated_cover_letter")
+        except PromptInjectionDetected:
+            # Give the model a bounded chance to regenerate, while keeping
+            # the unsafe draft and its diagnostics out of the next prompt.
+            if _attempt == _GENERATION_ATTEMPTS - 1:
+                raise CoverLetterValidationError(
+                    "Модель не вернула безопасное сопроводительное письмо после повторной попытки"
+                ) from None
+            repair = (
+                "Предыдущий текст не прошёл локальную проверку безопасности. "
+                "Перепиши полный текст без служебных инструкций, секретов и непроверенных ссылок."
+            )
+            continue
         exempt_words = 0
         valid, reason = True, ""
         valid, reason, exempt_words = _validate_special_conditions(
-            draft.text, special_conditions, draft.fulfilled_special_conditions,
+            draft_text, special_conditions, draft.fulfilled_special_conditions,
         )
         if valid:
             valid, reason = validate_cover_letter(
-                draft.text, safe_description, exempt_words=exempt_words,
+                draft_text, safe_description, exempt_words=exempt_words,
                 max_words=max_words,
             )
         if valid:
-            return str(draft.text).strip()
+            # New session snapshots persist the placeholder draft. Rendering
+            # belongs to the adapter boundary; legacy callers retain the old
+            # return shape when no private view was supplied.
+            rendered = str(draft_text).strip()
+            valid, reason = validate_cover_letter(
+                rendered, safe_description, exempt_words=exempt_words, max_words=max_words
+            )
+            if not valid:
+                repair = "После локальной подстановки убери пустые слоты и служебные маркеры."
+                continue
+            return rendered
         # Keep diagnostics local; never reflect model text into a subsequent
         # prompt where it could be interpreted as an instruction.
         repair = (

@@ -19,10 +19,42 @@ def upgrade() -> None:
     legacy_metadata = sa.MetaData()
     for table in Base.metadata.sorted_tables:
         table.to_metadata(legacy_metadata)
+    # These profile tables/columns are historical bootstrap state.  They must
+    # remain available to migrations 0004/0023 even after the runtime ORM has
+    # removed the legacy profile classes.
+    sa.Table(
+        "candidate_profiles",
+        legacy_metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("full_name", sa.String(255), nullable=True),
+        sa.Column("gender", sa.String(10), nullable=True),
+        sa.Column("residence", sa.String(255), nullable=True),
+        sa.Column("job_search_locations", sa.JSON, nullable=False),
+        sa.Column("contacts", sa.JSON, nullable=False),
+        sa.Column("education", sa.JSON, nullable=False),
+        sa.Column("languages", sa.JSON, nullable=False),
+        sa.Column("driver_license", sa.Boolean, nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    sessions = legacy_metadata.tables["sessions"]
+    applications = legacy_metadata.tables.get("applications")
+    if "profile_id" not in sessions.c:
+        sessions.append_column(
+            sa.Column("profile_id", sa.Integer, sa.ForeignKey("candidate_profiles.id"), nullable=False)
+        )
+    if applications is not None:
+        for constraint in list(applications.constraints):
+            if isinstance(constraint, sa.UniqueConstraint):
+                applications.constraints.remove(constraint)
+        if "candidate_profile_id" not in applications.c:
+            applications.append_column(
+                sa.Column("candidate_profile_id", sa.Integer, sa.ForeignKey("candidate_profiles.id"), nullable=False)
+            )
+        applications.append_constraint(sa.UniqueConstraint("candidate_profile_id", "vacancy_id"))
     # These tables/columns are intentionally historical: later migrations
     # remove them, but 0001 must still bootstrap the old schema independently
     # of the current runtime ORM models.
-    sessions = legacy_metadata.tables["sessions"]
     vacancies = legacy_metadata.tables["vacancies"]
     for constraint in list(vacancies.constraints):
         if isinstance(constraint, sa.UniqueConstraint):
@@ -69,9 +101,19 @@ def upgrade() -> None:
     # does not create the table before its owning migration runs.
     if "ai_model_settings" in legacy_metadata.tables:
         legacy_metadata.remove(legacy_metadata.tables["ai_model_settings"])
+    # Resume-session tables are introduced by later revisions.  Keep them
+    # out of the historical bootstrap so their owning migrations can create
+    # the exact schema for each intermediate revision (not today's ORM
+    # columns, such as the 0033 gender preference).
+    for table_name in ("session_resume_snapshots", "resume_preview_tokens", "saved_resume_sources"):
+        if table_name in legacy_metadata.tables:
+            legacy_metadata.remove(legacy_metadata.tables[table_name])
     legacy_metadata.create_all(bind)
 
 
 def downgrade() -> None:
     bind = op.get_bind()
     Base.metadata.drop_all(bind)
+    for table in ("review_items", "reports", "candidate_profiles"):
+        if table in sa.inspect(bind).get_table_names():
+            op.drop_table(table)

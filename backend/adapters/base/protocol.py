@@ -4,7 +4,41 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from backend.schemas.domain import ApplicationField, ApplicationPlan, JobPosting
+from backend.schemas.domain import (
+    AdditionalResumeSection,
+    ApplicationField,
+    ApplicationPlan,
+    FieldAvailability,
+    JobPosting,
+    ResumeAward,
+    ResumeCertification,
+    ResumeContacts,
+    ResumeCourse,
+    ResumeCoverage,
+    ResumeEducation,
+    ResumeExperience,
+    ResumeIdentity,
+    ResumeLanguage,
+    ResumeLocation,
+    ResumePortfolioItem,
+    ResumePrivateView,
+    ResumeProfessionalView,
+    ResumeProject,
+    ResumeRef,
+    ResumeSkill,
+    ResumeTarget,
+    SiteResumeSnapshot,
+    SourceField,
+)
+
+__all__ = [
+    "AdapterManifest", "ResumeImportCapability", "ResumeRef", "SiteResumeSnapshot",
+    "FieldAvailability", "SourceField", "ResumeIdentity", "ResumeContacts", "ResumeTarget",
+    "ResumeLocation", "ResumeExperience", "ResumeProject", "ResumeSkill", "ResumeEducation",
+    "ResumeLanguage", "ResumeCourse", "ResumeCertification", "ResumeAward",
+    "ResumePortfolioItem", "AdditionalResumeSection", "ResumeCoverage", "ResumeProfessionalView",
+    "ResumePrivateView",
+]
 
 
 class AdapterManifest(BaseModel):
@@ -12,6 +46,18 @@ class AdapterManifest(BaseModel):
     display_name: str
     allowed_domains: tuple[str, ...]
     supports_submission: bool = True
+    # Resume import is deliberately optional: some job sites only expose
+    # vacancies, while sites that do expose resumes opt in explicitly.
+    supports_resume_import: bool = False
+    supports_public_resume_url: bool = False
+    supports_account_resume_list: bool = False
+
+
+class ResumeImportCapability(Protocol):
+    def validate_resume_url(self, url: str) -> ResumeRef: ...
+    async def list_resume_refs(self, page: Any) -> list[ResumeRef]: ...
+    async def open_resume(self, page: Any, ref: ResumeRef) -> None: ...
+    async def extract_resume(self, page: Any, ref: ResumeRef) -> SiteResumeSnapshot: ...
 
 
 class LoginState(BaseModel):
@@ -56,6 +102,11 @@ class FillResult(BaseModel):
 class SubmissionResult(BaseModel):
     status: Literal["submitted", "already_applied", "unknown", "blocked", "needs_input"]
     message: str
+    # ``blocked`` can describe either a confirmed terminal refusal or an
+    # ambiguous transport result after a click.  Adapters must set this when
+    # the page proves that no application was accepted; omitted/false keeps
+    # the result eligible for bounded reconciliation.
+    confirmed: bool = False
 
 
 class Blocker(BaseModel):

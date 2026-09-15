@@ -12,8 +12,9 @@ from backend.browser import sessions as browsers
 from backend.browser.executor import BrowserExecutor
 from backend.orchestrator import workflow
 from backend.persistence.database import Base
-from backend.persistence.models import Application, CandidateProfile, JobSession, Resume
+from backend.persistence.models import Application, JobSession
 from backend.schemas.domain import JobEvaluation, SessionStatus
+from backend.services.resume_session import _normalize_extracted, persist_session_snapshot
 
 
 @pytest.mark.e2e
@@ -83,12 +84,18 @@ async def test_chromium_recovers_page_model_and_lost_submission_response(tmp_pat
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        profile = CandidateProfile(full_name="Fixture", gender="male")
-        db.add(profile)
-        db.flush()
-        db.add(Resume(profile_id=profile.id, name="Fixture resume", selected_for_matching=True))
-        item = JobSession(profile_id=profile.id, adapter_id=Adapter.site_id, application_limit=1)
+        item = JobSession(adapter_id=Adapter.site_id, application_limit=1)
         db.add(item)
+        db.flush()
+        persist_session_snapshot(
+            db, item.id,
+            _normalize_extracted(
+                {"external_id": "fixture", "identity": {"full_name": "Fixture", "gender": "male"},
+                 "target": {"title": "Engineer"}, "about": "Fixture professional background",
+                 "skills": [{"name": "Python"}]},
+                adapter_id=Adapter.site_id, source_url="https://hh.ru/resume/fixture",
+            ),
+        )
         db.commit()
         session_id = item.id
 

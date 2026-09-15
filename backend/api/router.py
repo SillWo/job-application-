@@ -12,11 +12,9 @@ from urllib.parse import urlparse, urlunparse
 from fastapi import (
     APIRouter,
     Depends,
-    File,
     HTTPException,
     Query,
     Request,
-    UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -43,28 +41,42 @@ from backend.intelligence.model_config import (
     normalize_base_url,
     validate_base_url,
 )
-from backend.intelligence.security import PromptInjectionDetected, sanitize_untrusted_input
+from backend.intelligence.security import sanitize_untrusted_input
 from backend.orchestrator.workflow import workflow_manager
 from backend.persistence.crypto import decrypt_secret, encrypt_secret
 from backend.persistence.database import get_db
 from backend.persistence.models import (
     AIModelSettings,
     BrowserEvent,
-    CandidateProfile,
     Evaluation,
     JobSession,
     Notification,
-    Resume,
-    SessionQuestion,
+    SavedResumeSource,
+    SessionResumeSnapshot,
     Vacancy,
 )
 from backend.schemas.domain import (
-    CandidateProfileData,
-    CandidateProfileInput,
-    ResumeData,
     SessionStatus,
+    SiteResumeSnapshot,
 )
-from backend.services.resume import profile_from_import, resume_from_import, save_and_extract
+from backend.services.resume_session import (
+    ResumeImportError,
+    ResumeImportUnavailable,
+    SavedResumeSourceNotFound,
+    _unseal_private,
+    confirm_saved_resume_source,
+    delete_saved_resume_source,
+    extract_resume,
+    issue_preview_token,
+    list_saved_resume_sources,
+    persist_session_snapshot,
+    public_preview,
+    refresh_saved_resume_source,
+    revalidate_saved_resume_source,
+    saved_resume_source_record,
+    update_saved_resume_gender,
+    validate_adapter_resume_url,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -272,10 +284,7 @@ def mark_all_notifications_read(db: Session = Depends(get_db)) -> dict:
 
 
 class SessionCreate(BaseModel):
-    # An outdated client/server pair must fail visibly instead of silently
-    # losing launch settings such as unlimited limits.
     model_config = ConfigDict(extra="forbid")
-    profile_id: int
     desired_job_description: str = Field(default="", max_length=2000)
     minimum_scores: dict[str, int | bool] | None = None
     adapter_id: str
@@ -342,317 +351,126 @@ async def model_status():
     return _no_store(await ModelGateway().status())
 
 
-async def _import_resume_for_profile(
-    file: UploadFile, profile_id: int | None, db: Session
-) -> tuple[CandidateProfile, Resume]:
-    if profile_id is not None and not db.get(CandidateProfile, profile_id):
-        raise HTTPException(404, "Профиль не найден")
-    try:
-        path, imported = await save_and_extract(file, ModelGateway())
-    except PromptInjectionDetected as exc:
-        raise HTTPException(422, "Импортированное резюме содержит небезопасные инструкции") from exc
-    except ModelUnavailable as exc:
-        raise HTTPException(503, str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    try:
-        profile = db.get(CandidateProfile, profile_id) if profile_id else None
-        personal = profile_from_import(imported)
-        if profile is None:
-            profile = CandidateProfile(
-                full_name=personal.full_name,
-                gender=personal.gender,
-                residence=personal.residence,
-                job_search_locations=personal.job_search_locations,
-                contacts=personal.contacts.model_dump(),
-                education=[item.model_dump() for item in personal.education],
-                languages=[item.model_dump() for item in personal.languages],
-                driver_license=personal.driver_license,
-            )
-            db.add(profile)
-            db.flush()
-        else:
-            _merge_personal_profile(profile, personal)
-        resume_data = resume_from_import(imported, path=path, filename=file.filename or "resume")
-        resume = Resume(
-            profile_id=profile.id,
-            **resume_data.model_dump(exclude={"original_filename", "original_path"}),
-            original_filename=file.filename or "resume",
-            original_path=str(path),
-        )
-        db.add(resume)
-        db.commit()
-        db.refresh(profile)
-        db.refresh(resume)
-    except PromptInjectionDetected as exc:
-        db.rollback()
-        path.unlink(missing_ok=True)
-        raise HTTPException(422, "Импортированное резюме содержит небезопасные инструкции") from exc
-    except Exception as exc:
-        db.rollback()
-        path.unlink(missing_ok=True)
-        raise HTTPException(500, "Не удалось сохранить импортированное резюме") from exc
-    return profile, resume
-
-
-@router.post("/profiles/{profile_id}/resumes/import")
-async def import_resume_for_profile(
-    profile_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)
-) -> dict:
-    profile, resume = await _import_resume_for_profile(file, profile_id, db)
-    return {"profile": serialize_profile(profile, db), "resume": serialize_resume(resume)}
-
-
-@router.post("/profiles/resume")
-async def upload_resume(
-    file: UploadFile = File(...), profile_id: int | None = None, db: Session = Depends(get_db)
-) -> dict:
-    """Legacy alias for imports; canonical clients should use the nested path."""
-    profile, _ = await _import_resume_for_profile(file, profile_id, db)
-    return serialize_profile(profile, db)
-
-
-def _profile_data(item: CandidateProfile) -> CandidateProfileData:
-    return CandidateProfileData(
-        full_name=item.full_name,
-        gender=item.gender,
-        residence=item.residence,
-        job_search_locations=item.job_search_locations or [],
-        contacts=item.contacts or {},
-        education=item.education or [],
-        languages=item.languages or [],
-        driver_license=item.driver_license,
-    )
-
-
-def _merge_personal_profile(item: CandidateProfile, data: CandidateProfileData) -> None:
-    if not item.full_name and data.full_name:
-        item.full_name = data.full_name
-    if not item.residence and data.residence:
-        item.residence = data.residence
-    if item.gender is None and data.gender is not None:
-        item.gender = data.gender
-    if not item.job_search_locations and data.job_search_locations:
-        item.job_search_locations = data.job_search_locations
-    if not item.contacts and data.contacts.model_dump(exclude_none=True):
-        item.contacts = data.contacts.model_dump()
-    if not item.education and data.education:
-        item.education = [entry.model_dump() for entry in data.education]
-    if not item.languages and data.languages:
-        item.languages = [entry.model_dump() for entry in data.languages]
-    if item.driver_license is None and data.driver_license is not None:
-        item.driver_license = data.driver_license
-
-
-def _require_profile_gender(item: CandidateProfile) -> None:
-    if item.gender not in {"male", "female"}:
-        raise HTTPException(
-            422,
-            "Укажите пол соискателя в профиле перед запуском сессии",
-        )
-
-
-def _matching_resumes(profile_id: int, db: Session) -> list[dict]:
-    return [
-        serialize_resume(item)
-        for item in db.scalars(
-            select(Resume).where(Resume.profile_id == profile_id).order_by(Resume.id)
-        )
-    ]
-
-
-def serialize_resume(item: Resume) -> dict:
-    return {
-        "id": item.id,
-        "profile_id": item.profile_id,
-        "name": item.name,
-        "desired_title": item.desired_title,
-        "desired_salary": item.desired_salary,
-        "employment_types": item.employment_types or [],
-        "work_formats": item.work_formats or [],
-        "business_trips": item.business_trips,
-        "experiences": item.experiences or [],
-        "skills": item.skills or [],
-        "about": item.about,
-        "selected_for_matching": item.selected_for_matching,
-        "original_filename": item.original_filename,
-        "created_at": item.created_at.isoformat(),
-        "updated_at": item.updated_at.isoformat(),
-    }
-
-
-def serialize_profile(item: CandidateProfile, db: Session | None = None) -> dict:
-    data = _profile_data(item).model_dump()
-    result = {"id": item.id, "data": data, "created_at": item.created_at.isoformat()}
-    if db is not None:
-        result["resumes"] = _matching_resumes(item.id, db)
-    return result
-
-
-@router.get("/profiles")
-def profiles(db: Session = Depends(get_db)) -> list[dict]:
-    return [
-        serialize_profile(item, db)
-        for item in db.scalars(select(CandidateProfile).order_by(CandidateProfile.id.desc()))
-    ]
-
-
-@router.post("/profiles")
-def create_profile(data: CandidateProfileInput, db: Session = Depends(get_db)) -> dict:
-    item = CandidateProfile(
-        full_name=data.full_name,
-        gender=data.gender,
-        residence=data.residence,
-        job_search_locations=data.job_search_locations,
-        contacts=data.contacts.model_dump(),
-        education=[entry.model_dump() for entry in data.education],
-        languages=[entry.model_dump() for entry in data.languages],
-        driver_license=data.driver_license,
-    )
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-    return serialize_profile(item, db)
-
-
-@router.get("/profiles/{profile_id}")
-def get_profile(profile_id: int, db: Session = Depends(get_db)) -> dict:
-    item = db.get(CandidateProfile, profile_id)
-    if not item:
-        raise HTTPException(404, "Профиль не найден")
-    return serialize_profile(item, db)
-
-
-class QuestionAnswer(BaseModel):
+class ResumeSourcePreviewIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    answer: str = Field(default="", max_length=4000)
-    skip: bool = False
-
-    @model_validator(mode="after")
-    def validate_answer(self):
-        self.answer = self.answer.strip()
-        if self.skip and self.answer or not self.skip and not self.answer:
-            raise ValueError("Введите ответ или пропустите вопрос")
-        return self
+    adapter_id: str = Field(min_length=1, max_length=50)
+    resume_url: str = Field(min_length=1, max_length=2048)
 
 
-@router.get("/profiles/{profile_id}/pending-questions")
-def pending_profile_questions(profile_id: int, db: Session = Depends(get_db)) -> list[dict]:
-    from backend.services.profile_memory import TERMINAL, can_remember
-
-    if not db.get(CandidateProfile, profile_id):
-        raise HTTPException(404, "Профиль не найден")
-    rows = db.execute(select(SessionQuestion, JobSession, Vacancy).join(JobSession, JobSession.id == SessionQuestion.session_id)
-                      .outerjoin(Vacancy, Vacancy.id == SessionQuestion.vacancy_id)
-                      .where(SessionQuestion.profile_id == profile_id, SessionQuestion.status == "pending", JobSession.status.in_(TERMINAL))
-                      .order_by(SessionQuestion.session_id.desc(), SessionQuestion.id)).all()
-    # Only unanswered interview prompts are public. Confirmed memory has no list/read route.
-    return [{"id": question.id, "session_id": session.id, "question": question.question,
-             "reason": question.reason, "options": question.options, "context": question.context,
-             "site": session.adapter_id, "vacancy_title": vacancy.title if vacancy else None,
-             "vacancy_url": vacancy.url if vacancy else None,
-             "can_answer": can_remember(question.question)} for question, session, vacancy in rows]
+class ResumeSourceConfirmIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    adapter_id: str = Field(min_length=1, max_length=50)
+    preview_token: str = Field(min_length=20, max_length=256)
+    consent: Literal[True]
+    grammatical_gender: Literal["male", "female"] | None = None
 
 
-@router.post("/profiles/{profile_id}/questions/{question_id}/answer")
-def answer_profile_question(profile_id: int, question_id: int, payload: QuestionAnswer, db: Session = Depends(get_db)) -> dict:
-    from backend.services.profile_memory import TERMINAL, save_user_answer
-
-    question = db.get(SessionQuestion, question_id)
-    if not question or question.profile_id != profile_id:
-        raise HTTPException(404, "Вопрос не найден")
-    session = db.get(JobSession, question.session_id)
-    if not session or session.status not in TERMINAL:
-        raise HTTPException(409, "Ответить можно после завершения сессии")
-    if question.status != "pending":
-        raise HTTPException(409, "Этот вопрос уже обработан")
-    if payload.skip:
-        question.status = "skipped"
-        question.answered_at = datetime.now(timezone.utc)
-    else:
-        try:
-            save_user_answer(db, question, payload.answer)
-        except (ValueError, PromptInjectionDetected) as error:
-            raise HTTPException(422, str(error)) from error
-    db.commit()
-    return {"ok": True}
+class ResumeSourceGenderIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    grammatical_gender: Literal["male", "female"]
 
 
-@router.patch("/profiles/{profile_id}")
-def patch_profile(
-    profile_id: int, data: CandidateProfileInput, db: Session = Depends(get_db)
+@router.post("/resume-sources/preview")
+async def preview_resume_source(payload: ResumeSourcePreviewIn, db: Session = Depends(get_db)) -> dict:
+    """Read a site resume and issue a short-lived, one-use preview token.
+
+    The response intentionally contains only structural coverage metadata. The
+    canonical public URL is retained in the preview state for revalidation,
+    but preview responses do not need to return it; private values remain
+    server-side until local letter/form filling.
+    """
+    try:
+        canonical_url, ref = validate_adapter_resume_url(payload.adapter_id, payload.resume_url)
+        snapshot = await extract_resume(
+            payload.adapter_id, canonical_url, validated=(canonical_url, ref)
+        )
+        token = issue_preview_token(
+            db, payload.adapter_id, snapshot, source_url=canonical_url
+        )
+    except KeyError as exc:
+        raise HTTPException(400, "Неизвестный сайт вакансий") from exc
+    except ResumeImportUnavailable as exc:
+        raise HTTPException(501, str(exc)) from exc
+    except ResumeImportError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return _no_store({"preview_token": token, "preview": public_preview(snapshot)})
+
+
+@router.post("/resume-sources/confirm")
+def confirm_resume_source(
+    payload: ResumeSourceConfirmIn, db: Session = Depends(get_db)
 ) -> dict:
-    item = db.get(CandidateProfile, profile_id)
-    if not item:
-        raise HTTPException(404, "Профиль не найден")
-    item.full_name = data.full_name
-    item.gender = data.gender
-    item.residence = data.residence
-    item.job_search_locations = data.job_search_locations
-    item.contacts = data.contacts.model_dump()
-    item.education = [entry.model_dump() for entry in data.education]
-    item.languages = [entry.model_dump() for entry in data.languages]
-    item.driver_license = data.driver_license
-    db.commit()
-    db.refresh(item)
-    return serialize_profile(item, db)
+    """Save a confirmed link without consuming its launch preview token."""
+    try:
+        adapter_registry.get(payload.adapter_id)
+    except KeyError as exc:
+        raise HTTPException(400, "Неизвестный сайт вакансий") from exc
+    try:
+        row, token = confirm_saved_resume_source(
+            db,
+            adapter_id=payload.adapter_id,
+            preview_token=payload.preview_token,
+            consent=payload.consent,
+            grammatical_gender=payload.grammatical_gender,
+        )
+    except ResumeImportError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _no_store(saved_resume_source_record(row, preview_token=token))
 
 
-def _get_resume_or_404(profile_id: int, resume_id: int, db: Session) -> Resume:
-    item = db.get(Resume, resume_id)
-    if not item or item.profile_id != profile_id:
-        raise HTTPException(404, "Резюме не найдено")
-    return item
-
-
-@router.get("/profiles/{profile_id}/resumes")
-def resumes(profile_id: int, db: Session = Depends(get_db)) -> list[dict]:
-    if not db.get(CandidateProfile, profile_id):
-        raise HTTPException(404, "Профиль не найден")
-    return _matching_resumes(profile_id, db)
-
-
-@router.post("/profiles/{profile_id}/resumes")
-def create_resume(profile_id: int, data: ResumeData, db: Session = Depends(get_db)) -> dict:
-    if not db.get(CandidateProfile, profile_id):
-        raise HTTPException(404, "Профиль не найден")
-    item = Resume(profile_id=profile_id, **data.model_dump())
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-    return serialize_resume(item)
-
-
-@router.get("/profiles/{profile_id}/resumes/{resume_id}")
-def get_resume(profile_id: int, resume_id: int, db: Session = Depends(get_db)) -> dict:
-    return serialize_resume(_get_resume_or_404(profile_id, resume_id, db))
-
-
-@router.patch("/profiles/{profile_id}/resumes/{resume_id}")
-def patch_resume(
-    profile_id: int, resume_id: int, data: ResumeData, db: Session = Depends(get_db)
+@router.patch("/resume-sources/{adapter_id}")
+def update_resume_source_gender(
+    adapter_id: str, payload: ResumeSourceGenderIn, db: Session = Depends(get_db)
 ) -> dict:
-    item = _get_resume_or_404(profile_id, resume_id, db)
-    for key, value in data.model_dump().items():
-        setattr(item, key, value)
-    db.commit()
-    db.refresh(item)
-    return serialize_resume(item)
+    """Change the local grammatical-gender preference for one source."""
+    try:
+        adapter_registry.get(adapter_id)
+    except KeyError as exc:
+        raise HTTPException(400, "Неизвестный сайт вакансий") from exc
+    try:
+        row = update_saved_resume_gender(db, adapter_id, payload.grammatical_gender)
+    except SavedResumeSourceNotFound as exc:
+        raise HTTPException(404, "Сохраненный источник не найден") from exc
+    except ResumeImportError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _no_store(saved_resume_source_record(row))
 
 
-@router.delete("/profiles/{profile_id}/resumes/{resume_id}")
-def delete_resume(profile_id: int, resume_id: int, db: Session = Depends(get_db)) -> dict:
-    item = _get_resume_or_404(profile_id, resume_id, db)
-    source_path = Path(item.original_path).resolve() if item.original_path else None
-    db.delete(item)
-    db.commit()
-    if (
-        source_path
-        and source_path.is_file()
-        and Path("data/resumes").resolve() in source_path.parents
-    ):
-        source_path.unlink(missing_ok=True)
-    return {"ok": True}
+@router.get("/resume-sources")
+async def saved_resume_sources(db: Session = Depends(get_db)) -> list[dict]:
+    """List confirmed sources from durable storage without network access."""
+    records = await list_saved_resume_sources(db)
+    return JSONResponse(
+        [saved_resume_source_record(row, preview_token=token) for row, token in records],
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/resume-sources/{adapter_id}/refresh")
+async def refresh_resume_source(adapter_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        adapter_registry.get(adapter_id)
+    except KeyError as exc:
+        raise HTTPException(400, "Неизвестный сайт вакансий") from exc
+    try:
+        row, token = await refresh_saved_resume_source(db, adapter_id)
+    except SavedResumeSourceNotFound as exc:
+        raise HTTPException(404, "Сохраненный источник не найден") from exc
+    return _no_store(saved_resume_source_record(row, preview_token=token))
+
+
+@router.delete("/resume-sources/{adapter_id}")
+def delete_resume_source(adapter_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        adapter_registry.get(adapter_id)
+    except KeyError as exc:
+        raise HTTPException(400, "Неизвестный сайт вакансий") from exc
+    try:
+        delete_saved_resume_source(db, adapter_id)
+    except SavedResumeSourceNotFound as exc:
+        raise HTTPException(404, "Сохраненный источник не найден") from exc
+    return _no_store({"ok": True, "adapter_id": adapter_id})
 
 
 @router.api_route(
@@ -675,9 +493,8 @@ def adapters() -> list[dict]:
 
 
 def session_dict(item: JobSession) -> dict:
-    return {
+    result = {
         "id": item.id,
-        "profile_id": item.profile_id,
         "desired_job_description": getattr(item, "desired_job_description", ""),
         "minimum_scores": item.minimum_scores or None,
         "adapter_id": item.adapter_id,
@@ -692,6 +509,19 @@ def session_dict(item: JobSession) -> dict:
         "finished_at": item.finished_at.isoformat() if item.finished_at else None,
         "stop_reason": item.stop_reason,
     }
+    # Expose only non-sensitive snapshot metadata. The raw source URL and
+    # private view never leave the local backend.
+    snapshot = getattr(item, "resume_snapshot", None)
+    if snapshot is None:
+        # Avoid an ORM relationship (and accidental eager loading) on legacy
+        # models; this is populated by the dedicated endpoint when needed.
+        result["resume_snapshot"] = None
+    else:
+        result["resume_snapshot"] = {
+            "source_site": snapshot.source_site,
+            "imported_at": snapshot.imported_at.isoformat(),
+        }
+    return result
 
 
 @router.post("/sessions")
@@ -705,16 +535,28 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
     safe_template = sanitize_untrusted_input(
         payload.cover_letter_template, context="candidate letter template"
     )
-    profile = db.get(CandidateProfile, payload.profile_id)
-    if not profile:
-        raise HTTPException(400, "Сначала создайте профиль")
-    _require_profile_gender(profile)
     try:
         adapter_registry.get(payload.adapter_id)
     except KeyError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # Launches always come from a confirmed durable source. Preview tokens are
+    # intentionally limited to the confirmation flow and cannot launch a
+    # session on their own.
+    saved_source = db.scalar(
+        select(SavedResumeSource).where(SavedResumeSource.adapter_id == payload.adapter_id)
+    )
+    if saved_source is None:
+        raise HTTPException(400, "Сначала проверьте и подтвердите ссылку на резюме выбранного сайта")
+    try:
+        refreshed, launch_snapshot = asyncio.run(
+            revalidate_saved_resume_source(db, payload.adapter_id)
+        )
+        if refreshed.status == "unavailable":
+            raise ResumeImportError("Не удалось повторно проверить сохраненное резюме")
+    except ResumeImportError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
     item = JobSession(
-        profile_id=payload.profile_id,
         desired_job_description=safe_description,
         minimum_scores=payload.minimum_scores or None,
         adapter_id=payload.adapter_id,
@@ -727,6 +569,12 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         counters={},
     )
     db.add(item)
+    db.flush()
+    try:
+        persist_session_snapshot(db, item.id, launch_snapshot)
+    except ResumeImportError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
     db.commit()
     db.refresh(item)
     return session_dict(item)
@@ -737,6 +585,36 @@ def sessions(db: Session = Depends(get_db)) -> list[dict]:
     return [session_dict(s) for s in db.scalars(select(JobSession).order_by(JobSession.id.desc()))]
 
 
+@router.get("/sessions/{session_id}/resume")
+def session_resume(session_id: int, db: Session = Depends(get_db)) -> dict:
+    """Return only a read-only, non-PII resume summary for the session."""
+    item = db.get(JobSession, session_id)
+    if item is None:
+        raise HTTPException(404, "Сессия не найдена")
+    snapshot = db.scalar(
+        select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == session_id)
+    )
+    if snapshot is None:
+        raise HTTPException(404, "Временный снимок резюме недоступен")
+    safe = SiteResumeSnapshot.model_validate(snapshot.snapshot)
+    result = public_preview(safe)
+    result["session_id"] = session_id
+    result["professional"] = snapshot.professional_view
+    private = _unseal_private(snapshot.private_view)
+    identity = private.get("identity", {})
+    contacts = private.get("contacts", {})
+    result["private_fields_found"] = {
+        "full_name": isinstance(identity, dict) and isinstance(identity.get("full_name"), dict)
+        and identity["full_name"].get("availability") == "present",
+        "phone": isinstance(contacts, dict) and isinstance(contacts.get("phone"), dict)
+        and contacts["phone"].get("availability") == "present",
+        "email": isinstance(contacts, dict) and isinstance(contacts.get("email"), dict)
+        and contacts["email"].get("availability") == "present",
+    }
+    # Explicitly avoid returning the encrypted private payload as well.
+    return _no_store(result)
+
+
 @router.post("/sessions/{session_id}/start")
 async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
@@ -744,10 +622,24 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(404, "Сессия не найдена")
     if item.status != SessionStatus.CREATED:
         raise HTTPException(409, "Запустить можно только новую сессию")
-    profile = db.get(CandidateProfile, item.profile_id)
-    if not profile:
-        raise HTTPException(400, "Сначала создайте профиль")
-    _require_profile_gender(profile)
+    snapshot = db.scalar(select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == item.id))
+    if snapshot is None:
+        raise HTTPException(400, "Временный снимок резюме не найден; проверьте ссылку ещё раз")
+    # Creation already performs source revalidation. The immutable snapshot
+    # is the only supported input for starting this session.
+    if snapshot.source_site != item.adapter_id:
+        raise HTTPException(409, "Снимок резюме принадлежит другому сайту")
+    private = _unseal_private(snapshot.private_view)
+    gender = (private.get("identity", {}).get("gender", {})
+              if isinstance(private.get("identity"), dict) else {})
+    source = db.scalar(
+        select(SavedResumeSource).where(SavedResumeSource.adapter_id == item.adapter_id)
+    )
+    if (
+        gender.get("value") not in {"male", "female"}
+        and (source is None or source.grammatical_gender not in {"male", "female"})
+    ):
+        raise HTTPException(422, "Выберите мужской или женский род в настройках сохраненного резюме")
     if not item.cover_letter_auto and not (item.cover_letter_template or "").strip():
         raise HTTPException(422, "Укажите структуру сопроводительного письма")
     if workflow_manager.launch(session_id) is False:
@@ -771,14 +663,25 @@ async def resume_session(session_id: int, db: Session = Depends(get_db)) -> dict
         raise HTTPException(404, "Сессия не найдена")
     if item.status not in {
         SessionStatus.PAUSED,
-        SessionStatus.WAITING_FOR_LOGIN,
-        SessionStatus.NEEDS_REVIEW,
     }:
-        raise HTTPException(409, "Продолжить можно только приостановленную сессию или сессию, требующую проверки")
-    profile = db.get(CandidateProfile, item.profile_id)
-    if not profile:
-        raise HTTPException(400, "Сначала создайте профиль")
-    _require_profile_gender(profile)
+        raise HTTPException(409, "Продолжить можно только приостановленную сессию")
+    snapshot = db.scalar(select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == item.id))
+    if snapshot is None:
+        raise HTTPException(400, "Временный снимок резюме не найден; восстановление невозможно")
+    # A PAUSED session resumes its already checked immutable snapshot.
+    if snapshot.source_site != item.adapter_id:
+        raise HTTPException(409, "Снимок резюме принадлежит другому сайту")
+    private = _unseal_private(snapshot.private_view)
+    gender = (private.get("identity", {}).get("gender", {})
+              if isinstance(private.get("identity"), dict) else {})
+    source = db.scalar(
+        select(SavedResumeSource).where(SavedResumeSource.adapter_id == item.adapter_id)
+    )
+    if (
+        gender.get("value") not in {"male", "female"}
+        and (source is None or source.grammatical_gender not in {"male", "female"})
+    ):
+        raise HTTPException(422, "Выберите мужской или женский род в настройках сохраненного резюме")
     if not item.cover_letter_auto and not (item.cover_letter_template or "").strip():
         raise HTTPException(422, "Укажите структуру сопроводительного письма")
     if workflow_manager.launch(session_id) is False:
@@ -803,11 +706,6 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     await close_browser(session_id)
-    from backend.services.profile_memory import collect_session_questions
-
-    db.refresh(item)
-    collect_session_questions(db, item)
-    db.commit()
     if item.adapter_id == "hirehi":
         workflow_manager.write_hirehi_report(session_id)
     if (getattr(item, "recovery", None) or {}).get("measurement_identity"):
@@ -816,6 +714,11 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
 
         db.refresh(item)
         freeze(db, item)
+    # STOPPED is terminal only after any report/metrics work above succeeds.
+    from backend.services.resume_session import delete_snapshot
+
+    delete_snapshot(db, session_id)
+    db.commit()
     return session_dict(item)
 
 
@@ -901,13 +804,17 @@ async def session_browser_login_status(session_id: int, db: Session = Depends(ge
     login = await adapter.get_login_state(executor.page)
     raw_url = str(getattr(executor.page, "url", "") or "")
     parsed = urlparse(raw_url)
-    hostname = (parsed.hostname or "").lower()
-    allowed = {str(domain).lower() for domain in adapter.allowed_domains}
-    safe_url = (
-        urlunparse(("https", parsed.netloc, parsed.path or "/", "", "", ""))
-        if parsed.scheme.lower() == "https" and hostname in allowed
-        else None
-    )
+    try:
+        validate_navigation = getattr(executor, "validate_navigation_url", None)
+        if not callable(validate_navigation):
+            raise ValueError("Текущий адрес браузера не удалось проверить")
+        validate_navigation(raw_url)
+        # Only the origin is useful to the UI.  Paths can contain opaque
+        # resume IDs (bearer identifiers) and must never be echoed by this
+        # status endpoint.
+        safe_url = urlunparse((parsed.scheme.lower(), parsed.netloc, "/", "", "", ""))
+    except (ValueError, TypeError):
+        safe_url = None
     return {
         "authenticated": bool(login.authenticated),
         "message": str(login.message),
@@ -1018,6 +925,14 @@ VacancySort = Literal[
 ]
 VacancySortDirection = Literal["asc", "desc"]
 VacancyExportFormat = Literal["csv", "xlsx", "xml"]
+VacancyStatusGroup = Literal["SUCCESS", "PROCESSING", "REJECTED", "UNCONFIRMED", "ERROR"]
+VACANCY_STATUS_GROUPS = {
+    "SUCCESS": frozenset({"SUBMITTED", "ALREADY_APPLIED", "REPORTED"}),
+    "PROCESSING": frozenset({"EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING"}),
+    "REJECTED": frozenset({"REJECTED_BY_MODEL"}),
+    "UNCONFIRMED": frozenset({"UNCONFIRMED"}),
+    "ERROR": frozenset({"ERROR"}),
+}
 VACANCY_EXPORT_HEADERS = (
     "Номер вакансии",
     "Название вакансии",
@@ -1091,6 +1006,7 @@ def _filtered_vacancy_rows(
     *,
     search: str | None = None,
     state: str | None = None,
+    status_group: VacancyStatusGroup | None = None,
     site: str | None = None,
     status_date_from: date | None = None,
     status_date_to: date | None = None,
@@ -1115,12 +1031,29 @@ def _filtered_vacancy_rows(
     filtered: list[tuple[Vacancy, Evaluation | None]] = []
 
     state_groups = {
-        "EVALUATING": {"EVALUATING"},
-        "REJECTED_BY_MODEL": {"REJECTED_BY_MODEL", "FILTERED_OUT"},
+        **VACANCY_STATUS_GROUPS,
+        # Keep exact-state filters useful for clients that need one status.
+        "SUBMITTED": {"SUBMITTED"},
+        "ALREADY_APPLIED": {"ALREADY_APPLIED"},
         "REPORTED": {"REPORTED"},
-        "ERROR": {"ERROR", "FAILED", "UNKNOWN", "UNKNOWN_RESULT"},
+        "REJECTED_BY_MODEL": {"REJECTED_BY_MODEL"},
+        "EXTRACTED": {"EXTRACTED"},
+        "EVALUATING": {"EVALUATING"},
+        "READY_TO_SUBMIT": {"READY_TO_SUBMIT"},
+        "READY_TO_REPORT": {"READY_TO_REPORT"},
+        "SUBMITTING": {"SUBMITTING"},
+        "UNCONFIRMED": {"UNCONFIRMED"},
     }
-    accepted_states = state_groups.get(state) if state else None
+    accepted_states: set[str] | None = None
+    if status_group:
+        accepted_states = set(state_groups[status_group])
+    if state:
+        requested_states = state_groups.get(state, {state})
+        accepted_states = (
+            set(requested_states)
+            if accepted_states is None
+            else accepted_states.intersection(requested_states)
+        )
 
     for vacancy, evaluation in rows:
         haystack = " ".join(
@@ -1133,7 +1066,7 @@ def _filtered_vacancy_rows(
         ).casefold()
         if needle and needle not in haystack:
             continue
-        if state and (vacancy.state not in accepted_states if accepted_states is not None else vacancy.state != state):
+        if accepted_states is not None and vacancy.state not in accepted_states:
             continue
         if requested_site is not None and vacancy.site != requested_site:
             continue
@@ -1211,6 +1144,10 @@ def _vacancy_score_limits(
 
 
 def _public_vacancy(vacancy: Vacancy, evaluation: Evaluation | None, include_data: bool) -> dict:
+    status_group = next(
+        (group for group, states in VACANCY_STATUS_GROUPS.items() if vacancy.state in states),
+        "ERROR",
+    )
     result = {
         "id": vacancy.id,
         "session_id": vacancy.session_id,
@@ -1218,11 +1155,28 @@ def _public_vacancy(vacancy: Vacancy, evaluation: Evaluation | None, include_dat
         "company": vacancy.company,
         "url": vacancy.url,
         "state": vacancy.state,
+        "status_group": status_group,
         "source": vacancy.source or "",
         "site": vacancy.site or "",
         "status_changed_at": _public_status_time(vacancy),
         "evaluation": public_evaluation(evaluation.data) if evaluation else None,
     }
+    data = vacancy.data or {}
+    if vacancy.state in {"ERROR", "UNCONFIRMED"}:
+        default_code = "SUBMISSION_UNCONFIRMED" if vacancy.state == "UNCONFIRMED" else "VACANCY_PROCESSING_FAILED"
+        default_message = (
+            "Площадка не подтвердила результат отправки; отклик мог быть отправлен"
+            if vacancy.state == "UNCONFIRMED"
+            else "Вакансия не обработана из-за ошибки"
+        )
+        message = data.get("error_message") or data.get("outcome_message")
+        if not isinstance(message, str) or not message.strip() or message.strip() == "[удалено]":
+            message = default_message
+        result["error_code"] = data.get("error_code") or data.get("outcome_code") or default_code
+        result["error_message"] = message
+        if vacancy.state == "UNCONFIRMED":
+            result["outcome_code"] = result["error_code"]
+            result["outcome_message"] = message
     if include_data:
         result["data"] = vacancy.data
     return result
@@ -1235,6 +1189,7 @@ def vacancies(
     include_data: bool = Query(False),
     search: str | None = Query(None),
     state: str | None = Query(None),
+    status_group: VacancyStatusGroup | None = Query(None),
     site: str | None = Query(None),
     status_date_from: date | None = Query(None),
     status_date_to: date | None = Query(None),
@@ -1260,6 +1215,7 @@ def vacancies(
         db,
         search=search,
         state=state,
+        status_group=status_group,
         site=site,
         status_date_from=status_date_from,
         status_date_to=status_date_to,
@@ -1299,6 +1255,7 @@ def export_vacancies(
     format: VacancyExportFormat = Query("csv"),
     search: str | None = Query(None),
     state: str | None = Query(None),
+    status_group: VacancyStatusGroup | None = Query(None),
     site: str | None = Query(None),
     status_date_from: date | None = Query(None),
     status_date_to: date | None = Query(None),
@@ -1324,6 +1281,7 @@ def export_vacancies(
         db,
         search=search,
         state=state,
+        status_group=status_group,
         site=site,
         status_date_from=status_date_from,
         status_date_to=status_date_to,

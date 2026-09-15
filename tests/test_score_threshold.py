@@ -6,7 +6,10 @@ from backend.persistence.models import JobSession
 
 
 def payload(**overrides: object) -> dict[str, object]:
-    return {"profile_id": 1, "adapter_id": "hh", **overrides}
+    return {
+        "adapter_id": "hh",
+        **overrides,
+    }
 
 
 def test_session_has_canonical_gate_map() -> None:

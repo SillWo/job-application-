@@ -16,6 +16,12 @@ class FakeLocator:
     async def count(self):
         return int(self.page.visible.get(self.selector, False))
 
+    async def is_visible(self):
+        return bool(self.page.visible.get(self.selector, False))
+
+    async def is_enabled(self):
+        return bool(self.page.enabled.get(self.selector, True))
+
     async def click(self):
         self.page.clicks.append(self.selector)
         if self.selector == locators.RESPONSE_BUTTON:
@@ -47,12 +53,37 @@ class FakePage:
         self.body_text = body_text
         self.clicks = []
         self.filled = []
+        self.enabled = {}
 
     def locator(self, selector):
         return FakeLocator(self, selector)
 
     async def wait_for_timeout(self, _ms):
         return None
+
+
+class DelayedConfirmationPage(FakePage):
+    def __init__(self, *, delay_ms=6_000, **kwargs):
+        super().__init__(**kwargs)
+        self.delay_ms = delay_ms
+        self.elapsed_ms = 0
+
+    async def wait_for_timeout(self, ms):
+        self.elapsed_ms += ms
+        if self.elapsed_ms >= self.delay_ms:
+            self.visible[locators.ALREADY_APPLIED] = True
+
+
+class DelayedSubmitPage(FakePage):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.enabled[locators.RESPONSE_SUBMIT] = False
+        self.elapsed_ms = 0
+
+    async def wait_for_timeout(self, ms):
+        self.elapsed_ms += ms
+        if self.elapsed_ms >= 2_000:
+            self.enabled[locators.RESPONSE_SUBMIT] = True
 
 
 @pytest.mark.asyncio
@@ -110,6 +141,37 @@ async def test_clicked_attempt_without_confirmation_is_unknown():
     result = await adapter.submit_application(page)
 
     assert result.status == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_clicked_attempt_waits_for_delayed_confirmation_without_second_click():
+    page = DelayedConfirmationPage(
+        delay_ms=6_000,
+        visible={locators.RESPONSE_BUTTON: True},
+    )
+    adapter = ZarplataAdapter()
+
+    await adapter.open_application(page)
+    result = await adapter.submit_application(page)
+
+    assert result.status == "submitted"
+    assert page.elapsed_ms >= 6_000
+    assert page.clicks == [locators.RESPONSE_BUTTON]
+
+
+@pytest.mark.asyncio
+async def test_popup_submit_waits_until_enabled_before_clicking():
+    page = DelayedSubmitPage(
+        visible={locators.RESPONSE_BUTTON: True, locators.RESPONSE_SUBMIT: True}
+    )
+    adapter = ZarplataAdapter()
+
+    await adapter.open_application(page)
+    result = await adapter.submit_application(page)
+
+    assert result.status == "submitted"
+    assert page.elapsed_ms >= 2_000
+    assert page.clicks == [locators.RESPONSE_BUTTON, locators.RESPONSE_SUBMIT]
 
 
 class Control:

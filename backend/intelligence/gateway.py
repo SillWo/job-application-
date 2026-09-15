@@ -324,49 +324,6 @@ def _resume_analysis_missing_fields(
     return missing
 
 
-def _resume_import_missing_fields(source: str, parsed: BaseModel) -> list[str]:
-    """Find schema fields that were defaulted although their HH section exists."""
-    if parsed.__class__.__name__ != "ResumeImportData":
-        return []
-    profile = parsed.profile
-    resume = parsed.resume
-    text = source.lower()
-    requirements = (
-        (("образован",), bool(profile.education)),
-        (("язык",), bool(profile.languages)),
-        (("опыт работы",), bool(resume.experiences)),
-        (("навык", "стек", "стэк"), bool(resume.skills)),
-        (("желаемая должность",), bool(resume.desired_title)),
-        (("тип занятости",), bool(resume.employment_types)),
-        (("формат работы",), bool(resume.work_formats)),
-        (("командиров",), resume.business_trips is not None),
-    )
-    return [
-        ", ".join(markers)
-        for markers, populated in requirements
-        if any(marker in text for marker in markers) and not populated
-    ]
-
-
-def _resume_import_is_incomplete(source: str, parsed: BaseModel) -> bool:
-    return bool(_resume_import_missing_fields(source, parsed))
-
-
-def _merge_resume_import(base: BaseModel, candidate: BaseModel) -> BaseModel:
-    """Merge non-default parser blocks while keeping the first complete values."""
-    profile = base.profile.model_dump()
-    candidate_profile = candidate.profile.model_dump()
-    for key, value in candidate_profile.items():
-        if value not in (None, [], {}):
-            profile[key] = value
-    resume = base.resume.model_dump()
-    candidate_resume = candidate.resume.model_dump()
-    for key, value in candidate_resume.items():
-        if value not in (None, [], ""):
-            resume[key] = value
-    return base.__class__.model_validate({"profile": profile, "resume": resume})
-
-
 class ModelGateway:
     def __init__(self, provider: str | None = None) -> None:
         self.provider = provider or settings.llm_provider
@@ -486,17 +443,14 @@ class ModelGateway:
         )
         system_prompt = TRUSTED_SYSTEM_SECURITY_POLICY + "\n\n" + system_prompt
         opts = {"num_predict": 128} if role == "connection_check" else ROLE_OPTIONS[role]
-        attempts = 4 if role == "resume_analyst" else (
-            4 if role == "profile" and schema.__name__ == "ResumeImportData" else 2
-        )
-        request_timeout = 45 if role == "connection_check" else (300 if role == "profile" else 180)
+        attempts = 4 if role == "resume_analyst" else 2
+        request_timeout = 45 if role == "connection_check" else 180
 
         async with self._lock:
             messages: list[dict] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(provider_payload, ensure_ascii=False, allow_nan=False)},
             ]
-            resume_candidate = None
             validation_error = "unknown validation error"
             try:
                 for attempt in range(attempts):
@@ -572,35 +526,6 @@ class ModelGateway:
                                     "ResumeAnalysis contains defaulted or incomplete fields: "
                                     + ", ".join(missing_analysis)
                                 )
-                        if role == "profile" and _resume_import_is_incomplete(
-                            payload.get("resume_text", ""), parsed
-                        ):
-                            if resume_candidate is not None:
-                                parsed = _merge_resume_import(resume_candidate, parsed)
-                            resume_candidate = parsed
-                            missing = _resume_import_missing_fields(
-                                payload.get("resume_text", ""), parsed
-                            )
-                            if not missing:
-                                return parsed
-                            if attempt == attempts - 1:
-                                raise ModelUnavailable(
-                                    "OpenAI-compat вернул неполный ResumeImportData после repair-pass"
-                                )
-                            messages[0]["content"] += (
-                                " Обязательный targeted repair: проверь локально определённые поля/разделы "
-                                "образования, языков, опыта и навыков. "
-                                "Найди их в исходном тексте и заполни явно. Особенно проверь заголовки "
-                                "Образование и Языки: верни все записи, даже если они находятся после "
-                                "опыта работы. Не оставляй эти поля пустыми при наличии текста раздела."
-                            )
-                            raise ValueError("ResumeImportData contains defaulted fields")
-                        if (
-                            role == "profile"
-                            and schema.__name__ == "ResumeImportData"
-                            and resume_candidate is not None
-                        ):
-                            parsed = _merge_resume_import(resume_candidate, parsed)
                         return parsed
                     except PromptInjectionDetected:
                         # Never put model output, exception text, or a value
@@ -619,34 +544,25 @@ class ModelGateway:
                                 "OpenAI-compat вернул неполный или некорректный JSON после повторной попытки"
                             ) from exc
                     # Retry with a larger explicit repair prompt
-                    if role == "profile" and schema.__name__ == "ResumeImportData":
-                        messages[0]["content"] += (
-                            " Предыдущий JSON не прошёл проверку. Повтори полный ResumeImportData: "
-                            "извлеки каждый явно присутствующий элемент из разделов education, languages, "
-                            "experiences, skills, desired_title, employment_types, work_formats и "
-                            "business_trips. Пустой массив запрещён, если соответствующий раздел есть в "
-                            "исходном тексте. Не выбирай значения по умолчанию и обязательно заверши JSON."
+                    root_contract = ""
+                    if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
+                        root_contract = (
+                            " Для ResumeAnalysis корень JSON обязан быть самим объектом с обязательными полями "
+                            "tasks, skills (массив объектов skill/importance/score/evidence/explanation), "
+                            "experience_depth, role_match, industry, special_requirements, "
+                            "непустыми reason и skills_summary; "
+                            "НЕ оборачивай его в analysis, resumes, candidate_name, result или data "
+                            "и не возвращай массив в корне. skills обязан быть массивом SkillAssessment; "
+                            "остальные критерии обязаны быть объектами со score, confidence, explanation и evidence."
                         )
-                    else:
-                        root_contract = ""
-                        if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
-                            root_contract = (
-                                " Для ResumeAnalysis корень JSON обязан быть самим объектом с обязательными полями "
-                                "tasks, skills (массив объектов skill/importance/score/evidence/explanation), "
-                                "experience_depth, role_match, industry, special_requirements, "
-                                "непустыми reason и skills_summary; "
-                                "НЕ оборачивай его в analysis, resumes, candidate_name, result или data "
-                                "и не возвращай массив в корне. skills обязан быть массивом SkillAssessment; "
-                                "остальные критерии обязаны быть объектами со score, confidence, explanation и evidence."
-                            )
-                            if "preference_policy" in payload:
-                                root_contract += " Верни также полный flag_matches: ровно один объект для каждого policy flag."
-                        messages[0]["content"] += (
-                            f" Предыдущий JSON не прошёл локальную проверку ({validation_error}). "
-                            f"Повтори полный объект схемы {schema.__name__}, сохрани все обязательные "
-                            "поля и заверши JSON без markdown. Не исправляй ошибку удалением полей."
-                            + root_contract
-                        )
+                        if "preference_policy" in payload:
+                            root_contract += " Верни также полный flag_matches: ровно один объект для каждого policy flag."
+                    messages[0]["content"] += (
+                        f" Предыдущий JSON не прошёл локальную проверку ({validation_error}). "
+                        f"Повтори полный объект схемы {schema.__name__}, сохрани все обязательные "
+                        "поля и заверши JSON без markdown. Не исправляй ошибку удалением полей."
+                        + root_contract
+                    )
             except ModelUnavailable:
                 raise
             except APIError as exc:
@@ -805,39 +721,7 @@ class ModelGateway:
                 for item in criteria
             ]
             score = sum(item["points"] for item in breakdown)
-            return schema.model_validate({"decision": "apply", "score": score, "confidence": 0.9 if score >= 80 else 0.72, "category": job.get("title", "Вакансия"), "score_breakdown": breakdown, "has_test_assignment": has_test, "requires_manual_review": False, "reason": "Детерминированная mock-оценка", "positive_evidence": [], "negative_evidence": [], "missing_requirements": [], "hard_rule_violations": []})
-        if role == "profile" and schema.__name__ in {
-            "CandidateProfileData",
-            "PersonalProfileData",
-            "ResumeData",
-        }:
-            text = payload.get("resume_text", "")
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            fields = getattr(schema, "model_fields", {})
-            values = {}
-            if "full_name" in fields:
-                values["full_name"] = lines[0] if lines else None
-            if "summary" in fields:
-                values["summary"] = " ".join(lines[1:3]) or None
-            if "desired_title" in fields:
-                values["desired_title"] = self._extract_desired_title(lines)
-            if "resume_text" in fields:
-                values["resume_text"] = text
-            return schema.model_validate(values)
-        if role == "profile" and schema.__name__ == "ResumeImportData":
-            text = payload.get("resume_text", "")
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            title = self._extract_desired_title(lines)
-            return schema.model_validate(
-                {
-                    "profile": {"full_name": lines[0] if lines else None},
-                    "resume": {
-                        "name": "Импортированное резюме",
-                        "desired_title": title,
-                        "about": " ".join(lines[1:3]),
-                    },
-                }
-            )
+            return schema.model_validate({"decision": "apply", "score": score, "confidence": 0.9 if score >= 80 else 0.72, "category": job.get("title", "Вакансия"), "score_breakdown": breakdown, "has_test_assignment": has_test, "reason": "Детерминированная mock-оценка", "positive_evidence": [], "negative_evidence": [], "missing_requirements": [], "hard_rule_violations": []})
         if schema is CoverLetterDraft or schema.__name__ == "CoverLetterGenerationDraft":
             vacancy = payload.get("vacancy", {})
             profile = payload.get("profile", {}) or {}
@@ -899,17 +783,3 @@ class ModelGateway:
                 result["fulfilled_special_conditions"] = fulfilled
             return schema.model_validate(result)
         raise ValueError(f"Mock provider has no fixture for role={role}, schema={schema.__name__}")
-
-    @staticmethod
-    def _extract_desired_title(lines: list[str]) -> str | None:
-        """Extract a likely position title without assuming a profession."""
-        markers = ("желаемая должность", "desired title", "position", "должность")
-        for index, line in enumerate(lines):
-            lowered = line.lower()
-            if any(marker in lowered for marker in markers):
-                value = line.split(":", 1)[1].strip() if ":" in line else ""
-                if value:
-                    return value
-                if index + 1 < len(lines):
-                    return lines[index + 1]
-        return next((line for line in lines[1:] if len(line.split()) <= 8), None)

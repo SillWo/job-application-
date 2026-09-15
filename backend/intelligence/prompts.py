@@ -560,14 +560,6 @@ ROLE_PROMPTS = {
         "ответ должен появиться в сопроводительном письме, но не является дословным токеном работодателя. "
         "Не выдумывай требования и не включай обязанности, навыки или условия работы. Верни только JSON."
     ),
-    "profile": (
-        "Строго распарсь резюме HH в один JSON-объект ResumeImportData с ключами profile и resume. "
-        "Заполни все найденные поля схемы, сохрани все записи образования, опыта, языков и навыков. "
-        "Не добавляй markdown, facts, verified_facts или другие ключи. Не выдумывай данные; отсутствующие "
-        "nullable-поля — null, массивы — []. Даты сохраняй как в источнике, контакты не помещай в about или skills. "
-        "Поле gender заполняй только если пол прямо указан в исходном тексте; не определяй его по имени, "
-        "фотографии, окончанию фамилии или косвенным признакам. Иначе gender=null."
-    ),
     "search_planner": (
         "Сформируй JSON SearchQueryPlan с queries-объектами query, relation_to_resume и "
         "is_title_equivalent. Генерируй новые названия смежных функций по задачам, навыкам и отраслям из резюме. "
@@ -591,6 +583,5 @@ ROLE_OPTIONS = {
     "resume_analyst": {"temperature": 0.1, "num_ctx": 32768, "num_predict": 5000, "think": False},
     "writer": {"temperature": 0.3, "num_ctx": 32768, "num_predict": 2500, "think": False},
     "special_conditions": {"temperature": 0, "num_ctx": 32768, "num_predict": 1800, "think": False},
-    "profile": {"temperature": 0, "num_ctx": 32768, "num_predict": 12000, "think": False},
     "search_planner": {"temperature": 0.1, "num_predict": 500, "think": False},
 }

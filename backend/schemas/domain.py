@@ -2,127 +2,254 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-EducationType = Literal["higher", "secondary_vocational", "school"]
+# Resume data imported from a job site is deliberately modelled separately.
+# The availability marker is important: ``None``
+# cannot tell a missing field from a field hidden by an anonymous/public view.
+class FieldAvailability(StrEnum):
+    PRESENT = "present"
+    NOT_PROVIDED = "not_provided"
+    HIDDEN = "hidden"
+    UNSUPPORTED = "unsupported"
+    PARSE_ERROR = "parse_error"
 
 
-class ContactData(BaseModel):
+SourceValue = TypeVar("SourceValue")
+
+
+class SourceField(BaseModel, Generic[SourceValue]):
     model_config = ConfigDict(extra="forbid")
-    phone: str | None = None
-    email: str | None = None
-    messengers: list[str] = Field(default_factory=list)
+    value: SourceValue | None = None
+    availability: FieldAvailability = FieldAvailability.NOT_PROVIDED
+    source_section: str | None = None
+    # Locator is useful only inside the adapter while reading the page; it is
+    # excluded from every serialized model payload sent to persistence/models.
+    source_locator: str | None = Field(default=None, exclude=True)
 
 
-class EducationEntry(BaseModel):
+class ResumeIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    type: EducationType
-    institution: str = Field(min_length=1)
-    faculty: str | None = None
-    specialty: str | None = None
-    degree: Literal["bachelor", "master", "postgraduate", "specialist"] | None = None
-    start_date: str | None = None
-    end_date: str | None = None
-
-    @model_validator(mode="after")
-    def validate_type_specific_fields(self) -> EducationEntry:
-        if self.type == "higher" and self.degree is None:
-            raise ValueError("higher education requires degree")
-        if self.type in {"higher", "secondary_vocational"} and not self.specialty:
-            raise ValueError(f"{self.type} education requires specialty")
-        if self.type in {"higher", "secondary_vocational"} and not self.faculty:
-            raise ValueError(f"{self.type} education requires faculty")
-        if self.type == "school" and any((self.faculty, self.specialty, self.degree)):
-            raise ValueError("school education does not accept faculty, specialty or degree")
-        return self
+    full_name: SourceField[str] = Field(default_factory=SourceField)
+    gender: SourceField[str] = Field(default_factory=SourceField)
+    age: SourceField[int | str] = Field(default_factory=SourceField)
+    birth_date: SourceField[str] = Field(default_factory=SourceField)
+    has_photo: SourceField[bool] = Field(
+        default_factory=SourceField, validation_alias=AliasChoices("has_photo", "photo_available")
+    )
 
 
-class LanguageEntry(BaseModel):
+class ResumeContacts(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    language: str = Field(min_length=1)
-    proficiency: str = Field(min_length=1)
+    phone: SourceField[str] = Field(default_factory=SourceField)
+    email: SourceField[str] = Field(default_factory=SourceField)
+    messengers: SourceField[list[str]] = Field(default_factory=SourceField)
+    links: SourceField[list[str]] = Field(
+        default_factory=SourceField,
+        validation_alias=AliasChoices("links", "professional_links"),
+    )
 
 
-class PersonalProfileData(BaseModel):
+class ResumeTarget(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    full_name: str | None = None
-    # User supplied; never infer gender from a name.
-    gender: Literal["male", "female"] | None = None
-    residence: str | None = None
-    job_search_locations: list[str] = Field(default_factory=list)
-    contacts: ContactData = Field(default_factory=ContactData)
-    education: list[EducationEntry] = Field(default_factory=list)
-    languages: list[LanguageEntry] = Field(default_factory=list)
-    driver_license: bool | None = None
+    desired_title: SourceField[str] = Field(
+        default_factory=SourceField, validation_alias=AliasChoices("desired_title", "title")
+    )
+    specializations: SourceField[list[str]] = Field(default_factory=SourceField)
+    grade: SourceField[str] = Field(default_factory=SourceField)
+    desired_salary: SourceField[str] = Field(
+        default_factory=SourceField, validation_alias=AliasChoices("desired_salary", "salary")
+    )
+    employment_types: SourceField[list[str]] = Field(default_factory=SourceField)
+    work_formats: SourceField[list[str]] = Field(default_factory=SourceField)
 
 
-class Experience(BaseModel):
+class ResumeLocation(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    company: str = Field(min_length=1)
-    position: str = Field(min_length=1)
-    start_date: str | None = None
-    end_date: str | None = None
-    duties: str = Field(default="")
+    residence: SourceField[str] = Field(
+        default_factory=SourceField, validation_alias=AliasChoices("residence", "city")
+    )
+    relocation: SourceField[str] = Field(default_factory=SourceField)
+    business_trips: SourceField[str | bool] = Field(default_factory=SourceField)
+    citizenship: SourceField[list[str]] = Field(default_factory=SourceField)
+    work_permit: SourceField[str] = Field(default_factory=SourceField)
 
 
-class ResumeData(BaseModel):
+class ResumeExperience(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str = Field(default="Резюме", min_length=1, max_length=255)
-    desired_title: str | None = None
-    desired_salary: str | None = None
-    employment_types: list[str] = Field(default_factory=list)
-    work_formats: list[str] = Field(default_factory=list)
-    business_trips: bool | Literal["can", "cannot"] | None = None
-    experiences: list[Experience] = Field(default_factory=list)
-    skills: list[str] = Field(default_factory=list)
-    about: str = ""
-    selected_for_matching: bool = True
-    original_filename: str | None = None
-    original_path: str | None = None
-
-    @field_validator("skills", mode="before")
-    @classmethod
-    def normalize_skills(cls, value: Any) -> list[str]:
-        if isinstance(value, str):
-            value = value.split(",")
-        if value is None:
-            return []
-        return list(dict.fromkeys(item.strip() for item in value if str(item).strip()))
-
-    @field_validator("desired_salary", mode="before")
-    @classmethod
-    def normalize_salary(cls, value: Any) -> str | None:
-        return None if value is None else str(value)
-
-    @field_validator("about")
-    @classmethod
-    def validate_about_words(cls, value: str) -> str:
-        if len(value.split()) > 500:
-            raise ValueError("about must contain at most 500 words")
-        return value
+    company: SourceField[str] | str = ""
+    position: SourceField[str] | str = Field(
+        default="", validation_alias=AliasChoices("position", "title")
+    )
+    start_date: SourceField[str] | str | None = Field(
+        default=None, validation_alias=AliasChoices("start_date", "period")
+    )
+    end_date: SourceField[str] | str | None = None
+    duties: SourceField[str] | str = Field(
+        default="", validation_alias=AliasChoices("duties", "description")
+    )
+    achievements: SourceField[list[str]] | list[str] = Field(default_factory=list)
+    source_section: str | None = None
 
 
-class CandidateProfileData(PersonalProfileData):
-    """The personal profile payload; resumes are separate resources."""
-
-
-class CandidateProfileInput(PersonalProfileData):
-    """Required user-authored fields accepted by create/update profile APIs."""
-
-    gender: Literal["male", "female"]
-
-
-class ResumeImportData(BaseModel):
+class ResumeProject(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    profile: PersonalProfileData = Field(default_factory=PersonalProfileData)
-    resume: ResumeData
+    name: SourceField[str] | str = ""
+    description: SourceField[str] | str = ""
+    role: SourceField[str] | str | None = None
+    links: SourceField[list[str]] | list[str] = Field(
+        default_factory=list, validation_alias=AliasChoices("links", "url")
+    )
+
+
+class ResumeSkill(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: SourceField[str] | str
+    level: SourceField[str] | str | None = None
+    category: SourceField[str] | str | None = None
+
+
+class ResumeEducation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    institution: SourceField[str] | str = ""
+    specialty: SourceField[str] | str | None = Field(
+        default=None, validation_alias=AliasChoices("specialty", "program")
+    )
+    degree: SourceField[str] | str | None = None
+    start_date: SourceField[str] | str | None = Field(
+        default=None, validation_alias=AliasChoices("start_date", "period")
+    )
+    end_date: SourceField[str] | str | None = None
+
+
+class ResumeLanguage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    language: SourceField[str] | str
+    proficiency: SourceField[str] | str | None = Field(
+        default=None, validation_alias=AliasChoices("proficiency", "level")
+    )
+
+
+class ResumeCourse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: SourceField[str] | str
+    institution: SourceField[str] | str | None = None
+    year: SourceField[str] | str | None = Field(
+        default=None, validation_alias=AliasChoices("year", "period")
+    )
+
+
+class ResumeCertification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: SourceField[str] | str
+    issuer: SourceField[str] | str | None = None
+    year: SourceField[str] | str | None = Field(
+        default=None, validation_alias=AliasChoices("year", "period")
+    )
+
+
+class ResumeAward(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: SourceField[str] | str
+    issuer: SourceField[str] | str | None = None
+    year: SourceField[str] | str | None = Field(
+        default=None, validation_alias=AliasChoices("year", "period")
+    )
+
+
+class ResumePortfolioItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: SourceField[str] | str = Field(
+        default="", validation_alias=AliasChoices("title", "name")
+    )
+    url: SourceField[str] | str | None = None
+    description: SourceField[str] | str | None = None
+
+
+class AdditionalResumeSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    content: SourceField[str] | str = ""
+    availability: FieldAvailability = FieldAvailability.PRESENT
+
+
+class ResumeCoverage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    present_sections: list[str] = Field(default_factory=list)
+    missing_sections: list[str] = Field(default_factory=list)
+    hidden_fields: list[str] = Field(default_factory=list)
+    unsupported_fields: list[str] = Field(default_factory=list)
+    parse_errors: list[str] = Field(default_factory=list)
+
+
+class SiteResumeSnapshot(BaseModel):
+    """Immutable, normalized data captured for exactly one job session."""
+    model_config = ConfigDict(extra="forbid")
+    schema_version: int = Field(default=1, ge=1)
+    extractor_version: str = Field(min_length=1, max_length=80)
+    source_site: str = Field(min_length=1, max_length=50)
+    source_resume_id: str = Field(min_length=1, max_length=255)
+    source_url_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_updated_at: datetime | None = None
+    imported_at: datetime = Field(default_factory=utcnow)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    identity: ResumeIdentity = Field(default_factory=ResumeIdentity)
+    contacts: ResumeContacts = Field(default_factory=ResumeContacts)
+    target: ResumeTarget = Field(default_factory=ResumeTarget)
+    location: ResumeLocation = Field(default_factory=ResumeLocation)
+    experience: list[ResumeExperience] = Field(default_factory=list)
+    projects: list[ResumeProject] = Field(default_factory=list)
+    skills: list[ResumeSkill] = Field(default_factory=list)
+    education: list[ResumeEducation] = Field(default_factory=list)
+    languages: list[ResumeLanguage] = Field(default_factory=list)
+    courses: list[ResumeCourse] = Field(default_factory=list)
+    certifications: list[ResumeCertification] = Field(default_factory=list)
+    awards: list[ResumeAward] = Field(default_factory=list)
+    portfolio: list[ResumePortfolioItem] = Field(default_factory=list)
+    about: SourceField[str] = Field(default_factory=SourceField)
+    additional_sections: list[AdditionalResumeSection] = Field(default_factory=list)
+    coverage: ResumeCoverage = Field(default_factory=ResumeCoverage)
+
+
+class ResumeRef(BaseModel):
+    """A validated, user-selected public resume reference (not a snapshot)."""
+    model_config = ConfigDict(extra="forbid")
+    source_site: str
+    external_id: str
+    url: str
+    title: str | None = None
+    language: str | None = None
+
+
+class ResumeProfessionalView(BaseModel):
+    """The allowlisted candidate context sent to search/evaluation models."""
+    model_config = ConfigDict(extra="forbid")
+    target: ResumeTarget = Field(default_factory=ResumeTarget)
+    location: ResumeLocation = Field(default_factory=ResumeLocation)
+    experience: list[ResumeExperience] = Field(default_factory=list)
+    projects: list[ResumeProject] = Field(default_factory=list)
+    skills: list[ResumeSkill] = Field(default_factory=list)
+    education: list[ResumeEducation] = Field(default_factory=list)
+    languages: list[ResumeLanguage] = Field(default_factory=list)
+    courses: list[ResumeCourse] = Field(default_factory=list)
+    certifications: list[ResumeCertification] = Field(default_factory=list)
+    awards: list[ResumeAward] = Field(default_factory=list)
+    portfolio: list[ResumePortfolioItem] = Field(default_factory=list)
+    about: SourceField[str] = Field(default_factory=SourceField)
+    additional_sections: list[AdditionalResumeSection] = Field(default_factory=list)
+
+
+class ResumePrivateView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    identity: ResumeIdentity = Field(default_factory=ResumeIdentity)
+    contacts: ResumeContacts = Field(default_factory=ResumeContacts)
 
 
 class ScoringCriterion(BaseModel):
@@ -323,7 +450,7 @@ class ScoreComponent(BaseModel):
 
 
 class JobEvaluation(BaseModel):
-    decision: Literal["apply", "skip", "manual_review"]
+    decision: Literal["apply", "skip"]
     score: int = Field(ge=0, le=100)
     confidence: float = Field(ge=0, le=1)
     category: str
@@ -338,7 +465,6 @@ class JobEvaluation(BaseModel):
     # this field and therefore cannot authorize a cached apply decision.
     preference_flags_verified: bool = False
     has_test_assignment: bool = False
-    requires_manual_review: bool = False
     reason: str
 
     @field_validator("confidence", mode="before")
@@ -358,9 +484,6 @@ class ApplicationPlan(BaseModel):
     unanswered_fields: dict[str, str] = Field(default_factory=dict)
     form_fields: dict[str, ApplicationField] = Field(default_factory=dict)
     allow_foreign_application: bool = False
-    # ``manual_review`` remains accepted so plans persisted by older releases
-    # can be loaded, but new plans must keep the pipeline fully automatic.
-    unknown_question_policy: Literal["manual_review", "skip"] = "skip"
     submission_allowed: bool = False
 
 
@@ -369,29 +492,23 @@ class CoverLetterDraft(BaseModel):
 
 
 class VacancyState(StrEnum):
-    DISCOVERED = "DISCOVERED"
     EXTRACTED = "EXTRACTED"
-    FILTERED_OUT = "FILTERED_OUT"
     EVALUATING = "EVALUATING"
     REJECTED_BY_MODEL = "REJECTED_BY_MODEL"
-    SKIPPED_TEST = "SKIPPED_TEST"
-    NEEDS_REVIEW = "NEEDS_REVIEW"
-    LETTER_GENERATED = "LETTER_GENERATED"
     READY_TO_SUBMIT = "READY_TO_SUBMIT"
-    FILLING_FORM = "FILLING_FORM"
     SUBMITTING = "SUBMITTING"
     SUBMITTED = "SUBMITTED"
     ALREADY_APPLIED = "ALREADY_APPLIED"
-    FAILED = "FAILED"
-    UNKNOWN_RESULT = "UNKNOWN_RESULT"
+    READY_TO_REPORT = "READY_TO_REPORT"
+    REPORTED = "REPORTED"
+    UNCONFIRMED = "UNCONFIRMED"
+    ERROR = "ERROR"
 
 
 class SessionStatus(StrEnum):
     CREATED = "CREATED"
     RUNNING = "RUNNING"
     PAUSED = "PAUSED"
-    WAITING_FOR_LOGIN = "WAITING_FOR_LOGIN"
-    NEEDS_REVIEW = "NEEDS_REVIEW"
     COMPLETED = "COMPLETED"
     STOPPED = "STOPPED"
     FAILED = "FAILED"

@@ -180,7 +180,7 @@ async def test_logical_quiz_can_be_answered_without_inventing_resume_facts():
     ApplicationField(id="q1", label="Ваш город?", max_length=3),
     ApplicationField(id="q1", label="Вопрос без подписи (q1)"),
 ])
-async def test_sensitive_unknown_and_invalid_controls_require_review(field):
+async def test_sensitive_unknown_and_invalid_controls_require_error_or_unresolved(field):
     plan = await answer_form(field, [proposal()])
     assert not plan.form_answers
 

@@ -13,12 +13,15 @@ from backend.adapters.base.protocol import (
     LoginState,
     SubmissionResult,
 )
+from backend.adapters.base.resume_import import ResumeImportMixin
 from backend.schemas.domain import ApplicationField, ApplicationPlan, JobPosting
 
 from . import locators
+from .resume import POLICY as resume_policy
+from .resume import extractor as resume_extractor
 
 
-class ZarplataAdapter:
+class ZarplataAdapter(ResumeImportMixin):
     site_id = "zarplata"
     display_name = "Zarplata.ru"
     # HH redirects authenticated users to their regional subdomain and emits
@@ -38,7 +41,15 @@ class ZarplataAdapter:
         display_name=display_name,
         allowed_domains=allowed_domains,
         supports_submission=True,
+        supports_resume_import=True,
+        supports_public_resume_url=True,
+        supports_account_resume_list=False,
     )
+    resume_policy = resume_policy
+    resume_extractor = resume_extractor
+    _submission_poll_interval_ms = 500
+    _submission_timeout_ms = 30_000
+
     async def start(self, context, settings: dict) -> None:
         return None
 
@@ -612,11 +623,9 @@ class ZarplataAdapter:
         return bool(await response.count() and await response.is_visible())
 
     async def submit_application(self, page) -> SubmissionResult:
-        submit = page.locator(locators.RESPONSE_SUBMIT)
         # HH can render the topic link while the response popup is still
         # active. The active submit control is authoritative in that state.
-        if await submit.count():
-            await submit.click()
+        if await self._click_submission_when_ready(page):
             return await self.verify_submission(page, just_submitted=True)
 
         # With no active form, the topic link means the response existed
@@ -635,12 +644,32 @@ class ZarplataAdapter:
             page, just_submitted=getattr(self, "_application_attempt_clicked", False)
         )
 
+    async def _click_submission_when_ready(self, page) -> bool:
+        """Click an attached, visible, enabled submit control at most once."""
+        submit = page.locator(locators.RESPONSE_SUBMIT)
+        if not await submit.count():
+            return False
+        attempts = self._submission_timeout_ms // self._submission_poll_interval_ms
+        for attempt in range(attempts + 1):
+            is_visible = getattr(submit, "is_visible", None)
+            if is_visible is not None and not await is_visible():
+                ready = False
+            else:
+                is_enabled = getattr(submit, "is_enabled", None)
+                ready = is_enabled is None or await is_enabled()
+            if ready:
+                await submit.click()
+                return True
+            if attempt < attempts:
+                await page.wait_for_timeout(self._submission_poll_interval_ms)
+        return False
+
     async def verify_submission(self, page, just_submitted: bool = False) -> SubmissionResult:
-        # HH updates the response form asynchronously. A fixed 1.2 second
-        # delay was too short in session 9 and classified six response flows
-        # as errors. Poll the visible state without a second click: repeating
-        # the submit action would risk a duplicate application.
-        for attempt in range(10):
+        # Zarplata may update the response state asynchronously well after the
+        # click. Poll the visible state without a second click: repeating the
+        # submit action would risk a duplicate application.
+        attempts = self._submission_timeout_ms // self._submission_poll_interval_ms
+        for attempt in range(attempts + 1):
             if await page.locator(locators.ALREADY_APPLIED).count():
                 if just_submitted:
                     return SubmissionResult(
@@ -659,8 +688,8 @@ class ZarplataAdapter:
                 return SubmissionResult(
                     status="submitted", message="zarplata.ru подтвердил отправку отклика"
                 )
-            if attempt < 9:
-                await page.wait_for_timeout(500)
+            if attempt < attempts:
+                await page.wait_for_timeout(self._submission_poll_interval_ms)
         return SubmissionResult(
             status="unknown", message="zarplata.ru не показал однозначное подтверждение отправки"
         )

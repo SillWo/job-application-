@@ -447,7 +447,6 @@ async def evaluate(
         + (["salary_below_preference"] if salary_hit else []),
         flag_matches=matches,
         preference_flags_verified=bool(preference_policy) and not red_safety_issue and not ungrounded_positive_scores,
-        requires_manual_review=False,
         decision="skip" if blocked else "apply",
         reason=reason,
         has_test_assignment=bool(job.has_test_assignment),

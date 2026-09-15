@@ -13,13 +13,16 @@ from backend.adapters.base.protocol import (
     LoginState,
     SubmissionResult,
 )
+from backend.adapters.base.resume_import import ResumeImportMixin
 from backend.schemas.domain import ApplicationPlan, JobPosting
 
 from . import discovery, forms, locators
+from .resume import POLICY as resume_policy
+from .resume import extractor as resume_extractor
 from .salary import parse_salary
 
 
-class HHAdapter:
+class HHAdapter(ResumeImportMixin):
     home_url = "https://hh.ru/"
     site_id = "hh"
     display_name = "HH.ru"
@@ -35,7 +38,12 @@ class HHAdapter:
         display_name=display_name,
         allowed_domains=allowed_domains,
         supports_submission=True,
+        supports_resume_import=True,
+        supports_public_resume_url=True,
+        supports_account_resume_list=False,
     )
+    resume_policy = resume_policy
+    resume_extractor = resume_extractor
     async def start(self, context, settings: dict) -> None:
         return None
 

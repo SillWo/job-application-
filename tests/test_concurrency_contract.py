@@ -105,6 +105,9 @@ async def test_workflow_site_lease_allows_cross_site_blocks_same_site_and_cleans
         def scalar(self, statement):
             return None
 
+        def commit(self):
+            pass
+
     class FakeSessionLocal:
         def __enter__(self):
             return FakeDB()

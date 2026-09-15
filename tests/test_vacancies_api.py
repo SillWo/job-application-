@@ -176,30 +176,44 @@ def test_vacancy_filters_cover_status_date_site_total_and_every_score(
     assert [item["id"] for item in response.json()["items"]] == [ids[expected]]
 
 
-def test_status_filter_groups_rejected_and_error_states(vacancy_api):
+def test_status_filter_groups(vacancy_api):
     client, session_factory, _ = vacancy_api
     with session_factory() as db:
         db.add_all(
             [
-                Vacancy(source="test", site="", external_id="filtered", url="https://example.test/filtered", title="Filtered", state="FILTERED_OUT", data={}),
-                Vacancy(source="test", site="", external_id="failed", url="https://example.test/failed", title="Failed", state="FAILED", data={}),
-                Vacancy(source="test", site="", external_id="unknown-result", url="https://example.test/unknown-result", title="Unknown result", state="UNKNOWN_RESULT", data={}),
-                Vacancy(source="test", site="", external_id="unknown", url="https://example.test/unknown", title="Unknown", state="UNKNOWN", data={}),
+                Vacancy(source="test", site="", external_id="rejected", url="https://example.test/rejected", title="Rejected", state="REJECTED_BY_MODEL", data={}),
+                Vacancy(source="test", site="", external_id="error-one", url="https://example.test/error-one", title="Error one", state="ERROR", data={"error_code": "SUBMISSION_UNCONFIRMED", "error_message": "Не подтверждено"}),
+                Vacancy(source="test", site="", external_id="error-two", url="https://example.test/error-two", title="Error two", state="ERROR", data={"error_code": "MFA_REQUIRED", "error_message": "Нужна проверка"}),
+                Vacancy(source="test", site="", external_id="processing", url="https://example.test/processing", title="Processing", state="EVALUATING", data={}),
             ]
         )
         db.commit()
 
-    rejected = client.get("/api/vacancies", params={"state": "REJECTED_BY_MODEL"})
+    rejected = client.get("/api/vacancies", params={"status_group": "REJECTED"})
     assert rejected.status_code == 200
-    assert {item["state"] for item in rejected.json()["items"]} == {"REJECTED_BY_MODEL", "FILTERED_OUT"}
+    assert {item["state"] for item in rejected.json()["items"]} == {"REJECTED_BY_MODEL"}
 
-    errors = client.get("/api/vacancies", params={"state": "ERROR"})
+    errors = client.get("/api/vacancies", params={"status_group": "ERROR"})
     assert errors.status_code == 200
-    assert {item["state"] for item in errors.json()["items"]} == {"ERROR", "FAILED", "UNKNOWN", "UNKNOWN_RESULT"}
+    assert {item["state"] for item in errors.json()["items"]} == {"ERROR"}
+    assert all(item["status_group"] == "ERROR" for item in errors.json()["items"])
+
+    success = client.get("/api/vacancies", params={"status_group": "SUCCESS"})
+    assert {item["state"] for item in success.json()["items"]} == {"SUBMITTED", "REPORTED"}
+
+    processing = client.get("/api/vacancies", params={"status_group": "PROCESSING"})
+    assert {item["state"] for item in processing.json()["items"]} == {"EVALUATING"}
 
     exact = client.get("/api/vacancies", params={"state": "SUBMITTED"})
     assert exact.status_code == 200
     assert {item["state"] for item in exact.json()["items"]} == {"SUBMITTED"}
+
+    conflicting = client.get(
+        "/api/vacancies", params={"state": "SUBMITTED", "status_group": "ERROR"}
+    )
+    assert conflicting.status_code == 200
+    assert conflicting.json()["items"] == []
+    assert conflicting.json()["total"] == 0
 
 
 @pytest.mark.parametrize(
@@ -293,7 +307,7 @@ def test_new_vacancies_get_platform_and_state_changes_get_a_new_timestamp(vacanc
             external_id="new-platform",
             url="https://example.test/new",
             title="New",
-            state="DISCOVERED",
+            state="EXTRACTED",
             data={},
         )
         explicit_legacy = Vacancy(
@@ -302,7 +316,7 @@ def test_new_vacancies_get_platform_and_state_changes_get_a_new_timestamp(vacanc
             external_id="explicit-legacy",
             url="https://example.test/explicit-legacy",
             title="Explicit legacy",
-            state="DISCOVERED",
+            state="EXTRACTED",
             data={},
         )
         db.add_all([vacancy, explicit_legacy])

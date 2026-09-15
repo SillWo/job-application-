@@ -47,16 +47,18 @@ def test_history_cleanup_preserves_good_history(tmp_path):
 
     _upgrade(path, "head")
     db = sqlite3.connect(path)
-    assert db.execute("select adapter_id from sessions").fetchall() == [("hirehi",)]
-    assert db.execute("select source, state, session_id from vacancies order by source").fetchall() == [("hh", "SUBMITTED", None), ("hirehi", "REPORTED", hirehi)]
+    assert db.execute("select adapter_id from sessions").fetchall() == []
+    assert all(session_id is None for session_id, in db.execute("select session_id from vacancies"))
     assert db.execute("select count(*) from evaluations").fetchone()[0] == 1
-    assert db.execute("select count(*) from browser_events").fetchone()[0] == 1
+    assert db.execute("select count(*) from browser_events").fetchone()[0] == 0
     tables = {row[0] for row in db.execute("select name from sqlite_master where type='table'")}
     assert not {"search_policies", "site_accounts", "employer_contacts"} & tables
     assert not {"policy_id", "resume_url", "resume_path"} & _columns(db, "sessions")
 
     assert "application_limit" in _columns(db, "sessions")
-    assert not {"filename", "data", "resume_path"} & _columns(db, "candidate_profiles")
+    assert not {"candidate_profiles", "resumes", "profile_memory", "session_questions"} & {
+        row[0] for row in db.execute("select name from sqlite_master where type='table'")
+    }
     db.close()
 
 

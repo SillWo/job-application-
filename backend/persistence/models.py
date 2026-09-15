@@ -33,45 +33,9 @@ class SessionFormDraft(Base):
     draft: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
-class CandidateProfile(Base):
-    __tablename__ = "candidate_profiles"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    gender: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    residence: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    job_search_locations: Mapped[list] = mapped_column(JSON, default=list)
-    contacts: Mapped[dict] = mapped_column(JSON, default=dict)
-    education: Mapped[list] = mapped_column(JSON, default=list)
-    languages: Mapped[list] = mapped_column(JSON, default=list)
-    driver_license: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
-
-
-class Resume(Base):
-    __tablename__ = "resumes"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey("candidate_profiles.id"), index=True)
-    name: Mapped[str] = mapped_column(String(255), default="Резюме")
-    desired_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    desired_salary: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    employment_types: Mapped[list] = mapped_column(JSON, default=list)
-    work_formats: Mapped[list] = mapped_column(JSON, default=list)
-    business_trips: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    experiences: Mapped[list] = mapped_column(JSON, default=list)
-    skills: Mapped[list] = mapped_column(JSON, default=list)
-    about: Mapped[str] = mapped_column(Text, default="")
-    selected_for_matching: Mapped[bool] = mapped_column(Boolean, default=True)
-    original_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    original_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
-
-
 class JobSession(Base):
     __tablename__ = "sessions"
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey("candidate_profiles.id"))
     minimum_scores: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     desired_job_description: Mapped[str] = mapped_column(Text, default="")
     preference_policy: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -90,38 +54,92 @@ class JobSession(Base):
     stop_reason: Mapped[str | None] = mapped_column(String(255))
     recovery: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
     guaranteed_application: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
-    questions_collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
-class ProfileMemory(Base):
-    """Private, user-authored facts shared by every adapter; never exposed as a UI catalog."""
-    __tablename__ = "profile_memory"
-    __table_args__ = (UniqueConstraint("profile_id", "memory_key"),)
+class SessionResumeSnapshot(Base):
+    """Temporary normalized resume data owned by one session only.
+
+    The JSON columns contain normalized fields, never raw HTML or downloaded
+    files.  ``private_view`` is used only for local form/letter assembly;
+    ``professional_view`` is the model-facing allowlist.
+    """
+    __tablename__ = "session_resume_snapshots"
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey("candidate_profiles.id"), index=True)
-    memory_key: Mapped[str] = mapped_column(String(64))
-    question: Mapped[str] = mapped_column(Text)
-    answer: Mapped[str] = mapped_column(Text)
-    context: Mapped[dict] = mapped_column(JSON, default=dict)
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    source_site: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_resume_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    professional_view: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # Complete normalized source captured for the local workflow.  This is
+    # optional so rows created before the full-context migration remain
+    # readable through ``snapshot`` + sealed ``private_view``.
+    full_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # DPAPI-encrypted JSON text retained for local form/letter rendering and
+    # backwards compatibility with snapshots created before full_snapshot.
+    private_view: Mapped[str] = mapped_column(Text, nullable=False)
+    # CREATED sessions may be abandoned before start; their private snapshot
+    # has a bounded recovery lifetime. RUNNING/PAUSED snapshots are retained
+    # until the normal terminal cleanup path.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ResumePreviewToken(Base):
+    """Short-lived one-use server-side preview state.
+
+    Only a SHA-256 digest of the bearer token is persisted.  New rows retain
+    the canonical public source URL directly.
+    Preview responses need not return the URL, and it is never written to
+    logs/events.
+    """
+    __tablename__ = "resume_preview_tokens"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    adapter_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    professional_view: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # New previews retain the complete normalized snapshot for the session
+    # created from them.  Older preview rows legitimately have no value.
+    full_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # DPAPI-encrypted JSON text retained for local form/letter rendering.
+    private_view: Mapped[str] = mapped_column(Text, nullable=False)
+    # Canonical public URL for the preview confirmation flow.
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class SessionQuestion(Base):
-    __tablename__ = "session_questions"
-    __table_args__ = (UniqueConstraint("session_id", "memory_key"),)
+class SavedResumeSource(Base):
+    """Durable, privacy-safe pointer to one confirmed site resume per adapter.
+
+    The canonical public URL is intentionally stored openly: it is a public
+    resume link, not a credential.  No resume id, identity, contacts, or private snapshot is stored here; the hashes are
+    only used to detect replacement of the external document during a refresh.
+    """
+
+    __tablename__ = "saved_resume_sources"
+    __table_args__ = (UniqueConstraint("adapter_id", name="uq_saved_resume_sources_adapter"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"), index=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey("candidate_profiles.id"), index=True)
-    vacancy_id: Mapped[int | None] = mapped_column(ForeignKey("vacancies.id"), nullable=True)
-    memory_key: Mapped[str] = mapped_column(String(64))
-    question: Mapped[str] = mapped_column(Text)
-    reason: Mapped[str] = mapped_column(Text, default="")
-    options: Mapped[list] = mapped_column(JSON, default=list)
-    context: Mapped[dict] = mapped_column(JSON, default=dict)
-    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    adapter_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    # User-selected grammatical gender for this confirmed source.  This is a
+    # low-sensitivity enum preference, not imported resume content.
+    grammatical_gender: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Canonical public URL for the user-facing profile.
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Hash only: the external resume id is a bearer-adjacent identifier and is
+    # not needed to render or recover a saved source.
+    resume_id_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    preview: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="valid")
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    changed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
 
 class Notification(Base):
@@ -161,7 +179,7 @@ def _notify_session_status_changes(session: Session, _flush_context, _instances)
         if not history.has_changes() or not history.deleted or not history.added:
             continue
         old, new = history.deleted[0], history.added[0]
-        if old == new or (old == "WAITING_FOR_LOGIN" and new == "RUNNING"):
+        if old == new:
             continue
         launch = old == "CREATED" and new == "RUNNING"
         session.add(
@@ -180,14 +198,17 @@ def _notify_session_status_changes(session: Session, _flush_context, _instances)
         )
 
 
-_VACANCY_NOTIFICATION_STATES = {"ERROR", "UNKNOWN", "NEEDS_REVIEW"}
+_VACANCY_NOTIFICATION_STATES = {"ERROR"}
 
 
 def _vacancy_notification(vacancy: Vacancy) -> Notification:
     status = vacancy.state
     company = f" — {vacancy.company}" if vacancy.company else ""
-    reasons = (vacancy.data or {}).get("application_review_reasons", [])
+    reasons = (vacancy.data or {}).get("application_error_reasons", [])
+    error_message = (vacancy.data or {}).get("error_message")
     detail = "; ".join(reason for reason in reasons[:3] if isinstance(reason, str)) if isinstance(reasons, list) else ""
+    if error_message and isinstance(error_message, str):
+        detail = error_message if not detail else f"{error_message}; {detail}"
     return Notification(
         source_type="vacancy",
         source_id=str(vacancy.id),
@@ -200,7 +221,7 @@ def _vacancy_notification(vacancy: Vacancy) -> Notification:
 
 @event.listens_for(Session, "before_flush")
 def _notify_vacancy_state_changes(session: Session, _flush_context, _instances) -> None:
-    """Notify atomically when a vacancy enters a review-worthy terminal state."""
+    """Notify atomically when a vacancy enters an error terminal state."""
     pending_new = session.info.setdefault("_pending_vacancy_notifications", set())
     for item in session.new:
         if isinstance(item, Vacancy) and item.state in _VACANCY_NOTIFICATION_STATES:
@@ -252,7 +273,7 @@ class Vacancy(Base):
     url: Mapped[str] = mapped_column(String(1000))
     title: Mapped[str] = mapped_column(String(500))
     company: Mapped[str | None] = mapped_column(String(500))
-    state: Mapped[str] = mapped_column(String(40), default="DISCOVERED")
+    state: Mapped[str] = mapped_column(String(40), default="EXTRACTED")
     status_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -288,9 +309,8 @@ class ApplicationPlanRecord(Base):
 
 class Application(Base):
     __tablename__ = "applications"
-    __table_args__ = (UniqueConstraint("candidate_profile_id", "vacancy_id"),)
+    __table_args__ = (UniqueConstraint("vacancy_id", name="uq_applications_vacancy_id"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    candidate_profile_id: Mapped[int] = mapped_column(ForeignKey("candidate_profiles.id"))
     vacancy_id: Mapped[int] = mapped_column(ForeignKey("vacancies.id"))
     status: Mapped[str] = mapped_column(String(40))
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -6,17 +6,7 @@ from backend.intelligence.letter_writer import (
     _finish_cover_letter,
     write_cover_letter,
 )
-from backend.schemas.domain import CoverLetterDraft, JobPosting, ResumeImportData
-
-
-@pytest.mark.asyncio
-async def test_mock_resume_import_extracts_any_desired_title():
-    result = await ModelGateway(provider="mock").structured(
-        "profile",
-        {"resume_text": "Иван Иванов\nЖелаемая должность: Python-разработчик\nОпыт работы"},
-        ResumeImportData,
-    )
-    assert result.resume.desired_title == "Python-разработчик"
+from backend.schemas.domain import CoverLetterDraft, JobPosting
 
 
 @pytest.mark.asyncio

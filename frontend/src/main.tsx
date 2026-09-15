@@ -4,7 +4,6 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter } from 'react-router-dom'
 import App from './App'
 import './styles.css'
-import './upload.css'
 import './local-fonts.css'
 
 const client = new QueryClient({ defaultOptions: { queries: { refetchInterval: 2500, retry: 1 } } })

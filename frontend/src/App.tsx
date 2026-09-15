@@ -1,30 +1,34 @@
-import { ReactNode, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { NavLink, Route, Routes, useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Toaster, toast } from "sonner";
-import { Popover } from "@base-ui/react/popover";
 import { Select } from "@base-ui/react/select";
+import { Popover } from "@base-ui/react/popover";
 import { api } from "./api";
-import { SessionQuestions } from "./SessionQuestions";
 import { useSessionDraft } from "./useSessionDraft";
 import type {
-  Adapter,
-  Degree,
-  Education,
-  EducationType,
-  EmploymentType,
   JobSession,
-  Language,
-  PersonalProfileData,
-  ProfileGender,
-  Profile,
-  Resume,
   ScoreComponent,
   Vacancy,
   VacancyPage,
-  WorkExperience,
   Notification,
+  VacancyStatusGroup,
 } from "./types";
+import {
+  previewFromResponse,
+  purgeLegacyResumeSourceStorage,
+  resumeSourcesFromResponse,
+  sourceRecordFromResponse,
+  RESUME_SITES,
+  questionOptionLabel,
+  isResumeQuestionValid,
+  resumeQuestions,
+  resumeDisplayTitle,
+  safeResumeUrlLabel,
+  publicResumeSourceUrl,
+  type ResumePreview,
+  type ResumeSourceRecord,
+} from "./resumeSources";
 
 const RELEVANCE_CRITERIA: ReadonlyArray<{ key: string; title: string; maxPoints: number; weight: number }> = [
   { key: "tasks", title: "Задачи", maxPoints: 4, weight: 35 },
@@ -77,11 +81,13 @@ function presentationBreakdown(rows: ScoreComponent[]): ScoreComponent[] {
 
 const nav = [["/", "Обзор", "M4 12h16M12 4l8 8-8 8"], ["/profile", "Профиль", "M20 21a8 8 0 0 0-16 0M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8"], ["/session", "Сессия", "M4 6h16M4 12h16M4 18h16"], ["/vacancies", "Вакансии", "M6 3h9l3 3v15H6zM9 12h6M9 16h6"], ["/model", "Модель", "M4 6h16M4 12h16M4 18h16M8 4v4m8 2v4m-5 4v4"]] as const;
 const STATUS_META: Record<string, { label: string; tone: string }> = {
-  CREATED: { label: "Создана", tone: "neutral" }, RUNNING: { label: "В работе", tone: "success" }, DISCOVERED: { label: "Найдена", tone: "neutral" }, EXTRACTED: { label: "Данные получены", tone: "neutral" }, EVALUATING: { label: "Оценка вакансии", tone: "info" }, WAITING_FOR_LOGIN: { label: "Ожидает входа", tone: "warning" }, PAUSED: { label: "Приостановлена", tone: "warning" }, STOPPED: { label: "Остановлена", tone: "neutral" }, COMPLETED: { label: "Завершена", tone: "success" }, FAILED: { label: "Ошибка", tone: "danger" }, UNKNOWN: { label: "Ошибка", tone: "danger" }, UNKNOWN_RESULT: { label: "Ошибка", tone: "danger" }, REJECTED_BY_MODEL: { label: "Отклонена моделью", tone: "danger" }, FILTERED_OUT: { label: "Отклонена моделью", tone: "danger" }, ERROR: { label: "Ошибка", tone: "danger" }, READY_TO_SUBMIT: { label: "Готова к отклику", tone: "success" }, READY_TO_REPORT: { label: "Готова к отчёту", tone: "success" }, SUBMITTED: { label: "Отклик отправлен", tone: "success" }, REPORTED: { label: "В отчёте", tone: "success" }, ALREADY_APPLIED: { label: "Отклик отправлен", tone: "success" }, CONTACT_COLLECTED: { label: "Контакт получен", tone: "neutral" }, NEEDS_REVIEW: { label: "Требует проверки", tone: "warning" }, SKIPPED_TEST: { label: "Тест пропущен", tone: "neutral" }, LETTER_GENERATED: { label: "Письмо подготовлено", tone: "neutral" }, FILLING_FORM: { label: "Заполнение формы", tone: "info" }, SUBMITTING: { label: "Отправка отклика", tone: "info" }, CONNECTED: { label: "Соединение есть", tone: "success" }, DISCONNECTED: { label: "Нет соединения", tone: "danger" },
+  CREATED: { label: "Создана", tone: "neutral" }, RUNNING: { label: "В работе", tone: "success" }, PAUSED: { label: "Приостановлена", tone: "warning" }, STOPPED: { label: "Остановлена", tone: "neutral" }, COMPLETED: { label: "Завершена", tone: "success" }, FAILED: { label: "Ошибка", tone: "danger" },
+  SUCCESS: { label: "Успех", tone: "success" }, PROCESSING: { label: "В процессе", tone: "info" }, REJECTED: { label: "Отклонена", tone: "danger" }, ERROR: { label: "Ошибка", tone: "danger" }, UNCONFIRMED: { label: "Не подтверждено", tone: "warning" },
+  CONNECTED: { label: "Соединение есть", tone: "success" }, DISCONNECTED: { label: "Нет соединения", tone: "danger" },
 };
 type VacancyFilters = {
   search: string;
-  state: string;
+  status_group: string;
   site: string;
   status_date_from: string;
   status_date_to: string;
@@ -104,7 +110,7 @@ type VacancyFilters = {
 };
 const DEFAULT_VACANCY_FILTERS: VacancyFilters = {
   search: "",
-  state: "",
+  status_group: "",
   site: "",
   status_date_from: "",
   status_date_to: "",
@@ -150,24 +156,56 @@ function vacancyExportUrl(filters: VacancyFilters, format: "csv" | "xlsx" | "xml
   return `/api/vacancies/export?${params}`;
 }
 function humanStatus(value: string) { return STATUS_META[value]?.label ?? value.replaceAll("_", " ").toLowerCase(); }
+function safeSessionText(value: string) { return value.replace(/https?:\/\/\S+/giu, "[ссылка скрыта]"); }
+function isCaptchaPause(value: string | null | undefined) { return Boolean(value && /captcha|капч/iu.test(value)); }
+function isAuthorizationPause(value: string | null | undefined) { return Boolean(value && /auth|авторизац|вход|логин|login/iu.test(value)); }
+function pausedSessionMessage(reason: string | null | undefined) {
+  if (isCaptchaPause(reason)) return "Пауза CAPTCHA: пройдите проверку в открытом браузере, затем нажмите «Продолжить».";
+  if (isAuthorizationPause(reason)) return "Пауза авторизации: войдите на площадку в открытом браузере, затем нажмите «Продолжить».";
+  return "Сессия приостановлена. Проверьте CAPTCHA или авторизацию в открытом браузере, затем нажмите «Продолжить».";
+}
 const VACANCY_STATUS_OPTIONS = [
-  { value: "EVALUATING", label: "Оценка вакансии" }, { value: "REJECTED_BY_MODEL", label: "Отклонена моделью" }, { value: "SUBMITTED", label: "Отклик отправлен" }, { value: "REPORTED", label: "В отчёте" }, { value: "ERROR", label: "Ошибка" },
+  { value: "SUCCESS", label: "Успех" }, { value: "PROCESSING", label: "В процессе" }, { value: "REJECTED", label: "Отклонена" }, { value: "UNCONFIRMED", label: "Не подтверждено" }, { value: "ERROR", label: "Ошибка" },
 ] as const;
-function vacancyOutcome(value: string) {
-  if (value === "SUBMITTED") return "Отклик действительно отправлен после положительной оценки вакансии.";
-  if (value === "ALREADY_APPLIED") return "Новый отклик не отправлялся: вы уже откликались на эту вакансию.";
-  if (value === "REJECTED_BY_MODEL" || value === "FILTERED_OUT") return "Модель отклонила вакансию из-за недостаточной релевантности, поэтому отклик не отправлен.";
-  if (["ERROR", "FAILED", "UNKNOWN", "UNKNOWN_RESULT"].includes(value)) return "Отклик не отправлен из-за ошибки обработки вакансии.";
-  if (value === "REPORTED") return "Вакансия добавлена в отчёт, внешний отклик не отправлялся.";
+function vacancyStatusGroup(vacancy: Vacancy): VacancyStatusGroup {
+  const dataErrorCode = typeof vacancy.data?.error_code === "string" ? vacancy.data.error_code : undefined;
+  // Older API responses represented an unknown submission as ERROR. Keep the
+  // outcome-specific status even when the normalized status_group is absent
+  // (or still says ERROR).
+  if (vacancy.error_code === "SUBMISSION_UNCONFIRMED" || dataErrorCode === "SUBMISSION_UNCONFIRMED" || vacancy.state === "SUBMISSION_UNCONFIRMED") return "UNCONFIRMED";
+  if (vacancy.status_group === "SUCCESS" || vacancy.status_group === "PROCESSING" || vacancy.status_group === "REJECTED" || vacancy.status_group === "ERROR" || vacancy.status_group === "UNCONFIRMED") {
+    return vacancy.status_group;
+  }
+  if (["SUBMITTED", "ALREADY_APPLIED", "REPORTED"].includes(vacancy.state)) return "SUCCESS";
+  if (vacancy.state === "REJECTED_BY_MODEL") return "REJECTED";
+  if (vacancy.state === "ERROR" || vacancy.state === "SUBMISSION_UNCONFIRMED") return "ERROR";
+  if (vacancy.state === "UNCONFIRMED") return "UNCONFIRMED";
+  return "PROCESSING";
+}
+function vacancyOutcome(vacancy: Vacancy) {
+  if (vacancy.state === "SUBMITTED") return "Отклик действительно отправлен после положительной оценки вакансии.";
+  if (vacancy.state === "ALREADY_APPLIED") return "Новый отклик не отправлялся: вы уже откликались на эту вакансию.";
+  if (vacancy.state === "REPORTED") return "Вакансия добавлена в отчёт, внешний отклик не отправлялся.";
+  if (vacancyStatusGroup(vacancy) === "REJECTED") return "Модель отклонила вакансию из-за недостаточной релевантности, поэтому отклик не отправлен.";
+  if (vacancyStatusGroup(vacancy) === "ERROR") return "Результат обработки вакансии не подтверждён.";
+  if (vacancyStatusGroup(vacancy) === "UNCONFIRMED") return "Площадка не подтвердила результат отправки; отклик мог быть отправлен.";
   return "Обработка вакансии ещё идёт.";
 }
-function humanRelevanceReason(reason: string, state: string) {
+function vacancyErrorMessage(vacancy: Vacancy): string {
+  const dataErrorCode = typeof vacancy.data?.error_code === "string" ? vacancy.data.error_code : undefined;
+  const dataErrorMessage = typeof vacancy.data?.error_message === "string" ? vacancy.data.error_message : undefined;
+  if (vacancy.error_code === "SUBMISSION_UNCONFIRMED" || dataErrorCode === "SUBMISSION_UNCONFIRMED" || vacancy.state === "SUBMISSION_UNCONFIRMED" || vacancy.state === "UNCONFIRMED" || vacancy.status_group === "UNCONFIRMED") {
+    return "Площадка не подтвердила результат отправки; отклик мог быть отправлен.";
+  }
+  return vacancy.error_message?.trim() || dataErrorMessage?.trim() || "Не удалось завершить обработку вакансии.";
+}
+function humanRelevanceReason(reason: string, group: VacancyStatusGroup) {
   const cleaned = reason.replace(/\s*(?:Ограничения|Restrictions)\s*:.*/is, "").replace(/\s*(?:Evidence не прошло локальную лексическую проверку|grounding warning).*/i, "").trim();
   const legacyGeneric = cleaned === "Оценка вакансии на основе резюме.";
   if (!cleaned || legacyGeneric || /(?:минимум|minimum|score|confidence|evidence|threshold|flag|raw[_ ]?points|raw[_ ]?fields|grounding|локальную лексическую проверку)/i.test(cleaned) || /\d+\s*\/\s*\d+/.test(cleaned)) {
-    if (["SUBMITTED", "ALREADY_APPLIED", "REPORTED"].includes(state)) return "Вакансия в целом соответствует вашему профилю.";
-    if (["ERROR", "FAILED"].includes(state)) return "Вакансия оценена по резюме, но обработка не завершилась.";
-    return ["REJECTED_BY_MODEL", "FILTERED_OUT"].includes(state) ? "Вакансия недостаточно релевантна вашему профилю." : "Вакансия оценена по вашему резюме.";
+    if (group === "SUCCESS") return "Вакансия в целом соответствует вашему профилю.";
+    if (group === "ERROR") return "Вакансия оценена по резюме, но обработка не завершилась.";
+    return group === "REJECTED" ? "Вакансия недостаточно релевантна вашему профилю." : "Вакансия оценена по вашему резюме.";
   }
   return cleaned;
 }
@@ -175,8 +213,8 @@ function humanCriterionExplanation(explanation: string) {
   const cleaned = explanation.replace(/\s*(?:Evidence не прошло локальную лексическую проверку|grounding warning).*/i, "").trim();
   return !cleaned || /(?:минимум|minimum|score|confidence|evidence|threshold|flag|raw[_ ]?points|raw[_ ]?fields|grounding)/i.test(cleaned) || /\d+\s*\/\s*\d+/.test(cleaned) ? "По этому критерию дополнительных пояснений нет." : cleaned;
 }
-function humanModelSummary(reason: string, state: string, rows: ScoreComponent[]) {
-  const cleanedReason = humanRelevanceReason(reason, state);
+function humanModelSummary(reason: string, group: VacancyStatusGroup, rows: ScoreComponent[]) {
+  const cleanedReason = humanRelevanceReason(reason, group);
   const legacy = reason.trim() === "Оценка вакансии на основе резюме." || cleanedReason === "Вакансия оценена по вашему резюме." || cleanedReason === "Вакансия недостаточно релевантна вашему профилю.";
   if (!legacy) return cleanedReason;
   const meaningful = rows
@@ -244,9 +282,6 @@ function Title({
 function ChevronIcon({ className = "" }: { className?: string }) {
   return <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m6 9 6 6 6-6" /></svg>;
 }
-function CloseIcon() {
-  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true" focusable="false"><path d="m6 6 12 12M18 6 6 18" /></svg>;
-}
 function Empty({ title = "Пока пусто", children, action, className = "" }: { title?: string; children: ReactNode; action?: ReactNode; className?: string }) {
   return (
     <div className={`empty ${className}`}>
@@ -280,109 +315,6 @@ function OverviewIcon({ name }: { name: OverviewIconName }) {
   return <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d={paths[name]} /></svg>;
 }
 
-function Dashboard() {
-  const profiles = useQuery({
-    queryKey: ["profiles"],
-    queryFn: () => api<Profile[]>("/profiles"),
-  });
-  const dashboardProfile = profiles.data?.[0];
-  const dashboardResumes = useQuery({
-    queryKey: ["dashboard-resumes", dashboardProfile?.id],
-    queryFn: () => api<Resume[]>(`/profiles/${dashboardProfile?.id}/resumes`),
-    enabled: Boolean(dashboardProfile),
-  });
-  const sessions = useQuery({
-    queryKey: ["sessions"],
-    queryFn: () => api<JobSession[]>("/sessions"),
-  });
-  const modelStatus = useQuery({
-    queryKey: ["model-status"],
-    queryFn: () => api<{ connected: boolean; model_available: boolean; model: string }>("/model/status"),
-    retry: false,
-  });
-  const active = sessions.data?.[0];
-  const hasProfile = Boolean(profiles.data?.length);
-  const hasResume = Boolean(dashboardResumes.data?.some((resume) => resume.selected_for_matching));
-  const activeStatus = active ? humanStatus(active.status) : "Нет сессии";
-  const primaryHref = hasResume ? "/session" : "/profile";
-  const primaryLabel = hasResume ? "Запустить сессию" : "Настроить профиль";
-  const secondaryHref = "/model";
-  const secondaryLabel = "Добавить API модели";
-  const sessionReady = Boolean(active && ["RUNNING", "EVALUATING", "CREATED"].includes(active.status));
-  return <div className="overview-page">
-    <section className="overview-hero-section" aria-labelledby="overview-title">
-      <div className="overview-container overview-hero">
-        <div className="overview-copy">
-          <span className="overview-eyebrow">JOB ORCHESTRATOR · ЦЕНТР ПОИСКА</span>
-          <h1 id="overview-title">Меньше шума.<br />Больше <em>подходящих</em> вакансий.</h1>
-          <p>Соберите профиль один раз, а затем поручите ИИ найти и разобрать вакансии по заданным критериям и лимитам. Вы наблюдаете за процессом и управляете условиями поиска.</p>
-          <div className="overview-actions">
-            <NavLink className="button-link overview-primary overview-quiet-control" to={primaryHref}>{primaryLabel} <OverviewIcon name="arrow" /></NavLink>
-            <NavLink className="overview-text-link overview-quiet-link" to={secondaryHref}>{secondaryLabel}</NavLink>
-          </div>
-          <div className="overview-status-strip" aria-label="Готовность к поиску">
-            <span className={modelStatus.data?.connected && modelStatus.data.model_available ? "is-done" : ""}><OverviewIcon name="check" />API модели {modelStatus.data?.connected && modelStatus.data.model_available ? "добавлен" : "не добавлен"}</span>
-            <span className={hasProfile ? "is-done" : ""}><OverviewIcon name="check" />Профиль {hasProfile ? "заполнен" : "не настроен"}</span>
-            <span className={hasResume ? "is-done" : ""}><OverviewIcon name="check" />Резюме {hasResume ? "выбрано" : "не выбрано"}</span>
-            <span><i key={`status-pulse-strip-${active?.status ?? "none"}`} className={sessionReady ? "overview-status-pulse" : ""} />Сессия {activeStatus.toLowerCase()}</span>
-          </div>
-        </div>
-        <div className="overview-preview" aria-label="Статус рабочего процесса">
-          <div className="preview-top"><span key={`status-pulse-preview-${active?.status ?? "none"}`} className={`preview-dot${sessionReady ? " overview-status-pulse" : ""}`} />Рабочий процесс <span className="preview-live">{activeStatus}</span></div>
-          <div className="preview-job"><span className="preview-logo">J</span><div><strong>Подходящие вакансии</strong><small>Оценка по профилю и условиям сессии</small></div><b>{sessionReady ? "Оценивает" : active ? activeStatus : hasResume ? "Готово к запуску" : "Нужно настроить"}</b></div>
-          <div className="preview-lines">
-            <div className="preview-line"><i className={hasProfile ? "is-done" : ""}>{hasProfile ? "✓" : "1"}</i><span>Личный профиль</span><small>{hasProfile ? "Заполнен" : "Нужно настроить"}</small></div>
-            <div className="preview-line"><i className={hasResume ? "is-done" : ""}>{hasResume ? "✓" : "2"}</i><span>Выбранное резюме</span><small>{hasResume ? "Готово к оценке" : "Выберите резюме"}</small></div>
-            <div className="preview-line"><i className={sessionReady ? "is-done" : ""}>{sessionReady ? "✓" : "3"}</i><span>Наблюдение за сессией</span><small>{active ? activeStatus : "Настройте критерии и лимиты"}</small></div>
-          </div>
-          <div className="preview-proof">
-            <div className="preview-proof-head"><div><span>Вакансия на проверке</span><h2>Продуктовая роль</h2><p>Сопоставление с выбранным резюме</p></div><b>Разбор</b></div>
-            <div className="preview-proof-list">
-              <div><OverviewIcon name="fileCheck" /><p><strong>Опыт и задачи</strong><span>ИИ ищет подтверждение требований в опыте кандидата.</span></p></div>
-              <div><OverviewIcon name="sliders" /><p><strong>Критерии сессии</strong><span>Формат, роль и ограничения учитываются при оценке.</span></p></div>
-              <div><OverviewIcon name="scan" /><p><strong>Результат для просмотра</strong><span>Причины соответствия остаются видимыми пользователю.</span></p></div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-  </div>;
-}
-
-const blankPersonal: Omit<PersonalProfileData, "resumes"> = {
-  full_name: "",
-  gender: null,
-  residence: "",
-  job_search_locations: [],
-  contacts: { phone: "", email: "", messengers: [] },
-  education: [],
-  languages: [],
-  driver_license: false,
-};
-
-const employmentOptions: Array<[EmploymentType, string]> = [
-  ["permanent", "Постоянная работа"],
-  ["internship", "Стажировка"],
-  ["part_time", "Подработка"],
-  ["volunteering", "Волонтёрство"],
-];
-const formatOptions: Array<[string, string]> = [
-  ["hybrid", "Гибрид"],
-  ["remote", "Удалённо"],
-  ["office", "Офис"],
-  ["traveling", "Разъездная"],
-  ["shift", "Вахта"],
-];
-const educationOptions: Array<[EducationType, string]> = [
-  ["higher", "Высшее"],
-  ["secondary_vocational", "Среднее специальное"],
-  ["school", "Школьное"],
-];
-const genderOptions: Array<[string, string]> = [
-  ["male", "Мужской"],
-  ["female", "Женский"],
-];
-
 function SingleSelect({ options, value, onValueChange, label, placeholder, className, disabled }: { options: ReadonlyArray<readonly [string, string]>; value: string; onValueChange: (value: string) => void; label: string; placeholder?: string; className?: string; disabled?: boolean }) {
   return <div className={`single-select ${className ?? ""}`}>
     <span className="single-select-label">{label}</span>
@@ -396,135 +328,6 @@ function SingleSelect({ options, value, onValueChange, label, placeholder, class
       </Select.List></Select.Popup></Select.Positioner></Select.Portal>
     </Select.Root>
   </div>;
-}
-
-function newEducation(type: EducationType = "higher"): Education {
-  return { type, institution: "", faculty: "", specialty: "", start_date: "", end_date: "", degree: null };
-}
-function newExperience(): WorkExperience {
-  return { company: "", position: "", start_date: "", end_date: "", duties: "" };
-}
-function newResume(profileId: number): Resume {
-  return {
-    id: 0,
-    profile_id: profileId,
-    name: "Новое резюме",
-    desired_title: "",
-    desired_salary: "",
-    employment_types: [],
-    work_formats: [],
-    business_trips: null,
-    experiences: [],
-    skills: [],
-    about: "",
-    selected_for_matching: false,
-  };
-}
-
-function PersonalEditor({
-  value,
-  onChange,
-  onSave,
-  saving,
-  submitLabel = "Сохранить личный профиль",
-}: {
-  value: Omit<PersonalProfileData, "resumes">;
-  onChange: (value: Omit<PersonalProfileData, "resumes">) => void;
-  onSave: () => void;
-  saving: boolean;
-  submitLabel?: string;
-}) {
-  const change = <K extends keyof Omit<PersonalProfileData, "resumes">>(key: K, next: Omit<PersonalProfileData, "resumes">[K]) =>
-    onChange({ ...value, [key]: next });
-  const changeEducation = (index: number, next: Partial<Education>) => {
-    const education = value.education.map((item, itemIndex) => itemIndex === index ? { ...item, ...next } : item);
-    change("education", education);
-  };
-  const changeLanguage = (index: number, next: Partial<Language>) => {
-    const languages = value.languages.map((item, itemIndex) => itemIndex === index ? { ...item, ...next } : item);
-    change("languages", languages);
-  };
-  return (
-    <article className="panel form profile-personal">
-      <div className="panelhead">
-        <div><span className="eyebrow">БЛОК 1</span><h2>Личная информация</h2></div>
-        <span className="profile-progress">Профиль кандидата</span>
-      </div>
-      <div className="form-content">
-      <div className="profile-pair-row">
-        <label className="profile-field">ФИО<input value={value.full_name ?? ""} onChange={(e) => change("full_name", e.target.value)} /></label>
-        <label className="profile-field">Место проживания<input value={value.residence ?? ""} onChange={(e) => change("residence", e.target.value)} /></label>
-      </div>
-      <div className="profile-pair-row">
-        <SingleSelect className="profile-field" label="Пол соискателя" placeholder="Выберите пол" options={genderOptions} value={value.gender ?? ""} onValueChange={(next) => change("gender", next as ProfileGender)} />
-      </div>
-      <label className="profile-full-field">Где ищу работу<input value={value.job_search_locations.join(", ")} onChange={(e) => change("job_search_locations", e.target.value.split(",").map((item) => item.trim()).filter(Boolean))} placeholder="Города или направления через запятую" /></label>
-      <div className="subsection form-rail">
-        <div className="section-heading"><div><h3>Контакты</h3><small>Телефон, email и список мессенджеров.</small></div><button type="button" className="secondary" onClick={() => change("contacts", { ...value.contacts, messengers: [...value.contacts.messengers, ""] })}>+ Мессенджер</button></div>
-        <div className="repeat-list">
-          <div className="profile-pair-row"><label className="profile-field">Телефон<input aria-label="Телефон" value={value.contacts.phone ?? ""} onChange={(e) => change("contacts", { ...value.contacts, phone: e.target.value })} /></label><label className="profile-field">Email<input aria-label="Email" value={value.contacts.email ?? ""} onChange={(e) => change("contacts", { ...value.contacts, email: e.target.value })} /></label></div>
-          {value.contacts.messengers.map((messenger, index) => <div className="profile-remove-row animated-repeat-item" key={index}><input className="profile-field" aria-label={`Мессенджер ${index + 1}`} value={messenger} onChange={(e) => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.map((item, itemIndex) => itemIndex === index ? e.target.value : item) })} placeholder="Telegram, WhatsApp или другой мессенджер" /><button type="button" className="icon-button" aria-label={`Удалить мессенджер ${index + 1}`} onClick={(event) => delayedRemove(event, (currentIndex) => change("contacts", { ...value.contacts, messengers: value.contacts.messengers.filter((_, itemIndex) => itemIndex !== currentIndex) }))}><CloseIcon /></button></div>)}
-        </div>
-      </div>
-      <div className="subsection form-rail">
-        <div className="section-heading"><div><h3>Образование</h3><small>Выберите тип для каждого учебного заведения.</small></div><button type="button" className="secondary" onClick={() => change("education", [...value.education, newEducation()])}>+ Образование</button></div>
-        <div className="repeat-list">
-          {value.education.map((item, index) => <div className="nested-card education-card animated-repeat-item" key={index}>
-            <div className="profile-remove-row profile-education-header"><SingleSelect label={`Тип образования ${index + 1}`} options={educationOptions} value={item.type} onValueChange={(next) => changeEducation(index, { type: next as EducationType })} /><button type="button" className="icon-button" aria-label={`Удалить образование ${index + 1}`} onClick={(event) => delayedRemove(event, (currentIndex) => change("education", value.education.filter((_, itemIndex) => itemIndex !== currentIndex)))}><CloseIcon /></button></div>
-            <div className={item.type === "school" ? "profile-full-field" : "profile-pair-row"}>
-              <label className="profile-field">{item.type === "higher" ? "Университет" : "Учебное заведение"}<input value={item.institution} onChange={(e) => changeEducation(index, { institution: e.target.value })} /></label>
-              {item.type !== "school" && <label className="profile-field">Факультет<input value={item.faculty ?? ""} onChange={(e) => changeEducation(index, { faculty: e.target.value })} /></label>}
-            </div>
-            {item.type === "higher" && <SingleSelect label="Степень" placeholder="Выберите степень" options={[["bachelor", "Бакалавр"], ["master", "Магистр"], ["specialist", "Специалист"], ["postgraduate", "Аспирант"]]} value={item.degree ?? ""} onValueChange={(next) => changeEducation(index, { degree: (next || null) as Degree | null })} />}
-            {item.type !== "school" && <label className="profile-full-field">Специальность<input value={item.specialty ?? ""} onChange={(e) => changeEducation(index, { specialty: e.target.value })} /></label>}
-            <div className="profile-pair-row"><label className="profile-field">Дата начала обучения<input type="month" value={item.start_date ?? ""} onChange={(e) => changeEducation(index, { start_date: e.target.value || null })} /></label><label className="profile-field">Дата окончания обучения<input type="month" value={item.end_date ?? ""} onChange={(e) => changeEducation(index, { end_date: e.target.value || null })} /></label></div>
-          </div>)}
-        </div>
-      </div>
-      <div className="subsection form-rail">
-        <div className="section-heading"><div><h3>Языки</h3><small>Язык и уровень владения.</small></div><button type="button" className="secondary" onClick={() => change("languages", [...value.languages, { language: "", proficiency: "" }])}>+ Язык</button></div>
-          <div className="repeat-list">{value.languages.map((language, index) => <div className="profile-pair-remove-row animated-repeat-item" key={index}><input className="profile-field" aria-label={`Язык ${index + 1}`} value={language.language} onChange={(e) => changeLanguage(index, { language: e.target.value })} placeholder="Например, английский" /><input className="profile-field" aria-label={`Уровень языка ${index + 1}`} value={language.proficiency} onChange={(e) => changeLanguage(index, { proficiency: e.target.value })} placeholder="Например, B2" /><button type="button" className="icon-button" aria-label={`Удалить язык ${index + 1}`} onClick={(event) => delayedRemove(event, (currentIndex) => change("languages", value.languages.filter((_, itemIndex) => itemIndex !== currentIndex)))}><CloseIcon /></button></div>)}</div>
-      </div>
-      <label className="checkline"><input type="checkbox" checked={value.driver_license ?? false} onChange={(e) => change("driver_license", e.target.checked)} /> Есть водительские права</label>
-      <div className="actions sticky-actions profile-save-bar"><button type="button" className="primary" onClick={onSave} disabled={saving || !value.gender}>{saving ? "Сохраняю…" : submitLabel}</button>{!value.gender && <small role="alert">Выберите пол соискателя, чтобы сохранить профиль.</small>}</div>
-      </div>
-    </article>
-  );
-}
-
-function MultiSelect({
-  label,
-  hint,
-  options,
-  values,
-  onToggle,
-}: {
-  label: string;
-  hint?: string;
-  options: ReadonlyArray<readonly [string, string]>;
-  values: string[];
-  onToggle: (value: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const listId = useId();
-  const selectedLabels = options.filter(([value]) => values.includes(value)).map(([, optionLabel]) => optionLabel);
-  return <Popover.Root open={open} onOpenChange={setOpen}>
-  <div className="multi-select field-wide">
-    <Popover.Trigger render={<button type="button" className="multi-select-trigger" aria-label={label} aria-controls={listId} />}>
-      <span className="multi-select-trigger-copy"><span className="multi-select-label">{label}</span><span className="multi-select-value">{selectedLabels.join(", ") || "Выберите варианты"}</span></span>
-      <ChevronIcon className={`multi-select-chevron${open ? " is-open" : ""}`} />
-    </Popover.Trigger>
-    {hint && <small className="multi-select-hint">{hint}</small>}
-    <Popover.Portal><Popover.Positioner className="multi-select-positioner"><Popover.Popup className="multi-select-popover" id={listId}>
-      <div className="multi-select-options">
-        {options.map(([value, optionLabel]) => <label className={`multi-select-option${values.includes(value) ? " is-selected" : ""}`} key={value}>
-          <input type="checkbox" checked={values.includes(value)} onChange={() => onToggle(value)} />
-          <span>{optionLabel}</span>
-        </label>)}
-      </div>
-      <button type="button" className="multi-select-confirm" onClick={() => setOpen(false)}>Выбрать</button>
-    </Popover.Popup></Popover.Positioner></Popover.Portal>
-  </div></Popover.Root>;
 }
 
 export function Notifications() {
@@ -580,91 +383,271 @@ export function Notifications() {
     </Popover.Popup></Popover.Positioner></Popover.Portal>
   </div></Popover.Root>;
 }
-function delayedRemove(event: React.MouseEvent<HTMLButtonElement>, remove: (currentIndex: number) => void) {
-  const button = event.currentTarget;
-  const item = button.closest<HTMLElement>(".animated-repeat-item");
-  if (!item || item.dataset.removing === "true") return;
-  const getCurrentIndex = () => {
-    const parent = item.parentElement;
-    return parent ? Array.from(parent.children).filter((child) => child.classList.contains("animated-repeat-item")).indexOf(item) : -1;
-  };
-  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) { remove(getCurrentIndex()); return; }
-  item.dataset.removing = "true"; item.classList.add("is-removing"); button.disabled = true;
-  window.setTimeout(() => remove(getCurrentIndex()), 120);
+async function fetchResumeSources(): Promise<Record<string, ResumeSourceRecord>> {
+  return resumeSourcesFromResponse(await api<unknown>("/resume-sources"));
 }
 
-function ResumeEditor({ value, onSave, onCancel, saving }: { value: Resume; onSave: (value: Resume) => void; onCancel: () => void; saving: boolean }) {
-  const [draft, setDraft] = useState(value);
-  const [skillsText, setSkillsText] = useState(value.skills.join(", "));
-  useEffect(() => { setDraft(value); setSkillsText(value.skills.join(", ")); }, [value]);
-  const wordCount = draft.about.trim() ? draft.about.trim().split(/\s+/u).length : 0;
-  const update = (next: Partial<Resume>) => setDraft((current) => ({ ...current, ...next }));
-  const toggleEmployment = (type: EmploymentType) => update({ employment_types: draft.employment_types.includes(type) ? draft.employment_types.filter((item) => item !== type) : [...draft.employment_types, type] });
-  const updateExperience = (index: number, next: Partial<WorkExperience>) => update({ experiences: draft.experiences.map((item, itemIndex) => itemIndex === index ? { ...item, ...next } : item) });
-  return <article className="panel form resume-editor">
-    <div className="panelhead"><div><span className="eyebrow">БЛОК 2</span><h2>{draft.id ? "Редактирование резюме" : "Новое резюме"}</h2></div><button type="button" className="icon-button" onClick={onCancel} aria-label="Закрыть редактор резюме"><CloseIcon /></button></div>
-    <div className="form-content">
-    <label className="field-medium">Название резюме<input value={draft.name} onChange={(e) => update({ name: e.target.value })} placeholder="Например, Product Manager" /></label>
-    <div className="row form-row"><label className="field-medium">Предполагаемая должность<input value={draft.desired_title ?? ""} onChange={(e) => update({ desired_title: e.target.value })} /></label><label className="field-compact">Желаемый доход<input value={draft.desired_salary ?? ""} onChange={(e) => update({ desired_salary: e.target.value })} placeholder="Например, 180 000 ₽" /></label></div>
-    <MultiSelect label="Желаемый тип занятости" options={employmentOptions} values={draft.employment_types} onToggle={(type) => toggleEmployment(type as EmploymentType)} />
-    <MultiSelect label="Формат работы" hint="Можно выбрать несколько вариантов." options={formatOptions} values={draft.work_formats} onToggle={(format) => update({ work_formats: draft.work_formats.includes(format) ? draft.work_formats.filter((item) => item !== format) : [...draft.work_formats, format] })} />
-    <SingleSelect className="field-compact" label="Командировки" placeholder="Выберите вариант" options={[["can", "Могу"], ["cannot", "Не могу"]]} value={draft.business_trips === null || draft.business_trips === undefined ? "" : draft.business_trips ? "can" : "cannot"} onValueChange={(next) => update({ business_trips: next === "" ? null : next === "can" })} />
-    <div className="subsection form-rail"><div className="section-heading"><div><h3>Опыт работы</h3><small>Добавьте должности и обязанности.</small></div><button type="button" className="secondary" onClick={() => update({ experiences: [...draft.experiences, newExperience()] })}>+ Опыт</button></div><div className="repeat-list">{draft.experiences.map((experience, index) => <div className="nested-card experience-card animated-repeat-item" key={index}><div className="repeat-row"><strong>Опыт #{index + 1}</strong><button type="button" className="icon-button" aria-label={`Удалить опыт ${index + 1}`} onClick={(event) => delayedRemove(event, (currentIndex) => update({ experiences: draft.experiences.filter((_, itemIndex) => itemIndex !== currentIndex) }))}><CloseIcon /></button></div><div className="row form-row"><label className="field-medium">Компания<input value={experience.company} onChange={(e) => updateExperience(index, { company: e.target.value })} /></label><label className="field-medium">Должность<input value={experience.position} onChange={(e) => updateExperience(index, { position: e.target.value })} /></label></div><div className="row form-row"><label className="field-compact">Начало работы<input type="month" value={experience.start_date ?? ""} onChange={(e) => updateExperience(index, { start_date: e.target.value || null })} /></label><label className="field-compact">Конец работы<input type="month" value={experience.end_date ?? ""} onChange={(e) => updateExperience(index, { end_date: e.target.value || null })} placeholder="Оставьте пустым, если работаете сейчас" /></label></div><label className="field-prose">Описание обязанностей<textarea className="experience-duties" aria-label={`Описание обязанностей ${index + 1}`} value={experience.duties} onChange={(e) => updateExperience(index, { duties: e.target.value })} /></label></div>)}</div></div>
-    <label className="field-wide">Навыки<small>Введите навыки через запятую — каждый станет отдельным тегом.</small><input value={skillsText} onChange={(e) => setSkillsText(e.target.value)} placeholder="CustDev, Scrum, аналитика" /></label>
-    <div className="tag-list field-wide" aria-label="Навыки">{skillsText.split(",").map((skill) => skill.trim()).filter(Boolean).map((skill) => <span className="tag" key={skill}>{skill}</span>)}</div>
-    <label className="field-prose">О себе<textarea className="about-text" value={draft.about} onChange={(e) => { const words = e.target.value.trim() ? e.target.value.trim().split(/\s+/u) : []; if (words.length <= 500) update({ about: e.target.value }); }} /><small className={wordCount > 500 ? "word-limit" : ""}>{wordCount} / 500 слов</small></label>
-    <div className="actions form-rail sticky-actions"><button type="button" className="primary" onClick={() => onSave({ ...draft, skills: skillsText.split(",").map((skill) => skill.trim()).filter(Boolean) })} disabled={saving}>{saving ? "Сохраняю…" : "Сохранить резюме"}</button><button type="button" className="secondary" onClick={onCancel}>Отмена</button></div>
-    </div>
+function Dashboard() {
+  const resumeSourcesQuery = useQuery({
+    queryKey: ["resume-sources"],
+    queryFn: () => fetchResumeSources(),
+    staleTime: 30_000,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+  });
+  const resumeSources = resumeSourcesQuery.data ?? {};
+  const sessions = useQuery({
+    queryKey: ["sessions"],
+    queryFn: () => api<JobSession[]>("/sessions"),
+  });
+  const modelStatus = useQuery({
+    queryKey: ["model-status"],
+    queryFn: () => api<{ connected: boolean; model_available: boolean; model: string }>("/model/status"),
+    retry: false,
+  });
+  const active = sessions.data?.[0];
+  const hasProfile = Object.keys(resumeSources).length > 0;
+  // Presence of a confirmed durable record is enough to keep the resume
+  // available in the workflow. Launch performs the only fresh availability
+  // check, so an unavailable record must not look deleted here.
+  const hasResume = Object.values(resumeSources).some((source) => source.confirmed);
+  const activeStatus = active ? humanStatus(active.status) : "Нет сессии";
+  const primaryHref = hasResume ? "/session" : "/profile";
+  const primaryLabel = hasResume ? "Запустить сессию" : "Настроить профиль";
+  const secondaryHref = "/model";
+  const secondaryLabel = "Добавить API модели";
+  const sessionReady = Boolean(active && ["RUNNING", "EVALUATING", "CREATED"].includes(active.status));
+  return <div className="overview-page">
+    <section className="overview-hero-section" aria-labelledby="overview-title">
+      <div className="overview-container overview-hero">
+        <div className="overview-copy">
+          <span className="overview-eyebrow">JOB ORCHESTRATOR · ЦЕНТР ПОИСКА</span>
+          <h1 id="overview-title">Меньше шума.<br />Больше <em>подходящих</em> вакансий.</h1>
+          <p>Добавьте ссылки на резюме с площадок, а затем поручите ИИ найти и разобрать вакансии по заданным критериям и лимитам. Вы наблюдаете за процессом и управляете условиями поиска.</p>
+          <div className="overview-actions">
+            <NavLink className="button-link overview-primary overview-quiet-control" to={primaryHref}>{primaryLabel} <OverviewIcon name="arrow" /></NavLink>
+            <NavLink className="overview-text-link overview-quiet-link" to={secondaryHref}>{secondaryLabel}</NavLink>
+          </div>
+          <div className="overview-status-strip" aria-label="Готовность к поиску">
+            <span className={modelStatus.data?.connected && modelStatus.data.model_available ? "is-done" : ""}><OverviewIcon name="check" />API модели {modelStatus.data?.connected && modelStatus.data.model_available ? "добавлен" : "не добавлен"}</span>
+            <span className={hasProfile ? "is-done" : ""}><OverviewIcon name="check" />Источники {hasProfile ? "добавлены" : "не настроены"}</span>
+            <span className={hasResume ? "is-done" : ""}><OverviewIcon name="check" />Резюме {hasResume ? "подтверждено" : "не подтверждено"}</span>
+            <span><i key={`status-pulse-strip-${active?.status ?? "none"}`} className={sessionReady ? "overview-status-pulse" : ""} />Сессия {activeStatus.toLowerCase()}</span>
+          </div>
+        </div>
+        <div className="overview-preview" aria-label="Статус рабочего процесса">
+          <div className="preview-top"><span key={`status-pulse-preview-${active?.status ?? "none"}`} className={`preview-dot${sessionReady ? " overview-status-pulse" : ""}`} />Рабочий процесс <span className="preview-live">{activeStatus}</span></div>
+          <div className="preview-job"><span className="preview-logo">J</span><div><strong>Подходящие вакансии</strong><small>Оценка по резюме и условиям сессии</small></div><b>{sessionReady ? "Оценивает" : active ? activeStatus : hasResume ? "Готово к запуску" : "Нужно настроить"}</b></div>
+          <div className="preview-lines">
+            <div className="preview-line"><i className={hasProfile ? "is-done" : ""}>{hasProfile ? "✓" : "1"}</i><span>Источники резюме</span><small>{hasProfile ? "Добавлены" : "Нужно настроить"}</small></div>
+            <div className="preview-line"><i className={hasResume ? "is-done" : ""}>{hasResume ? "✓" : "2"}</i><span>Подтверждённое резюме</span><small>{hasResume ? "Готово к оценке" : "Добавьте ссылку"}</small></div>
+            <div className="preview-line"><i className={sessionReady ? "is-done" : ""}>{sessionReady ? "✓" : "3"}</i><span>Наблюдение за сессией</span><small>{active ? activeStatus : "Настройте критерии и лимиты"}</small></div>
+          </div>
+          <div className="preview-proof">
+            <div className="preview-proof-head"><div><span>Вакансия оценивается</span><h2>Продуктовая роль</h2><p>Сопоставление с выбранным резюме</p></div><b>Разбор</b></div>
+            <div className="preview-proof-list">
+              <div><OverviewIcon name="fileCheck" /><p><strong>Опыт и задачи</strong><span>ИИ ищет подтверждение требований в опыте кандидата.</span></p></div>
+              <div><OverviewIcon name="sliders" /><p><strong>Критерии сессии</strong><span>Формат, роль и ограничения учитываются при оценке.</span></p></div>
+              <div><OverviewIcon name="scan" /><p><strong>Результат для просмотра</strong><span>Причины соответствия остаются видимыми пользователю.</span></p></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>;
+}
+
+function resumeSite(adapterId: string) {
+  return RESUME_SITES.find((site) => site.id === adapterId) ?? RESUME_SITES[0];
+}
+
+function resumeEditUrl(adapterId: string): string {
+  // Keep the action useful without putting the bearer resume URL (or its
+  // opaque id) into the DOM, session storage, telemetry, or copied markup.
+  return adapterId === "hh"
+    ? "https://hh.ru/applicant/resumes"
+    : adapterId === "hirehi"
+      ? "https://hirehi.ru/profile/resumes"
+      : "https://zarplata.ru/profile/resumes";
+}
+
+function isAllowedResumeUrl(adapterId: string, raw: string): boolean {
+  try {
+    const url = new URL(raw.trim());
+    // The adapter canonicalizes fragments and harmless tracking parameters;
+    // the client still rejects credentials/ports before any network request.
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return false;
+    const host = url.hostname.toLowerCase();
+    const hostAllowed = adapterId === "hh"
+      ? host === "hh.ru" || host.endsWith(".hh.ru")
+      : adapterId === "hirehi" ? host === "hirehi.ru" || host === "www.hirehi.ru" : host === "zarplata.ru" || host.endsWith(".zarplata.ru");
+    return hostAllowed && /^\/resume\/[^/]+\/?$/u.test(url.pathname);
+  } catch { return false; }
+}
+
+function sanitizeResumePreview(preview: ResumePreview): ResumePreview {
+  const { source_resume_id: _sourceResumeId, source_edit_url: _sourceEditUrl, ...safePreview } = preview;
+  void _sourceResumeId;
+  void _sourceEditUrl;
+  return safePreview;
+}
+
+function sourceStatusLabel(record: ResumeSourceRecord | undefined, checking = false): string {
+  if (checking) return "Проверяем…";
+  if (!record) return "Не настроено";
+  return record.status === "changed" ? "Обновлено" : record.status === "unavailable" ? "Недоступно" : "Актуально";
+}
+
+function ResumePreviewCard({ adapterId, record, checking, onConfirmed, onPreferenceChange, onRemoved }: { adapterId: string; record: ResumeSourceRecord | undefined; checking?: boolean; onConfirmed: (record: ResumeSourceRecord) => void; onPreferenceChange: (adapterId: string, grammaticalGender: "male" | "female") => Promise<void>; onRemoved: (adapterId: string) => void }) {
+  const site = resumeSite(adapterId);
+  const [url, setUrl] = useState("");
+  const savedPreview = record?.preview && Object.keys(record.preview).length > 0 ? record.preview : null;
+  const [preview, setPreview] = useState<ResumePreview | null>(savedPreview);
+  const [token, setToken] = useState("");
+  const [consent, setConsent] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [deletePending, setDeletePending] = useState(false);
+  const [resumeAnswers, setResumeAnswers] = useState<Record<string, string>>(() => {
+    const answers: Record<string, string> = {};
+    if (record?.grammaticalGender) answers.grammatical_gender = record.grammaticalGender;
+    return answers;
+  });
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!editing) {
+      setPreview(record?.preview && Object.keys(record.preview).length > 0 ? record.preview : null);
+      setResumeAnswers(record?.grammaticalGender ? { grammatical_gender: record.grammaticalGender } : {});
+    }
+  }, [record?.adapterId, record?.checkedAt, record?.status, record?.preview, record?.grammaticalGender, editing]);
+  const previewMutation = useMutation({
+    mutationFn: () => {
+      if (!isAllowedResumeUrl(adapterId, url)) throw new Error(`Укажите безопасную прямую ссылку на резюме ${site.label} (HTTPS, без параметров).`);
+      return api<{ preview_token: string; preview?: ResumePreview; public_preview?: ResumePreview; source?: ResumePreview }>("/resume-sources/preview", { method: "POST", body: JSON.stringify({ adapter_id: adapterId, resume_url: url.trim() }) });
+    },
+    onSuccess: (result) => {
+      const nextPreview = sanitizeResumePreview(previewFromResponse(result));
+      if (!result.preview_token) { setPreview(null); setToken(""); setError("Сервис не выдал одноразовый токен проверки. Повторите попытку."); return; }
+      if (nextPreview.source_site && nextPreview.source_site !== adapterId) {
+        setPreview(null); setToken(""); setError("Сайт в ответе не совпал с выбранной площадкой. Проверьте ссылку ещё раз."); return;
+      }
+      setPreview(nextPreview); setToken(result.preview_token); setConsent(false); setEditing(true); setError(""); setUrl("");
+      setResumeAnswers({});
+    },
+    onError: (reason) => setError(reason instanceof Error ? reason.message : "Не удалось проверить ссылку."),
+  });
+  const confirmMutation = useMutation({
+    mutationFn: () => api<unknown>("/resume-sources/confirm", { method: "POST", body: JSON.stringify({ adapter_id: adapterId, preview_token: token, consent: true, ...(resumeAnswers.grammatical_gender ? { grammatical_gender: resumeAnswers.grammatical_gender } : {}) }) }),
+    onSuccess: (result) => {
+      const serverRecord = sourceRecordFromResponse(result);
+      const grammaticalGender = serverRecord?.grammaticalGender ?? (resumeAnswers.grammatical_gender === "male" || resumeAnswers.grammatical_gender === "female" ? resumeAnswers.grammatical_gender : null);
+      const next = serverRecord
+        ? { ...serverRecord, grammaticalGender, preview: Object.keys(serverRecord.preview).length ? serverRecord.preview : preview! }
+        : { adapterId, grammaticalGender, preview: preview!, previewToken: token, confirmed: true, status: "valid" as const };
+      setEditing(false); setConsent(false); setError(""); onConfirmed(next);
+    },
+    onError: (reason) => setError(reason instanceof Error ? reason.message : "Не удалось сохранить резюме."),
+  });
+  const hasSavedSource = Boolean(record);
+  const questions = preview ? resumeQuestions(preview) : [];
+  // The durable preference is intentionally stripped from the public preview
+  // once saved, so keep a small local editor on the source card as well.
+  const profileQuestions = hasSavedSource && !questions.some((question) => question.id === "grammatical_gender")
+    ? [{ id: "grammatical_gender", question: "Какой род использовать в сопроводительных письмах?", options: ["male", "female"], required: true }, ...questions]
+    : questions;
+  const confirm = () => {
+    if (!preview || !token || !consent) return;
+    if (!profileQuestions.every((question) => isResumeQuestionValid(question, resumeAnswers[question.id] ?? ""))) return;
+    confirmMutation.mutate();
+  };
+  const removeMutation = useMutation({
+    mutationFn: () => api<unknown>(`/resume-sources/${adapterId}`, { method: "DELETE" }),
+    onSuccess: () => { setPreview(null); setToken(""); setConsent(false); setEditing(false); setDeletePending(false); setUrl(""); setError(""); onRemoved(adapterId); },
+    onError: (reason) => setError(reason instanceof Error ? reason.message : "Не удалось удалить источник."),
+  });
+  const remove = () => {
+    removeMutation.mutate();
+  };
+  const beginReplace = () => {
+    setEditing(true); setPreview(null); setToken(""); setConsent(false); setDeletePending(false); setError(""); setResumeAnswers({});
+  };
+  const cancelReplace = () => {
+    setPreview(record?.preview && Object.keys(record.preview).length > 0 ? record.preview : null);
+    setToken("");
+    setConsent(false);
+    setResumeAnswers(record?.grammaticalGender ? { grammatical_gender: record.grammaticalGender } : {});
+    setEditing(false);
+    setDeletePending(false);
+    setError("");
+  };
+  const updateResumeAnswer = (questionId: string, value: string) => {
+    setResumeAnswers((current) => ({ ...current, [questionId]: value }));
+    if (record?.confirmed && !editing) {
+      if (questionId === "grammatical_gender" && (value === "male" || value === "female")) {
+        void onPreferenceChange(adapterId, value).catch((reason) => setError(reason instanceof Error ? reason.message : "Не удалось сохранить предпочтение."));
+      }
+    }
+  };
+  const isUnavailable = record?.status === "unavailable";
+  const savedSourceUrl = publicResumeSourceUrl(record?.sourceUrl, adapterId)
+    ?? publicResumeSourceUrl(record?.preview.source_url, adapterId);
+  const savedAddress = savedSourceUrl
+    ?? (record?.maskedUrl || record?.preview.masked_url
+      ? safeResumeUrlLabel(record.maskedUrl ?? record.preview.masked_url)
+      : "Ссылка сохранена");
+  return <article className={`panel resume-source-card${record?.confirmed ? " is-confirmed" : ""}`} aria-labelledby={`resume-source-${adapterId}`}>
+    <div className="resume-source-head"><div><span className="eyebrow">ИСТОЧНИК РЕЗЮМЕ</span><h2 id={`resume-source-${adapterId}`}>{site.label}</h2></div>{(hasSavedSource || checking) && !editing && <span className={`status ${isUnavailable ? "status-danger" : record?.status === "changed" ? "status-warning" : "status-success"}`}><span>{sourceStatusLabel(record, checking)}</span>{record?.status === "valid" && <small className="resume-source-confirmed">Подтверждено</small>}</span>}</div>
+    {(!hasSavedSource || editing) && <>
+      <label className="profile-full-field">Ссылка на резюме на {site.label}
+        <input type="url" aria-label={`Ссылка на резюме на ${site.label}`} value={url} onChange={(event) => { setUrl(event.target.value); setError(""); }} placeholder={`https://${site.id === "hh" ? "hh.ru" : site.id === "hirehi" ? "hirehi.ru" : "zarplata.ru"}/resume/...`} autoComplete="off" />
+      </label>
+      <button type="button" className="secondary" onClick={() => previewMutation.mutate()} disabled={previewMutation.isPending || !url.trim()}>{previewMutation.isPending ? "Проверяем…" : "Проверить ссылку"}</button>
+      {error && <Notice tone="danger" role="alert">{error}</Notice>}
+    </>}
+    {hasSavedSource && <div className="resume-source-address" aria-label={`Сохранённая ссылка на резюме ${site.label}`}><span>Сохранённая ссылка</span>{savedSourceUrl ? <a href={savedSourceUrl} target="_blank" rel="noreferrer"><code>{savedAddress}</code></a> : <code>{savedAddress}</code>}</div>}
+    {preview && <div className="resume-source-preview" aria-label={`Предпросмотр резюме ${site.label}`}>
+      <div className="resume-source-summary"><strong>{resumeDisplayTitle(preview)}</strong></div>
+      {profileQuestions.length > 0 && <div className="resume-source-block resume-source-questions"><h3>Уточните о себе</h3>{profileQuestions.map((question) => <label className="resume-source-question" key={question.id}><span>{question.id === "grammatical_gender" ? "Ваш пол" : question.question}{question.required !== false && <em aria-hidden="true"> *</em>}</span>{question.options?.length ? <select aria-label={question.question} value={resumeAnswers[question.id] ?? ""} onChange={(event) => updateResumeAnswer(question.id, event.target.value)}><option value="">Выберите вариант</option>{question.options.map((option) => <option key={option} value={option}>{questionOptionLabel(question, option)}</option>)}</select> : <input aria-label={question.question} value={resumeAnswers[question.id] ?? ""} onChange={(event) => updateResumeAnswer(question.id, event.target.value)} placeholder="Короткий ответ" />}</label>)}</div>}
+      {(!record?.confirmed || editing) && <>
+        <label className="checkline resume-source-consent"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} /> Это моё резюме. Разрешаю сохранить ссылку и проверять актуальность резюме перед запуском сессий.</label>
+        <button type="button" className="primary" onClick={confirm} disabled={!consent || confirmMutation.isPending || !profileQuestions.every((question) => isResumeQuestionValid(question, resumeAnswers[question.id] ?? ""))}>{confirmMutation.isPending ? "Сохраняем…" : "Подтвердить резюме"}</button>
+      </>}
+      {hasSavedSource && !editing && <div className="actions"><button type="button" className="secondary" onClick={beginReplace}>Заменить источник</button><button type="button" className="danger" onClick={() => setDeletePending(true)}>Удалить источник</button><a className="button-link secondary" href={resumeEditUrl(adapterId)} target="_blank" rel="noreferrer">{site.editLabel}</a></div>}
+    </div>}
+    {hasSavedSource && !editing && !preview && <div className="actions"><button type="button" className="secondary" onClick={beginReplace}>Заменить источник</button><button type="button" className="danger" onClick={() => setDeletePending(true)}>Удалить источник</button><a className="button-link secondary" href={resumeEditUrl(adapterId)} target="_blank" rel="noreferrer">{site.editLabel}</a></div>}
+    {error && !editing && hasSavedSource && <Notice tone="danger" role="alert">{error}</Notice>}
+    {deletePending && hasSavedSource && !editing && <div className="resume-source-delete-confirm" role="alert"><p>Удалить сохранённый источник {site.label}? Его можно будет добавить снова.</p><div className="actions"><button type="button" className="danger" onClick={remove} disabled={removeMutation.isPending}>{removeMutation.isPending ? "Удаляем…" : "Удалить"}</button><button type="button" className="secondary" onClick={() => setDeletePending(false)}>Отмена</button></div></div>}
+    {hasSavedSource && editing && !preview && <button type="button" className="secondary" onClick={cancelReplace}>Отмена замены</button>}
   </article>;
 }
 
-function ProfilePage() {
-  const profiles = useQuery({ queryKey: ["profiles"], queryFn: () => api<Profile[]>("/profiles") });
-  const current = profiles.data?.[0];
-  const resumes = useQuery({ queryKey: ["resumes", current?.id], queryFn: () => api<Resume[]>(`/profiles/${current?.id}/resumes`), enabled: Boolean(current) });
+function ResumeSourcesPage() {
   const qc = useQueryClient();
-  const [personal, setPersonal] = useState<Omit<PersonalProfileData, "resumes">>(blankPersonal);
-  const [editingResume, setEditingResume] = useState<Resume | null>(null);
-  const [message, setMessage] = useState("");
-  const [messageTone, setMessageTone] = useState<"neutral" | "success" | "warning" | "danger" | "info">("neutral");
-  useEffect(() => { if (current) { const data = { ...current.data }; delete data.resumes; setPersonal({ ...blankPersonal, ...data, contacts: { ...blankPersonal.contacts, ...data.contacts, messengers: data.contacts?.messengers ?? [] }, job_search_locations: data.job_search_locations ?? [], education: data.education ?? [], languages: data.languages ?? [] }); } }, [current]);
-  const personalPayload = (value: Omit<PersonalProfileData, "resumes">) => ({
-    full_name: value.full_name || null,
-    gender: value.gender || null,
-    residence: value.residence || null,
-    job_search_locations: value.job_search_locations,
-    contacts: { phone: value.contacts.phone || null, email: value.contacts.email || null, messengers: value.contacts.messengers.filter(Boolean) },
-    education: value.education.map((item) => ({
-      type: item.type,
-      institution: item.institution,
-      start_date: item.start_date || null,
-      end_date: item.end_date || null,
-      ...(item.type !== "school" ? { faculty: item.faculty || null, specialty: item.specialty || null } : {}),
-      ...(item.type === "higher" ? { degree: item.degree || null } : {}),
-    })),
-    languages: value.languages.map((item) => ({ language: item.language, proficiency: item.proficiency })),
-    driver_license: value.driver_license ?? null,
-  });
-  const resumePayload = (resume: Resume) => ({ name: resume.name, desired_title: resume.desired_title || null, desired_salary: resume.desired_salary || null, employment_types: resume.employment_types, work_formats: resume.work_formats, business_trips: resume.business_trips ?? null, experiences: resume.experiences.map(({ company, position, start_date, end_date, duties }) => ({ company, position, start_date: start_date || null, end_date: end_date || null, duties })), skills: resume.skills, about: resume.about, selected_for_matching: resume.selected_for_matching });
-  const savePersonal = useMutation({ mutationFn: () => current ? api<Profile>(`/profiles/${current.id}`, { method: "PATCH", body: JSON.stringify(personalPayload(personal)) }) : api<Profile>("/profiles", { method: "POST", body: JSON.stringify(personalPayload(personal)) }), onSuccess: async () => { setMessageTone("success"); setMessage("Личный профиль сохранён."); toast.success("Личный профиль сохранён"); await qc.invalidateQueries({ queryKey: ["profiles"] }); }, onError: (e) => { setMessageTone("danger"); setMessage(e.message); toast.error(e.message); } });
-  const saveResume = useMutation({ mutationFn: (resume: Resume) => current ? resume.id ? api<Resume>(`/profiles/${current.id}/resumes/${resume.id}`, { method: "PATCH", body: JSON.stringify(resumePayload(resume)) }) : api<Resume>(`/profiles/${current.id}/resumes`, { method: "POST", body: JSON.stringify(resumePayload(resume)) }) : Promise.reject(new Error("Сначала создайте профиль.")), onSuccess: async () => { setMessageTone("success"); setEditingResume(null); setMessage("Резюме сохранено."); toast.success("Резюме сохранено"); await qc.invalidateQueries({ queryKey: ["resumes", current?.id] }); }, onError: (e) => { setMessageTone("danger"); setMessage(e.message); toast.error(e.message); } });
-  const removeResume = useMutation({ mutationFn: (id: number) => current ? api(`/profiles/${current.id}/resumes/${id}`, { method: "DELETE" }) : Promise.reject(new Error("Профиль не найден.")), onSuccess: async () => { setMessageTone("success"); setMessage("Резюме удалено."); toast.success("Резюме удалено"); await qc.invalidateQueries({ queryKey: ["resumes", current?.id] }); }, onError: (e) => { setMessageTone("danger"); setMessage(e.message); toast.error(e.message); } });
-  const upload = useMutation({ mutationFn: async (file: File) => { if (!current) throw new Error("Сначала сохраните личный профиль."); const body = new FormData(); body.append("file", file); return api<{ profile: Profile; resume: Resume }>(`/profiles/${current.id}/resumes/import`, { method: "POST", body }); }, onMutate: (file) => { setMessageTone("info"); setMessage(`Файл «${file.name}» принят. Заполняем профиль и отдельное резюме…`); }, onSuccess: async (result) => { qc.setQueryData<Profile[]>(["profiles"], (items = []) => [result.profile, ...items.filter((item) => item.id !== result.profile.id)]); qc.setQueryData<Resume[]>(["resumes", result.profile.id], (items = []) => [result.resume, ...items.filter((item) => item.id !== result.resume.id)]); setMessageTone("success"); setMessage(`Импорт «${result.resume.name || result.resume.original_filename || "резюме"}» завершён. Проверьте и отредактируйте поля.`); toast.success("Импорт резюме завершён"); await qc.invalidateQueries({ queryKey: ["profiles"] }); }, onError: (e) => { setMessageTone("danger"); setMessage(e.message); toast.error(e.message); } });
-  const toggleSelected = async (resume: Resume) => { if (!current) return; try { await api<Resume>(`/profiles/${current.id}/resumes/${resume.id}`, { method: "PATCH", body: JSON.stringify(resumePayload({ ...resume, selected_for_matching: !resume.selected_for_matching })) }); await qc.invalidateQueries({ queryKey: ["resumes", current.id] }); } catch (error) { setMessageTone("danger"); setMessage(error instanceof Error ? error.message : "Не удалось изменить выбор резюме"); } };
-  return <section className="page">
-    <Title eyebrow="ПРОФИЛЬ КАНДИДАТА" note="Заполните личные данные один раз, а затем создавайте отдельные резюме под разные направления поиска. Только выбранные резюме попадут в оценку вакансий.">Профиль и резюме под вашим контролем</Title>
-    {!current && <Notice tone="warning">Заполните личную информацию и выберите пол соискателя, чтобы создать профиль.</Notice>}
-    {current && <>
-      <label className={`upload ${upload.isPending ? "busy" : ""}`}><input type="file" accept=".pdf,.docx,.txt" aria-label="Импортировать резюме" disabled={upload.isPending} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file) upload.mutate(file); }} /><span>{upload.isPending ? `Обрабатываем «${upload.variables?.name}»…` : "Импортировать PDF, DOCX или TXT"}</span><small>Парсер заполнит личный профиль и создаст отдельное резюме. После импорта проверьте поля.</small></label>
-    </>}
-    {message && <Notice tone={messageTone}>{message}</Notice>}
-    <PersonalEditor value={personal} onChange={setPersonal} onSave={() => savePersonal.mutate()} saving={savePersonal.isPending} submitLabel={current ? "Сохранить личный профиль" : "Создать профиль"} />
-    {current && <>
-      <section className="resume-section"><div className="section-heading resume-section-heading"><div><span className="eyebrow">БЛОК 2</span><h2>Мои резюме</h2><p>Отметьте одно или несколько резюме, которые передавать ИИ при оценке релевантности вакансий.</p></div><button type="button" className="primary" onClick={() => setEditingResume(newResume(current.id))}>+ Создать резюме</button></div>
-        {editingResume && <ResumeEditor value={editingResume} onSave={(value) => saveResume.mutate(value)} onCancel={() => setEditingResume(null)} saving={saveResume.isPending} />}
-        {resumes.data?.length ? <div className="resume-grid">{resumes.data.map((resume) => <article className={`panel resume-card ${resume.selected_for_matching ? "selected" : ""}`} key={resume.id}><div className="resume-card-top"><div><span className="eyebrow">РЕЗЮМЕ</span><h3>{resume.name || resume.desired_title || "Без названия"}</h3></div><label className="selection-control"><input type="checkbox" checked={resume.selected_for_matching} onChange={() => void toggleSelected(resume)} /> Передавать модели</label></div><div className="resume-meta"><span>{resume.desired_title || "Должность не указана"}</span><span>{resume.skills?.length ?? 0} навыков</span><span>{resume.experiences?.length ?? 0} мест опыта</span></div><p>{resume.about || "Добавьте короткое описание о себе как о работнике."}</p><div className="tag-list">{resume.skills?.slice(0, 8).map((skill) => <span className="tag" key={skill}>{skill}</span>)}</div><div className="actions"><button type="button" className="secondary" onClick={() => setEditingResume(resume)}>Редактировать</button><button type="button" className="danger" onClick={() => { if (window.confirm("Удалить это резюме?")) removeResume.mutate(resume.id); }}>Удалить</button></div></article>)}</div> : <Empty title="Резюме пока нет">Создайте резюме вручную или импортируйте файл сверху.</Empty>}
-      </section>
-    </>}
+  const sourcesQuery = useQuery({ queryKey: ["resume-sources"], queryFn: () => fetchResumeSources(), staleTime: 30_000, refetchInterval: false, refetchOnWindowFocus: false });
+  const sources = sourcesQuery.data ?? {};
+  const removeSource = (adapterId: string) => { const next = { ...sources }; delete next[adapterId]; qc.setQueryData(["resume-sources"], next); };
+  const saveSource = (record: ResumeSourceRecord) => {
+    const current = qc.getQueryData<Record<string, ResumeSourceRecord>>(["resume-sources"]) ?? {};
+    qc.setQueryData(["resume-sources"], { ...current, [record.adapterId]: record });
+  };
+  const savePreference = async (adapterId: string, grammaticalGender: "male" | "female") => {
+    const result = await api<unknown>(`/resume-sources/${adapterId}`, { method: "PATCH", body: JSON.stringify({ grammatical_gender: grammaticalGender }) });
+    const updated = sourceRecordFromResponse(result);
+    const current = qc.getQueryData<Record<string, ResumeSourceRecord>>(["resume-sources"]) ?? {};
+    const existing = current[adapterId];
+    const merged = updated
+      ? { ...existing, ...updated, preview: Object.keys(updated.preview).length ? updated.preview : existing?.preview }
+      : existing;
+    qc.setQueryData(["resume-sources"], {
+      ...current,
+      [adapterId]: {
+        ...merged,
+        grammaticalGender: updated?.grammaticalGender ?? grammaticalGender,
+      },
+    });
+  };
+  return <section className="page profile-sources-page">
+    <Title eyebrow="ИСТОЧНИКИ РЕЗЮМЕ" note="Добавьте ссылку на резюме и подтвердите её.">Профиль — ссылки на резюме</Title>
+    <div className="resume-source-grid">{RESUME_SITES.map((site) => <ResumePreviewCard key={site.id} adapterId={site.id} record={sources[site.id]} checking={sourcesQuery.isLoading} onConfirmed={saveSource} onPreferenceChange={savePreference} onRemoved={removeSource} />)}</div>
   </section>;
 }
 
@@ -673,30 +656,40 @@ function SessionPage() {
   const [coverLetterOpen, setCoverLetterOpen] = useState(false);
   const [influenceOpen, setInfluenceOpen] = useState(false);
   const qc = useQueryClient();
-  const profiles = useQuery({
-    queryKey: ["profiles"],
-    queryFn: () => api<Profile[]>("/profiles"),
+  const resumeSourcesQuery = useQuery({
+    queryKey: ["resume-sources"],
+    queryFn: () => fetchResumeSources(),
+    staleTime: 30_000,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
   });
-  const sessionProfile = profiles.data?.[0];
-  const adapters = useQuery({ queryKey: ["adapters"], queryFn: async () => { const value = await api<Adapter[] | unknown>("/adapters"); return Array.isArray(value) ? value as Adapter[] : []; } });
-  const sessionResumes = useQuery({
-    queryKey: ["session-resumes", sessionProfile?.id],
-    queryFn: () => api<Resume[]>(`/profiles/${sessionProfile?.id}/resumes`),
-    enabled: Boolean(sessionProfile),
-  });
+  const resumeSources = resumeSourcesQuery.data ?? {};
   const sessions = useQuery({
     queryKey: ["sessions"],
     queryFn: () => api<JobSession[]>("/sessions"),
     refetchInterval: 2000,
   });
   const terminalStatuses = ["COMPLETED", "STOPPED", "FAILED"];
-  const profileReady = Boolean(
-    sessionProfile &&
-      sessionProfile.data?.gender &&
-      sessionResumes.data?.some((resume) => resume.selected_for_matching),
-  );
   const { draft, updateDraft, status: draftStatus, conflict: draftConflict, loadSaved } = useSessionDraft();
   const { adapter, applicationLimit, desiredJobDescription, coverLetterAuto, coverLetterTemplate, coverLetterMaxWords, unlimitedApplications, influence } = draft;
+  const resumeSource = resumeSources[adapter];
+  // A saved source is durable profile data. Its latest availability and any
+  // launch-only validation token must never decide whether the source is
+  // shown or whether the user may try to launch again.
+  const genderPreferenceRequired = Boolean(resumeSource && resumeQuestions(resumeSource.preview).some((question) => question.id === "grammatical_gender" && question.required !== false));
+  const missingGenderPreference = Boolean(genderPreferenceRequired && resumeSource?.grammaticalGender == null);
+  const profileReady = Boolean(resumeSource && !missingGenderPreference);
+  const profileUnavailable = resumeSource?.status === "unavailable";
+  const resumeSourceUrl = resumeSource
+    ? publicResumeSourceUrl(resumeSource.sourceUrl, adapter)
+      ?? publicResumeSourceUrl(resumeSource.preview.source_url, adapter)
+    : undefined;
+  const resumeAddress = resumeSource
+    ? resumeSourceUrl
+      ?? (resumeSource.maskedUrl || resumeSource.preview.masked_url
+        ? safeResumeUrlLabel(resumeSource.maskedUrl ?? resumeSource.preview.masked_url)
+        : "Ссылка сохранена")
+    : "";
   const desiredJobDescriptionRef = useRef<HTMLTextAreaElement>(null);
   const resizeDesiredJobDescription = useCallback(() => {
     const textarea = desiredJobDescriptionRef.current;
@@ -718,10 +711,12 @@ function SessionPage() {
   const coverLetterMaxWordsAreValid = coverLetterMaxWordsValue === "" || (/^[1-9]\d*$/.test(coverLetterMaxWordsValue) && Number(coverLetterMaxWordsValue) <= 10000);
   const create = useMutation({
     mutationFn: async () => {
+      // The server owns launch-time revalidation of the durable saved source.
+      // Keep this as one create request: no browser token lifecycle or extra
+      // source refetch can remove the saved card after a stop or launch error.
       const session = await api<JobSession>("/sessions", {
         method: "POST",
         body: JSON.stringify({
-          profile_id: profiles.data?.[0]?.id,
           adapter_id: adapter,
           guaranteed_application: guaranteedApplication,
           application_limit: unlimitedApplications ? null : Number(applicationLimit),
@@ -781,13 +776,17 @@ function SessionPage() {
           <section className="subsection form-rail session-main-info" aria-labelledby="session-main-info-heading">
             <div className="section-heading"><h3 id="session-main-info-heading">Основная информация</h3></div>
             <div className="row session-top-row">
-              <SingleSelect label="Сайт" options={[['hh', 'HH.ru'], ...(adapters.data ?? []).filter((item) => item.site_id !== "hh").map((item) => [item.site_id, item.display_name] as const)]} value={adapter} onValueChange={(adapter) => updateDraft({ adapter })} />
+              <SingleSelect label="Сайт" options={RESUME_SITES.map((site) => [site.id, site.label] as const)} value={adapter} onValueChange={(nextAdapter) => updateDraft({ adapter: nextAdapter })} />
               <label>
                 Лимит вакансий в работе
                 <input aria-label="Лимит вакансий в работе" type="number" min="1" step="1" value={applicationLimit} disabled={unlimitedApplications} onChange={(e) => updateDraft({ applicationLimit: e.target.value })} />
                 <small>{adapter === "hirehi" ? "Считаются выбранные вакансии." : "Считаются отклики, подтверждённые выбранной площадкой."}</small>
                 <span className="checkline"><input aria-label={adapter === "hirehi" ? "Без ограничений: выбранные вакансии" : "Без ограничений: отправка откликов"} type="checkbox" checked={unlimitedApplications} onChange={(e) => updateDraft({ unlimitedApplications: e.target.checked })} />Без ограничений</span>
               </label>
+            </div>
+            <div className={`session-resume-requirement${profileReady ? " is-ready" : ""}`} aria-live="polite">
+              <div><strong>Резюме для {resumeSite(adapter).label}</strong>{resumeSource ? <><code className="session-resume-address">{resumeAddress}</code>{profileUnavailable && <span>Источник сохранён; актуальность будет проверена при запуске.</span>}{missingGenderPreference && <span>Заполните данные резюме в профиле.</span>}</> : <span>Нужно добавить и подтвердить ссылку на этой площадке.</span>}</div>
+              <NavLink className="button-link secondary" to="/profile">{resumeSource ? "Открыть источник" : "Добавить ссылку в профиле"}</NavLink>
             </div>
             <label className="profile-full-field session-description-field">
               Описание желаемой вакансии
@@ -862,13 +861,12 @@ function SessionPage() {
           {!coverLetterMaxWordsAreValid && (
             <Notice tone="danger" role="alert">Укажите целое число от 1 до 10000 слов или оставьте поле пустым.</Notice>
           )}
-          {!profileReady && (
+          {!profileReady && !profileUnavailable && !missingGenderPreference && (
             <Notice tone="warning">
-              {(!sessionProfile || !sessionProfile.data?.gender)
-                ? <>Выберите пол соискателя в профиле и хотя бы одно резюме. <NavLink className="button-link secondary" to="/profile">Открыть профиль</NavLink></>
-                : "Сначала выберите хотя бы одно резюме в профиле."}
+              <>Для запуска нужно проверить и подтвердить резюме на сайте {resumeSite(adapter).label}. <NavLink className="button-link secondary" to="/profile">Открыть профиль</NavLink></>
             </Notice>
           )}
+          {missingGenderPreference && <Notice tone="warning">Заполните данные резюме в профиле перед запуском сессии. <NavLink className="button-link secondary" to="/profile">Открыть профиль</NavLink></Notice>}
         </article>
       {message && <Notice tone={messageTone}>{message}</Notice>}
       {visibleSessions.map((session) => {
@@ -901,8 +899,9 @@ function SessionCard({ session, formatSessionLimit, action }: { session: JobSess
               </h2>
               {session.guaranteed_application && <p>Гарантированный отклик включён</p>}
               <p>
-                {session.stop_reason ||
-                  "Обработка вакансий идёт последовательно"}
+                {session.status === "PAUSED"
+                  ? pausedSessionMessage(session.stop_reason)
+                  : safeSessionText(session.stop_reason || "Обработка вакансий идёт последовательно")}
               </p>
               <p className="session-limits-summary">
                 Лимит сессии: {session.adapter_id === "hirehi" ? "выбрано" : "отправка"} — {formatSessionLimit(session.application_limit)}.
@@ -918,13 +917,6 @@ function SessionCard({ session, formatSessionLimit, action }: { session: JobSess
                   )}
                 </>
               )}
-              {session.status === "WAITING_FOR_LOGIN" && (
-                <>
-                  <button type="button" className="secondary" onClick={() => void action(session.id, "browser")}>Открыть браузер</button>
-                  <button type="button" className="secondary" onClick={() => void action(session.id, "browser/check")}>Проверить вход</button>
-                  <button type="button" className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
-                </>
-              )}
               {session.status === "RUNNING" && (
                 <>
                   {browserAvailable && (
@@ -933,7 +925,7 @@ function SessionCard({ session, formatSessionLimit, action }: { session: JobSess
                   <button type="button" className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
                 </>
               )}
-              {(session.status === "PAUSED" || session.status === "NEEDS_REVIEW") && (
+              {session.status === "PAUSED" && (
                 <>
                   <button type="button" className="primary" onClick={() => void action(session.id, "resume")}>Продолжить</button>
                   <button type="button" className="danger" onClick={() => void action(session.id, "stop")}>Остановить</button>
@@ -945,7 +937,6 @@ function SessionCard({ session, formatSessionLimit, action }: { session: JobSess
             {[
               ["Просмотрено", "viewed"],
               ["Отфильтровано", "filtered"],
-
               ["Отклики", "submitted"],
               ["Ошибка", "errors"],
             ].map(([label, key]) => (
@@ -972,22 +963,24 @@ function formatStatusDate(value: string) {
 
 function VacancyCard({ v }: { v: Vacancy }) {
   const [open, setOpen] = useState(false);
+  const statusGroup = vacancyStatusGroup(v);
+  const errorMessage = vacancyErrorMessage(v);
   return <details className="panel vacancy-score vacancy-disclosure" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
     <summary aria-expanded={open} aria-controls={`vacancy-details-${v.id}`}>
       <span className="vacancy-main"><b>{v.title}</b><small>#{v.id} · {v.company || "Компания не указана"}{v.site ? ` · ${v.site}` : ""}</small></span>
       <span className="score-total"><strong>{v.evaluation?.score ?? "—"}</strong><small>/ 100</small></span>
-      <span><Status value={v.state} />{v.status_changed_at && <small className="vacancy-status-date">{formatStatusDate(v.status_changed_at)}</small>}</span>
+      <span><Status value={statusGroup} />{v.status_changed_at && <small className="vacancy-status-date">{formatStatusDate(v.status_changed_at)}</small>}</span>
       <span className="vacancy-disclosure-control"><span className="sr-only">{open ? "Скрыть подробности вакансии" : "Показать подробности вакансии"}</span><ChevronIcon className="vacancy-chevron" /></span>
     </summary>
     {v.evaluation ? <div className="score-details" id={`vacancy-details-${v.id}`}>
       <div className="resume-score-heading"><span className="eyebrow">КРАТКОЕ РЕЗЮМЕ</span></div>
-      <p>{humanModelSummary(v.evaluation.reason || "", v.state, v.evaluation.score_breakdown ?? [])}</p>
-      <p>{vacancyOutcome(v.state)}</p>
+      <p>{humanModelSummary(v.evaluation.reason || "", statusGroup, v.evaluation.score_breakdown ?? [])}</p>
+      {statusGroup === "ERROR" || statusGroup === "UNCONFIRMED" ? <p className="vacancy-error-message">{errorMessage}</p> : <p>{vacancyOutcome(v)}</p>}
       <div className="resume-score-heading"><span className="eyebrow">ПО КРИТЕРИЯМ</span></div>
       {presentationBreakdown(v.evaluation.score_breakdown ?? []).map((row) => <div className="score-row" key={row.key}><div><b>{row.title}</b><span>{row.max_points > 0 ? `${row.points} / ${row.max_points}` : "не применяется"}</span></div>{row.max_points > 0 && <div className="scorebar" role="progressbar" aria-label={`Релевантность: ${row.title}`} aria-valuenow={row.points} aria-valuemin={0} aria-valuemax={row.max_points}><i style={{ width: `${Math.min(100, Math.max(0, (row.points / row.max_points) * 100))}%` }} /></div>}<small>{humanCriterionExplanation(row.explanation)}</small></div>)}
       <a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a>
-    </div> : ["ERROR", "FAILED", "UNKNOWN", "UNKNOWN_RESULT"].includes(v.state)
-      ? <div className="score-details" id={`vacancy-details-${v.id}`}><div className="resume-score-heading"><span className="eyebrow">КРАТКОЕ РЕЗЮМЕ</span><small>Что произошло с вакансией</small></div><p>Не удалось оценить вакансию.</p><p>{vacancyOutcome(v.state)}</p><a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a></div>
+    </div> : statusGroup === "ERROR" || statusGroup === "UNCONFIRMED"
+      ? <div className="score-details" id={`vacancy-details-${v.id}`}><div className="resume-score-heading"><span className="eyebrow">КРАТКОЕ РЕЗЮМЕ</span><small>Что произошло с вакансией</small></div><p className="vacancy-error-message">{errorMessage}</p><a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a></div>
       : <p className="empty-score">Оценка ещё не завершена.</p>}
   </details>;
 }
@@ -1027,7 +1020,7 @@ function VacanciesPage() {
       <div className="vacancy-filters" aria-label="Фильтры вакансий">
         <div className="vacancy-filter-primary">
         <label className="vacancy-search">Поиск<input aria-label="Поиск" value={filters.search} onChange={(event) => setFilter("search", event.target.value)} placeholder="Номер, вакансия или компания" /></label>
-        <label>Статус<select aria-label="Статус" value={filters.state} onChange={(event) => setFilter("state", event.target.value)}><option value="">Все</option>{VACANCY_STATUS_OPTIONS.map((status) => <option value={status.value} key={status.value}>{status.label}</option>)}</select></label>
+        <label>Статус<select aria-label="Статус" value={filters.status_group} onChange={(event) => setFilter("status_group", event.target.value)}><option value="">Все</option>{VACANCY_STATUS_OPTIONS.map((status) => <option value={status.value} key={status.value}>{status.label}</option>)}</select></label>
         <fieldset className="vacancy-filter-range"><legend>Дата</legend><label>От<input aria-label="Дата от" type="date" value={filters.status_date_from} onChange={(event) => setFilter("status_date_from", event.target.value)} /></label><label>До<input aria-label="Дата до" type="date" value={filters.status_date_to} onChange={(event) => setFilter("status_date_to", event.target.value)} /></label></fieldset>
         <fieldset className="vacancy-filter-range"><legend>Общий балл</legend><label>От<input aria-label="Общий балл от" type="number" min="0" max="100" value={filters.total_score_min} onChange={(event) => setFilter("total_score_min", event.target.value)} /></label><label>До<input aria-label="Общий балл до" type="number" min="0" max="100" value={filters.total_score_max} onChange={(event) => setFilter("total_score_max", event.target.value)} /></label></fieldset>
         </div>
@@ -1129,12 +1122,12 @@ function ModelPage() {
 }
 
 export default function App() {
+  useEffect(() => { purgeLegacyResumeSourceStorage(); }, []);
   return (
     <Shell>
-      <SessionQuestions />
       <Routes>
         <Route path="/" element={<Dashboard />} />
-        <Route path="/profile" element={<ProfilePage />} />
+        <Route path="/profile" element={<ResumeSourcesPage />} />
         <Route path="/session" element={<SessionPage />} />
         <Route path="/vacancies" element={<VacanciesPage />} />
         <Route path="/model" element={<ModelPage />} />

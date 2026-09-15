@@ -12,11 +12,14 @@ from backend.adapters.base.protocol import (
     JobRef,
     LoginState,
 )
+from backend.adapters.base.resume_import import ResumeImportMixin
 from backend.adapters.hirehi import locators
+from backend.adapters.hirehi.resume import POLICY as resume_policy
+from backend.adapters.hirehi.resume import extractor as resume_extractor
 from backend.schemas.domain import JobPosting
 
 
-class HireHiAdapter:
+class HireHiAdapter(ResumeImportMixin):
     GRADES = ("intern", "junior", "middle", "senior", "lead", "head")
     CATEGORY_PATHS = {
         "все вакансии": "/",
@@ -41,7 +44,12 @@ class HireHiAdapter:
         display_name=display_name,
         allowed_domains=allowed_domains,
         supports_submission=True,
+        supports_resume_import=True,
+        supports_public_resume_url=True,
+        supports_account_resume_list=False,
     )
+    resume_policy = resume_policy
+    resume_extractor = resume_extractor
 
     @property
     def search_exhausted(self) -> bool:

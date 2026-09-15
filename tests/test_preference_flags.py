@@ -134,7 +134,6 @@ async def test_unverified_red_match_is_skipped_automatically():
         job(text="Продажи и работа с клиентами"), {}, [{}], FakeGateway(complete), preference_policy=p,
     )
     assert result.decision == "skip"
-    assert result.requires_manual_review is False
     assert "preference_red_flag_unverified" in result.hard_rule_violations
 
 

@@ -16,7 +16,7 @@ from backend.intelligence.security import (
     assert_safe_output,
     sanitize_untrusted_input,
 )
-from backend.schemas.domain import ApplicationPlan, FormAnswer, JobPosting
+from backend.schemas.domain import ApplicationField, ApplicationPlan, FormAnswer, JobPosting
 
 SALARY_MARKERS = re.compile(r"зарплат|\bзп\b|з/п|доход|оплат|оклад|финансов\w*\s+ожидан|вознагражд|salary|compensation|pay\b|income|wage|от какой суммы рассматрива|какую сумму (?:ожида|рассматрива|хотите)", re.I)
 MONEY = re.compile(r"\d[\d\s.,]*\s*(?:тыс|[кk]\b|руб|₽|\$|€|rub|usd|eur)", re.I)
@@ -95,6 +95,53 @@ class ProposedAnswer(StrictModel):
 
 class AnswerBatch(StrictModel):
     answers: list[ProposedAnswer]
+
+
+_PRIVATE_FORM_LABELS = {
+    "full_name": re.compile(
+        r"(?:фио|полное\s+имя|имя\s+и\s+фамил|full\s*name|candidate\s+name|applicant\s+name)", re.I
+    ),
+    "phone": re.compile(r"(?:телефон|мобильн|phone|mobile)", re.I),
+    "email": re.compile(r"(?:e[- ]?mail|электронн\w*\s+почт|почта)", re.I),
+    "messengers": re.compile(r"(?:мессенджер|telegram|whatsapp|телеграм)", re.I),
+}
+
+
+def _private_value(private_view, key: str) -> str:
+    if not isinstance(private_view, dict):
+        return ""
+    group = private_view.get("identity", {}) if key == "full_name" else private_view.get("contacts", {})
+    field = group.get(key) if isinstance(group, dict) else None
+    if isinstance(field, dict):
+        field = field.get("value")
+    if isinstance(field, list):
+        field = ", ".join(str(value).strip() for value in field if str(value).strip())
+    return str(field).strip() if field is not None else ""
+
+
+def _local_private_answer(field: ApplicationField, private_view) -> FormAnswer | None:
+    """Bind identity/contact fields locally after model classification."""
+    label = f"{field.id} {field.label}"
+    if re.search(
+        r"(?:company|employer|organization|project|vacancy|компан|работодател|организац|проект|ваканс)",
+        label,
+        re.I,
+    ):
+        return None
+    key = next((name for name, pattern in _PRIVATE_FORM_LABELS.items() if pattern.search(label)), None)
+    if key is None or field.kind not in {"text", "number", "radio", "select"}:
+        return None
+    value = _private_value(private_view, key)
+    if not value:
+        return None
+    if field.max_length is not None and len(value) > field.max_length:
+        return None
+    if field.options:
+        match = next((option for option in field.options if option.casefold() == value.casefold()), None)
+        if match is None:
+            return None
+        value = match
+    return FormAnswer(field=field, values=[value], source="local_private", explanation="Локальная подстановка")
 
 
 def _normalized(value: str) -> str:
@@ -455,7 +502,8 @@ async def resolve_salary(
 
 async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan, job: JobPosting,
                           profile, resumes: list[dict], description: str, *,
-                          memory: list[dict] | None = None, guaranteed_application: bool = False) -> ApplicationPlan:
+                          memory: list[dict] | None = None, guaranteed_application: bool = False,
+                          private_view: dict | None = None) -> ApplicationPlan:
     """Model output is a proposal; source quotes, IDs, choices and salary are checked locally."""
     safe_job = sanitize_untrusted_input(job.model_dump(mode="json"), context="vacancy data")
     safe_form = sanitize_untrusted_input(form.model_dump(mode="json"), context="application form")
@@ -482,8 +530,14 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
     )]
     for entry in applicable_memory:
         sources[f"memory.{entry['id']}"] = f"{entry['question']}\n{entry['answer']}"
-    salary_fields = {field.id for field in form.fields if SALARY_MARKERS.search(field.label)}
-    salary_question = " ".join(field.label for field in form.fields if field.id in salary_fields)
+    # Classification must use the sanitized semantic copy.  A hostile label
+    # must not turn an ordinary question into a salary or sensitive question.
+    safe_labels = {
+        field.id: str(safe_fields_by_id.get(field.id, {}).get("label") or "Вопрос без подписи")
+        for field in form.fields
+    }
+    salary_fields = {field.id for field in form.fields if SALARY_MARKERS.search(safe_labels[field.id])}
+    salary_question = " ".join(safe_labels[field.id] for field in form.fields if field.id in salary_fields)
     salary = (await resolve_salary(gateway, job, safe_resumes, safe_description, applicable_memory, salary_question)
               if salary_fields else ResolvedSalary())
     # Remove raw salary fields so lower-priority resume amounts cannot leak into a composite answer.
@@ -492,11 +546,29 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
         sources["salary"] = salary.display()
     if salary.source == "estimate":
         sources["salary_estimate"] = salary.reason
+    local_answers = {
+        field.id: _local_private_answer(field, private_view)
+        for field in form.fields
+        if private_view is not None
+    }
+    private_field_ids = {
+        field.id
+        for field in form.fields
+        if field.kind in {"text", "number", "radio", "select"}
+        and not re.search(
+            r"(?:company|employer|organization|project|vacancy|компан|работодател|организац|проект|ваканс)",
+            f"{field.id} {field.label}",
+            re.I,
+        )
+        and any(pattern.search(f"{field.id} {field.label}") for pattern in _PRIVATE_FORM_LABELS.values())
+    }
+    model_fields = [field for field in form.fields if field.id not in private_field_ids]
+
     async def propose():
         proposed = await gateway.structured("application_answers", {
             # Semantic labels/options are sanitized, while original form
             # objects remain authoritative for exact UI binding below.
-            "fields": safe_form.get("fields", []),
+            "fields": [safe_fields_by_id[field.id] for field in model_fields],
             "sources": sources,
             "guaranteed_application": guaranteed_application,
             "salary": salary.model_dump(),
@@ -507,11 +579,17 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
         for answer in proposed.answers:
             for value in [answer.values, answer.reason, *(evidence.quote for evidence in answer.evidence)]:
                 assert_safe_output(value, context="application_answer_content")
+            original_field = next((item for item in form.fields if item.id == answer.field_id), None)
+            original_options = set(original_field.options or []) if original_field else set()
             for value in answer.values:
-                assert_safe_outgoing_text(value, profile, resumes, context="application_answer")
+                # Exact source choices are safe UI data and are validated
+                # against the authoritative field below.  Other generated
+                # values still pass the strict outbound guard.
+                if value not in original_options:
+                    assert_safe_outgoing_text(value, profile, resumes, context="application_answer")
         return proposed
 
-    proposed = await propose()
+    proposed = AnswerBatch(answers=[]) if not model_fields and not salary_fields else await propose()
     if not salary_fields:
         # Salary questions can be indirect or in another language. Let the model
         # identify them, then resolve the same authoritative rules before answering.
@@ -520,7 +598,7 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                          if answer.category == "salary" and answer.field_id in known_fields}
         if salary_fields:
             salary_question = " ".join(
-                field.label for field in form.fields if field.id in salary_fields
+                safe_labels[field.id] for field in form.fields if field.id in salary_fields
             )
             salary = await resolve_salary(
                 gateway, job, safe_resumes, safe_description, applicable_memory, salary_question,
@@ -537,6 +615,12 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
     for field in form.fields:
         result.unanswered_fields.pop(field.id, None)
         result.form_answers.pop(field.id, None)
+        if private_view is not None:
+            local_answer = _local_private_answer(field, private_view)
+            local_answer = local_answers.get(field.id)
+            if local_answer is not None:
+                result.form_answers[field.id] = local_answer
+                continue
         answer = answers.get(field.id)
         reason = "Для ответа недостаточно подтверждённых данных"
         confidence_threshold = .5 if salary.source == "estimate" and answer and answer.category == "salary" else .95
@@ -545,23 +629,24 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                         and answer.category not in {"unknown", "sensitive", "task"})
         if answer:
             safe_field = safe_fields_by_id.get(field.id, {})
-            safe_label = str(safe_field.get("label") or field.label)
+            safe_label = str(safe_field.get("label") or "Вопрос без подписи")
+            options_mapping_valid = True
             # Sanitization can change an option's text. Bind the model's clean
             # value back to the exact original option by index, and only when
             # every clean option is unique and non-empty. This keeps live UI
             # values byte-for-byte stable without allowing arbitrary remapping.
             if field.options:
                 safe_options = safe_field.get("options") or []
-                if len(safe_options) == len(field.options) and all(
+                options_mapping_valid = len(safe_options) == len(field.options) and all(
                     isinstance(value, str) and value.strip() for value in safe_options
-                ) and len(set(safe_options)) == len(safe_options):
-                    option_map = dict(zip(safe_options, field.options))
-                    if all(value in option_map for value in answer.values):
+                ) and len(set(safe_options)) == len(safe_options)
+                if options_mapping_valid:
+                    option_map = dict(zip(safe_options, field.options, strict=True))
+                    options_mapping_valid = all(value in option_map for value in answer.values)
+                    if options_mapping_valid:
                         answer = answer.model_copy(update={
                             "values": [option_map[value] for value in answer.values]
                         })
-                        for value in answer.values:
-                            assert_safe_outgoing_text(value, profile, resumes, context="application_answer")
             reason = answer.reason or reason
             if answer.category == "assumption":
                 accepted = bool(guaranteed_application and answer.values
@@ -585,7 +670,7 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                         accepted = False
                         reason = "Сумма, валюта, период или налоговая база ответа не совпадают с ожиданиями"
             if field.options:
-                accepted = accepted and len(set(field.options)) == len(field.options) and all(value in field.options for value in answer.values)
+                accepted = accepted and options_mapping_valid and len(set(field.options)) == len(field.options) and all(value in field.options for value in answer.values)
             if field.kind not in {"checkbox", "multiselect"}:
                 accepted = accepted and len(answer.values) == 1
             if field.kind == "number":
@@ -600,7 +685,7 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
                     f"Зарплатный ответ с суммой «{selected_amount}» отклонён: "
                     "источник salary или локальная проверка не подтверждают ответ"
                 )
-        safe_label = str(safe_fields_by_id.get(field.id, {}).get("label") or field.label)
+        safe_label = str(safe_fields_by_id.get(field.id, {}).get("label") or "Вопрос без подписи")
         if SENSITIVE.search(safe_label) or field.kind == "unsupported" or safe_label.startswith("Вопрос без подписи"):
             accepted = False
             reason = "Вопрос не может быть обработан автоматически"
