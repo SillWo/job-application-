@@ -27,10 +27,15 @@ from backend.services.resume_session import (
     update_saved_resume_gender,
 )
 
+SITE_HOSTS = {"hh": "hh.ru", "zarplata": "zarplata.ru", "hirehi": "hirehi.ru"}
 URL = "https://hh.ru/resume/abc123"
 
 
-def _snapshot(*, name: str = "Synthetic Candidate", experience: str = "Original work"):
+def _snapshot(
+    *, adapter_id: str = "hh", name: str = "Synthetic Candidate",
+    experience: str = "Original work",
+):
+    source_url = f"https://{SITE_HOSTS[adapter_id]}/resume/abc123"
     snapshot = _normalize_extracted(
         {
             "source_resume_id": "abc123",
@@ -39,8 +44,8 @@ def _snapshot(*, name: str = "Synthetic Candidate", experience: str = "Original 
             "target": {"desired_title": "Engineer"},
             "experience": [{"company": "Example Co", "position": "Engineer", "duties": experience}],
         },
-        adapter_id="hh",
-        source_url=URL,
+        adapter_id=adapter_id,
+        source_url=source_url,
     )
     return snapshot
 
@@ -54,12 +59,13 @@ def db(tmp_path):
     engine.dispose()
 
 
-def _confirm(db: Session, snapshot=None, *, gender="female"):
-    snapshot = snapshot or _snapshot()
-    token = issue_preview_token(db, "hh", snapshot, source_url=URL)
+def _confirm(db: Session, snapshot=None, *, adapter_id="hh", gender="female"):
+    snapshot = snapshot or _snapshot(adapter_id=adapter_id)
+    source_url = f"https://{SITE_HOSTS[adapter_id]}/resume/abc123"
+    token = issue_preview_token(db, adapter_id, snapshot, source_url=source_url)
     row, _ = confirm_saved_resume_source(
         db,
-        adapter_id="hh",
+        adapter_id=adapter_id,
         preview_token=token,
         consent=True,
         grammatical_gender=gender,
@@ -67,8 +73,30 @@ def _confirm(db: Session, snapshot=None, *, gender="female"):
     return row
 
 
-def test_confirm_persists_full_sealed_snapshot_and_loads_after_new_session(db, tmp_path):
-    row = _confirm(db)
+def _complete_snapshot(adapter_id: str):
+    source_url = f"https://{SITE_HOSTS[adapter_id]}/resume/abc123"
+    return _normalize_extracted(
+        {
+            "source_resume_id": "abc123",
+            "identity": {"full_name": "Synthetic Candidate", "gender": "male"},
+            "contacts": {"email": "candidate@example.test"},
+            "target": {"desired_title": "Engineer"},
+            "location": {"residence": "Tomsk"},
+            "total_experience": "5 years",
+            "experience": [{"company": "Example Co", "position": "Engineer"}],
+            "skills": [{"name": "Python"}],
+            "education": [{"institution": "Example University"}],
+            "languages": [{"language": "Russian"}],
+            "about": "Synthetic profile",
+        },
+        adapter_id=adapter_id,
+        source_url=source_url,
+    )
+
+
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
+def test_confirm_persists_full_sealed_snapshot_and_loads_after_new_session(db, tmp_path, adapter_id):
+    row = _confirm(db, adapter_id=adapter_id)
     payload = row.resume_snapshot_payload
     assert payload and "Synthetic Candidate" not in payload
     row_id = row.id
@@ -82,9 +110,50 @@ def test_confirm_persists_full_sealed_snapshot_and_loads_after_new_session(db, t
         assert loaded.identity.gender.value == "female"
         assert loaded.content_hash == _snapshot_hash(loaded)
         assert saved_resume_source_record(durable)["resume_data_status"] == "ready"
+        assert saved_resume_source_record(durable)["completion_status"] == "partial"
 
 
-def test_loader_rejects_missing_corrupt_hash_mismatch_and_non_local_site(db):
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
+def test_completion_status_uses_main_sections_from_full_snapshot_and_ignores_preview_and_optional_sections(
+    db, adapter_id
+):
+    row = _confirm(db, _complete_snapshot(adapter_id), adapter_id=adapter_id)
+    # Neither the API preview nor portfolio/additional content determines
+    # completeness. All ten canonical main sections are present in the sealed copy.
+    row.preview = {"completion_status": "partial", "sections": []}
+    record = saved_resume_source_record(row)
+    assert record["completion_status"] == "complete"
+    assert record["completion_error_message"] is None
+
+    snapshot = load_saved_resume_data(row).model_dump(mode="json")
+    snapshot["location"] = {}
+    snapshot["portfolio"] = [{"title": "Optional portfolio"}]
+    snapshot["additional_sections"] = [{"name": "Optional", "content": "Extra"}]
+    normalized = SiteResumeSnapshot.model_validate(snapshot)
+    normalized = normalized.model_copy(update={"content_hash": _snapshot_hash(normalized)})
+    public_snapshot, _ = _redacted_snapshot(normalized)
+    row.content_hash = public_snapshot.content_hash
+    row.resume_snapshot_payload = _seal_private(normalized.model_dump(mode="json"))
+    record = saved_resume_source_record(row)
+    assert record["completion_status"] == "partial"
+
+
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
+def test_completion_status_reports_safe_error_for_missing_or_corrupt_snapshot(db, adapter_id):
+    row = _confirm(db, _snapshot(adapter_id=adapter_id), adapter_id=adapter_id)
+    row.resume_snapshot_payload = None
+    record = saved_resume_source_record(row)
+    assert record["completion_status"] == "error"
+    assert record["completion_error_message"] == record["resume_data_error_message"]
+    assert "Обновите данные резюме" in record["completion_error_message"]
+
+    row.resume_snapshot_payload = "sealed-test:damaged"
+    record = saved_resume_source_record(row)
+    assert record["completion_status"] == "error"
+    assert record["completion_error_message"] == record["resume_data_error_message"]
+
+
+def test_loader_rejects_missing_corrupt_hash_mismatch_and_unsupported_site(db):
     row = _confirm(db)
     row.resume_snapshot_payload = None
     with pytest.raises(ResumeImportError, match="Обновите данные резюме во вкладке «Профиль»"):
@@ -103,7 +172,7 @@ def test_loader_rejects_missing_corrupt_hash_mismatch_and_non_local_site(db):
         load_saved_resume_data(row)
 
     row = _confirm(db, _snapshot(name="Fourth Candidate"))
-    row.adapter_id = "hirehi"
+    row.adapter_id = "unsupported"
     with pytest.raises(ResumeImportError):
         load_saved_resume_data(row)
 
@@ -133,15 +202,17 @@ def test_inconsistent_saved_gender_is_corrupt_and_requests_profile_update(db):
 
 
 @pytest.mark.asyncio
-async def test_refresh_replaces_snapshot_and_failed_refresh_preserves_last_good_copy(db, monkeypatch):
-    row = _confirm(db, _snapshot(experience="Before refresh"))
-    refreshed = _snapshot(name="Updated Candidate", experience="After refresh")
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
+async def test_refresh_replaces_snapshot_and_failed_refresh_preserves_last_good_copy(db, monkeypatch, adapter_id):
+    row = _confirm(db, _snapshot(adapter_id=adapter_id, experience="Before refresh"), adapter_id=adapter_id)
+    source_url = f"https://{SITE_HOSTS[adapter_id]}/resume/abc123"
+    refreshed = _snapshot(adapter_id=adapter_id, name="Updated Candidate", experience="After refresh")
 
     async def read_updated(_db, _adapter_id):
-        return row, URL, refreshed
+        return row, source_url, refreshed
 
     monkeypatch.setattr("backend.services.resume_session._read_saved_resume_source", read_updated)
-    updated, token = await refresh_saved_resume_source(db, "hh", issue_token=False)
+    updated, token = await refresh_saved_resume_source(db, adapter_id, issue_token=False)
     assert token is None
     assert load_saved_resume_data(updated).experience[0].duties == "After refresh"
     good_payload = updated.resume_snapshot_payload
@@ -150,11 +221,12 @@ async def test_refresh_replaces_snapshot_and_failed_refresh_preserves_last_good_
         raise RuntimeError("synthetic site failure")
 
     monkeypatch.setattr("backend.services.resume_session._read_saved_resume_source", failed_read)
-    failed, token = await refresh_saved_resume_source(db, "hh", issue_token=False)
+    failed, token = await refresh_saved_resume_source(db, adapter_id, issue_token=False)
     assert token is None
     assert failed.status == "unavailable"
     assert failed.resume_snapshot_payload == good_payload
     assert load_saved_resume_data(failed).identity.full_name.value == "Updated Candidate"
+    assert saved_resume_source_record(failed)["completion_status"] == "partial"
 
 
 def test_loader_rejects_semantic_hash_and_coverage_tampering(db):
@@ -210,7 +282,7 @@ def test_confirming_replacement_replaces_full_snapshot_for_same_site(db):
     assert loaded.experience[0].duties == "Replacement text"
 
 
-def test_hirehi_confirmation_keeps_legacy_no_durable_snapshot_contract(db):
+def test_hirehi_confirmation_persists_full_protected_snapshot(db):
     snapshot = _normalize_extracted(
         {
             "source_resume_id": "hhid",
@@ -225,11 +297,16 @@ def test_hirehi_confirmation_keeps_legacy_no_durable_snapshot_contract(db):
     row, _ = confirm_saved_resume_source(
         db, adapter_id="hirehi", preview_token=token, consent=True, grammatical_gender="male"
     )
-    assert row.resume_snapshot_payload is None
-    assert row.resume_data_saved_at is None
+    assert row.resume_snapshot_payload
+    assert "HireHi Candidate" not in row.resume_snapshot_payload
+    assert row.resume_data_saved_at is not None
+    loaded = load_saved_resume_data(row)
+    assert loaded.identity.full_name.value == "HireHi Candidate"
+    assert loaded.identity.gender.value == "male"
+    assert loaded.experience[0].company == "Example Co"
     record = saved_resume_source_record(row)
-    assert record["uses_saved_data"] is False
-    assert record["resume_data_status"] is None
+    assert record["uses_saved_data"] is True
+    assert record["resume_data_status"] == "ready"
 
 
 def test_api_record_does_not_expose_snapshot_payload_or_personal_values(db):

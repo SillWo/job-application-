@@ -3,7 +3,7 @@
 
 **Theme:** light
 
-shadcn/ui is a monochromatic design-system workshop: pure white canvas, soft warm-gray surfaces, and large-radius cards floating on hairline borders. The interface is almost entirely achromatic — black text, white surfaces, gray secondary tones — with a single destructive red reserved for error states and nothing else. Typography uses Inter with restrained tracking, creating a quiet, code-adjacent feel that reads as developer infrastructure rather than consumer product.
+shadcn/ui is a monochromatic design-system workshop: pure white canvas, soft warm-gray surfaces, and large-radius cards floating on hairline borders. The base interface stays neutral — black text, white surfaces, and gray secondary tones. Muted semantic colors appear only on meaningful status and feedback surfaces; they do not serve as branding or decoration. Destructive actions keep their dedicated red. Typography uses Inter with restrained tracking, creating a quiet, code-adjacent feel that reads as developer infrastructure rather than consumer product.
 
 ## Tokens — Colors
 
@@ -16,7 +16,67 @@ shadcn/ui is a monochromatic design-system workshop: pure white canvas, soft war
 | Ink Soft | `#171717` | `--color-ink-soft` | Filled button backgrounds, secondary text on light surfaces |
 | Mid Gray | `#737373` | `--color-mid-gray` | Muted body text, placeholder text, helper labels, icon fills at rest |
 | Hairline | `#e5e5e5` | `--color-hairline` | Borders, input outlines, card edges, badge outlines |
-| Ember | `#e7000b` | `--color-ember` | Red reserved for errors and destructive actions |
+| Ember | `#e7000b` | `--color-ember` | Dedicated red for destructive actions |
+
+### Semantic Status Palette
+
+Use these muted colors only for meaningful status and feedback surfaces, such as status badges, indicators, and feedback panels. Keep the base interface neutral and do not use semantic colors for branding or decoration. Every status must include a visible text label; icons can reinforce meaning when present, and color alone must never convey status. Use the same status palette at all breakpoints without changing layout. Unknown, not configured, and cancelled states with no result use a neutral gray treatment.
+
+| Meaning | Text | Background | Border | Indicator | Tokens |
+|---------|------|------------|--------|-----------|--------|
+| Danger: failed or rejected | `#9f3a38` | `#f8ebea` | `#e8c5c2` | `#c87972` | `--status-danger-text`, `--status-danger-bg`, `--status-danger-border`, `--status-danger-indicator` |
+| Warning: ongoing or processing | `#85631c` | `#faf3df` | `#e6d6a6` | `#b99545` | `--status-warning-text`, `--status-warning-bg`, `--status-warning-border`, `--status-warning-indicator` |
+| Success: positive result | `#35694b` | `#edf5ef` | `#c2d9c8` | `#79a68a` | `--status-success-text`, `--status-success-bg`, `--status-success-border`, `--status-success-indicator` |
+| Info: paused or waiting for user | `#3b6087` | `#edf2f8` | `#c6d5e6` | `#7f9cbe` | `--status-info-text`, `--status-info-bg`, `--status-info-border`, `--status-info-indicator` |
+| Neutral: unknown, not configured, cancelled with no result | Existing neutral badge text token (`#404040`) | `#f5f5f5` | `#e5e5e5` | `#a3a3a3` | Existing neutral palette tokens |
+
+### Canonical Status Mapping
+
+| Area | Statuses | Treatment |
+|------|----------|-----------|
+| Sessions | `CREATED`, `PREPARING`, `RUNNING`, `STOPPING` | Warning (ongoing) |
+| Sessions | `PAUSED`, `STOPPED` | Info (paused) |
+| Sessions | `COMPLETED` | Success |
+| Sessions | `FAILED` | Danger |
+| Sessions | `CANCELLED` | Neutral |
+| Vacancies | `PROCESSING` | Warning (ongoing) |
+| Vacancies | `SUCCESS`, `SUBMITTED`, `ALREADY_APPLIED`, `REPORTED` | Success |
+| Vacancies | `REJECTED`, `ERROR` | Danger |
+| Vacancies | `CANCELLED` | Neutral |
+| Resume | Checking | Warning (ongoing) |
+| Resume | Valid, changed | Success |
+| Resume | Unavailable | Danger |
+| Resume | Unconfigured | Neutral |
+| Resume completion | `empty`, `complete`, `partial`, `error` | Neutral, success, warning, danger |
+| Model | `LOADING`, `PENDING` | Warning (ongoing) |
+| Model | Available, connected, healthy | Success |
+| Model | Unavailable, disconnected, unhealthy, status error | Danger |
+| Model | Unknown | Neutral |
+| User action | Waiting for user | Info (paused) |
+| Work | Active processing | Warning (ongoing) |
+
+### Status Tokens
+
+| Token | Value |
+|-------|-------|
+| `--status-danger-text` | `#9f3a38` |
+| `--status-danger-bg` | `#f8ebea` |
+| `--status-danger-border` | `#e8c5c2` |
+| `--status-danger-indicator` | `#c87972` |
+| `--status-warning-text` | `#85631c` |
+| `--status-warning-bg` | `#faf3df` |
+| `--status-warning-border` | `#e6d6a6` |
+| `--status-warning-indicator` | `#b99545` |
+| `--status-success-text` | `#35694b` |
+| `--status-success-bg` | `#edf5ef` |
+| `--status-success-border` | `#c2d9c8` |
+| `--status-success-indicator` | `#79a68a` |
+| `--status-info-text` | `#3b6087` |
+| `--status-info-bg` | `#edf2f8` |
+| `--status-info-border` | `#c6d5e6` |
+| `--status-info-indicator` | `#7f9cbe` |
+
+The `--color-ember` value (`#e7000b`) remains reserved for destructive actions. Status errors use the muted danger palette above.
 
 ## Tokens — Typography
 
@@ -110,7 +170,7 @@ becomes width 100% so controls remain within the viewport.
 ### Primary Filled Button
 **Role:** High-emphasis action (Submit, Save, Create)
 
-Background #0a0a0a, text #fafafa, border none, radius 18px, padding 0px 12px (compact) or 8px 16px (comfortable), font 14px Inter weight 500. Height ≈ 36–40px. The dark-on-light inversion is the only chromatic interaction in the system; the fully rounded radius (18px on a ~36px height) produces perfect pill geometry.
+Background #0a0a0a, text #fafafa, border none, radius 18px, padding 0px 12px (compact) or 8px 16px (comfortable), font 14px Inter weight 500. Height ≈ 36–40px. The dark-on-light inversion is the primary action treatment; the fully rounded radius (18px on a ~36px height) produces perfect pill geometry.
 
 ### Secondary Ghost Button
 **Role:** Low-emphasis action (Cancel, Back)
@@ -185,7 +245,7 @@ Background #f5f5f5, text #737373, radius 18px, padding 8px 10px, with a keyboard
 ### Destructive Action
 **Role:** Delete, remove, revoke — error-adjacent interactions
 
-Text or icon in #e7000b against the monochromatic palette. The red is the only chromatic hue in the system and appears exclusively in destructive or error contexts — it never decorates.
+Text or icon in #e7000b for destructive actions. Keep this dedicated red separate from status feedback: failed and rejected statuses use the muted semantic danger palette. Neither treatment is decorative.
 
 ## Do's and Don'ts
 
@@ -193,16 +253,16 @@ Text or icon in #e7000b against the monochromatic palette. The red is the only c
 - Use #0a0a0a on #ffffff for filled buttons — the dark inversion is the only primary action treatment.
 - Maintain 18px radius on all buttons, inputs, and badges for perfect pill geometry; use 24px radius only on cards.
 - Set display headlines at 48px/600 with -0.0500em tracking — Inter's neutral weight at this size with aggressive tightening produces the engineered headline voice.
-- Reserve #e7000b exclusively for destructive states; never use it for decoration, branding, or non-error emphasis.
+- Reserve #e7000b exclusively for destructive actions; never use it for status errors, decoration, branding, or non-error emphasis. Use muted semantic status colors for status feedback.
 - Stack card shadows as 1px hairline + 1px + 2px offset — the combined effect is a barely-perceptible elevation that reads as 'card' without drama.
 - Use #f5f5f5 for secondary surfaces and inputs; use #fafafa for subtle navigation and card variants — the three-tone surface stack (canvas → soft → paper) creates layering without borders.
 
 ### Don't
-- Do not introduce chromatic brand colors beyond #e7000b — the monochromatic palette is the system.
+- Do not introduce brand or decorative colors. Keep the base interface neutral; use only the documented muted semantic palette on meaningful status and feedback surfaces, and reserve #e7000b for destructive actions.
 - Do not use border-radius values other than 18px (interactive) or 24px (containers); avoid square corners on any element.
 - Do not skip the 1px hairline border on cards — the shadow alone does not define the card edge in this system.
 - Do not set body text below 14px or above #737373 lightness — the type scale is deliberately compact.
-- Do not apply gradients, colored shadows, or accent fills — every surface is a solid tone.
+- Do not apply gradients, colored shadows, or decorative accent fills — every surface is a solid tone. Semantic status fills are limited to meaningful status and feedback surfaces.
 - Do not use letter-spacing wider than 0.05em or tighter than -0.05em; tracking outside this range breaks the typographic system.
 - Do not mix filled and outline buttons of the same size in a single row without visual rhythm — alternate ghost or secondary variants.
 
@@ -234,7 +294,8 @@ Minimal imagery — the system is almost entirely UI. No hero photography, no il
 - Muted text: #737373
 - Border: #e5e5e5
 - primary action: #171717 (filled action)
-- Destructive: #e7000b
+- Destructive action: #e7000b
+- Status palette: use the canonical semantic status tokens above for feedback surfaces only
 
 **Example Component Prompts**
 1. Create a dashboard stat card: white (#ffffff) background, 24px radius, 1px solid #e5e5e5 border, shadow 0 0 0 1px rgba(23,23,23,0.05) + 0 1px 3px rgba(0,0,0,0.1) + 0 1px 2px -1px rgba(0,0,0,0.1), 20px padding. Label in 12px uppercase #737373, value in 36px Inter weight 600 #0a0a0a with -0.025em tracking.
@@ -245,19 +306,19 @@ Minimal imagery — the system is almost entirely UI. No hero photography, no il
 
 4. Create an input field: background #f5f5f5, text #0a0a0a, placeholder #737373, no border at rest, 18px radius, padding 8px 10px, font 14px weight 400. On focus: 1px solid #e5e5e5 ring with no offset.
 
-5. Create a badge tag: background #171717, text #fafafa, 18px radius (full pill), padding 2px 8px, font 12px Inter weight 500.
+5. Create a neutral badge tag: background #171717, text #fafafa, 18px radius (full pill), padding 2px 8px, font 12px Inter weight 500. For a status badge, use its documented semantic status tokens and include a visible text label; an icon can reinforce meaning when present.
 
 ## Design Philosophy
 
-shadcn/ui is built on three principles visible in every token: (1) achromatic by default — color is absence, not expression; (2) radius defines hierarchy — 18px for interactive elements, 24px for containers, never anything in between; (3) elevation is whisper-quiet — the card shadow is barely perceptible, relying on 1px hairlines and tonal contrast rather than dramatic drop shadows. The system is designed to be copied, modified, and owned — every value is explicit, every token is simple, and nothing is locked behind abstraction.
+shadcn/ui is built on three principles visible in every token: (1) neutral by default — muted semantic colors communicate meaningful status and feedback only; (2) radius defines hierarchy — 18px for interactive elements, 24px for containers, never anything in between; (3) elevation is whisper-quiet — the card shadow is barely perceptible, relying on 1px hairlines and tonal contrast rather than dramatic drop shadows. The system is designed to be copied, modified, and owned — every value is explicit, every token is simple, and nothing is locked behind abstraction.
 
 ## Similar Brands
 
 - **Vercel** — Same monochromatic palette, same Inter sans pairing, same pill-shaped buttons with tight letter-spacing on display text
-- **Linear** — Identical approach to monochromatic UI with single accent for destructive states, tight typographic tracking, and hairline-bordered cards
+- **Linear** — Identical approach to neutral UI with restrained status feedback, tight typographic tracking, and hairline-bordered cards
 - **Radix UI** — Same developer-tool visual language — neutral surfaces, geometric type, and component-first documentation layout
 - **Tailwind UI** — Matching restrained palette, identical border-radius scale (large radii on containers), and code-adjacent minimal chrome
-- **Cal.com** — Same compact density, same pill-badge system, and the same achromatic-first approach with red reserved for errors
+- **Cal.com** — Same compact density, same pill-badge system, and the same neutral-first approach
 
 ## Quick Start
 
@@ -274,6 +335,24 @@ shadcn/ui is built on three principles visible in every token: (1) achromatic by
   --color-mid-gray: #737373;
   --color-hairline: #e5e5e5;
   --color-ember: #e7000b;
+
+  /* Semantic status colors — use only on meaningful status/feedback surfaces */
+  --status-danger-text: #9f3a38;
+  --status-danger-bg: #f8ebea;
+  --status-danger-border: #e8c5c2;
+  --status-danger-indicator: #c87972;
+  --status-warning-text: #85631c;
+  --status-warning-bg: #faf3df;
+  --status-warning-border: #e6d6a6;
+  --status-warning-indicator: #b99545;
+  --status-success-text: #35694b;
+  --status-success-bg: #edf5ef;
+  --status-success-border: #c2d9c8;
+  --status-success-indicator: #79a68a;
+  --status-info-text: #3b6087;
+  --status-info-bg: #edf2f8;
+  --status-info-border: #c6d5e6;
+  --status-info-indicator: #7f9cbe;
 
   /* Typography — Font Families */
   --font-inter: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -367,6 +446,24 @@ shadcn/ui is built on three principles visible in every token: (1) achromatic by
   --color-mid-gray: #737373;
   --color-hairline: #e5e5e5;
   --color-ember: #e7000b;
+
+  /* Semantic status colors — use only on meaningful status/feedback surfaces */
+  --status-danger-text: #9f3a38;
+  --status-danger-bg: #f8ebea;
+  --status-danger-border: #e8c5c2;
+  --status-danger-indicator: #c87972;
+  --status-warning-text: #85631c;
+  --status-warning-bg: #faf3df;
+  --status-warning-border: #e6d6a6;
+  --status-warning-indicator: #b99545;
+  --status-success-text: #35694b;
+  --status-success-bg: #edf5ef;
+  --status-success-border: #c2d9c8;
+  --status-success-indicator: #79a68a;
+  --status-info-text: #3b6087;
+  --status-info-bg: #edf2f8;
+  --status-info-border: #c6d5e6;
+  --status-info-indicator: #7f9cbe;
 
   /* Typography */
   --font-inter: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;

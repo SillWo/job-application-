@@ -9,6 +9,7 @@ export type ResumeCoverage = {
   hidden?: string[];
   hidden_fields?: string[];
   unsupported?: string[];
+  unsupported_fields?: string[];
   parse_errors?: string[];
   present_count?: number;
   total_count?: number;
@@ -68,6 +69,8 @@ export type ResumeSourceRecord = {
   resumeDataStatus: "ready" | "missing" | "corrupt" | null;
   resumeDataSavedAt: string | null;
   resumeDataErrorMessage: string | null;
+  completionStatus: ResumeCompletionStatus | null;
+  completionErrorMessage: string | null;
   grammaticalGender?: "male" | "female" | null;
   previewToken?: string;
   preview: ResumePreview;
@@ -82,6 +85,8 @@ export type ResumeSourceRecord = {
   importUrl?: string;
   importedAt?: string;
 };
+
+export type ResumeCompletionStatus = "empty" | "complete" | "partial" | "error";
 
 const STORAGE_KEY = "job-orchestrator.resume-sources";
 
@@ -223,16 +228,20 @@ export function sourceRecordFromResponse(value: unknown): ResumeSourceRecord | n
     : null;
   return {
     adapterId: value.adapter_id,
-    usesSavedData: value.uses_saved_data === true,
-    // Old HH/Zarplata records predate durable resume copies. Treat them as
-    // missing so they fail closed until the user explicitly refreshes them.
-    resumeDataStatus: value.adapter_id === "hh" || value.adapter_id === "zarplata"
+    usesSavedData: value.uses_saved_data === true || ["hh", "hirehi", "zarplata"].includes(value.adapter_id),
+    // Older records predate durable resume copies. Treat them as missing so
+    // they fail closed until the user explicitly refreshes them.
+    resumeDataStatus: ["hh", "hirehi", "zarplata"].includes(value.adapter_id)
       ? value.resume_data_status === "ready" || value.resume_data_status === "corrupt" || value.resume_data_status === "missing"
         ? value.resume_data_status
         : "missing"
       : null,
     resumeDataSavedAt: typeof value.resume_data_saved_at === "string" ? value.resume_data_saved_at : null,
     resumeDataErrorMessage: typeof value.resume_data_error_message === "string" ? value.resume_data_error_message : null,
+    completionStatus: value.completion_status === "empty" || value.completion_status === "complete" || value.completion_status === "partial" || value.completion_status === "error"
+      ? value.completion_status
+      : null,
+    completionErrorMessage: typeof value.completion_error_message === "string" ? value.completion_error_message : null,
     grammaticalGender,
     status,
     // The record's presence means it was durably confirmed. Usability is
@@ -298,6 +307,7 @@ export function previewSections(preview: ResumePreview): Array<{ label: string; 
 
 const RESUME_SECTION_LABELS: Record<string, string> = {
   about: "О себе",
+  identity: "Личные данные",
   personal: "Личные данные",
   personal_info: "Личные данные",
   experience: "Опыт работы",
@@ -318,7 +328,71 @@ const RESUME_SECTION_LABELS: Record<string, string> = {
   schedule: "График работы",
   salary: "Зарплатные ожидания",
   desired_position: "Желаемая должность",
+  target: "Желаемая должность",
+  location: "Местоположение",
+  total_experience: "Общий опыт работы",
 };
+
+const MAIN_RESUME_SECTIONS = new Set([
+  "identity", "contacts", "target", "location", "experience", "skills", "education", "languages", "about", "total_experience",
+]);
+const MAIN_SECTION_ALIASES: Record<string, string> = {
+  personal: "identity", personal_info: "identity", personal_data: "identity", identity: "identity",
+  contact: "contacts", contacts: "contacts",
+  desired_position: "target", target_role: "target", target_title: "target", target: "target",
+  work_location: "location", location: "location",
+  work_experience: "experience", experience: "experience",
+  key_skills: "skills", skills: "skills",
+  languages: "languages", education: "education", about: "about", total_experience: "total_experience",
+};
+
+function canonicalMainSection(value: string): string | undefined {
+  const key = value.trim().toLocaleLowerCase().replace(/[\s-]+/gu, "_").split(/[.[\]]/u, 1)[0];
+  const canonical = MAIN_SECTION_ALIASES[key];
+  return canonical && MAIN_RESUME_SECTIONS.has(canonical) ? canonical : undefined;
+}
+
+/** Derive a compatibility status for older source responses without completion_status. */
+export function completionStatusFromCoverage(preview: ResumePreview, resumeDataStatus: ResumeSourceRecord["resumeDataStatus"]): ResumeCompletionStatus {
+  if (resumeDataStatus === "missing" || resumeDataStatus === "corrupt") return "error";
+  if (resumeDataStatus !== "ready") return "empty";
+
+  const sectionStatuses = new Map<string, string>();
+  const add = (value: unknown, status: string) => {
+    if (typeof value !== "string") return;
+    const section = canonicalMainSection(value);
+    if (section) sectionStatuses.set(section, status);
+  };
+  preview.sections?.forEach((item) => typeof item === "string" ? add(item, "present") : add(item.key || item.title || item.label, item.status || "present"));
+  const coverage = preview.coverage;
+  (coverage?.sections ?? []).forEach((item) => add(item, "present"));
+  (coverage?.present_sections ?? coverage?.present ?? []).forEach((item) => add(item, "present"));
+  (coverage?.missing_sections ?? coverage?.missing ?? []).forEach((item) => add(item, "not_provided"));
+  (coverage?.hidden_fields ?? coverage?.hidden ?? preview.hidden_fields ?? []).forEach((item) => add(item, "hidden"));
+  (coverage?.unsupported ?? []).forEach((item) => add(item, "unsupported"));
+  (coverage?.unsupported_fields ?? []).forEach((item) => add(item, "unsupported"));
+  (coverage?.parse_errors ?? []).forEach((item) => add(item, "parse_error"));
+
+  const allPresent = [...MAIN_RESUME_SECTIONS].every((section) => sectionStatuses.get(section) === "present");
+  return allPresent ? "complete" : "partial";
+}
+
+/** Avoid rendering URLs or URL credentials in profile status tooltips. */
+export function safeCompletionErrorMessage(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const safe = value.trim()
+    .replace(/https?:\/\/[^\s)\]}>,]+/giu, "ссылку")
+    .replace(/(?:www\.)?[\w.-]+\.(?:ru|com|net|org)\/[^\s)\]}>,]*/giu, "ссылку")
+    .replace(/[?#][^\s)\]}>,]*/gu, "")
+    .trim();
+  return safe || "Не удалось обработать сохранённое резюме.";
+}
+
+export function resumeCompletionStatus(record: ResumeSourceRecord | undefined, importError?: string): ResumeCompletionStatus {
+  if (!record) return importError ? "error" : "empty";
+  if (record.resumeDataStatus === "missing" || record.resumeDataStatus === "corrupt") return "error";
+  return record.completionStatus ?? completionStatusFromCoverage(record.preview, record.resumeDataStatus);
+}
 
 /** Turn known normalized source keys into labels suitable for the profile UI. */
 export function resumeSectionLabel(value: string): string {

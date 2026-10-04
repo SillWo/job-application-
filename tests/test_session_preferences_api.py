@@ -28,6 +28,21 @@ def _payload(**overrides):
     }
 
 
+def _add_saved_source(db, snapshot):
+    source_url = "https://hh.ru/resume/resume-1"
+    public, _ = _redacted_snapshot(snapshot)
+    db.add(SavedResumeSource(
+        adapter_id="hh",
+        source_url=source_url,
+        source_url_hash=hashlib.sha256(source_url.encode()).hexdigest(),
+        resume_id_hash=hashlib.sha256(snapshot.source_resume_id.encode()).hexdigest(),
+        content_hash=public.content_hash,
+        resume_snapshot_payload=_seal_private(snapshot.model_dump(mode="json")),
+        preview={},
+        status="unavailable",
+    ))
+
+
 def test_description_is_limited_to_2000_characters():
     assert len(SessionCreate.model_validate(_payload(desired_job_description="x" * 2000)).desired_job_description) == 2000
     with pytest.raises(ValidationError):
@@ -112,8 +127,9 @@ def test_create_session_normalizes_hirehi_limit_and_pro_flag(
         preview={},
         status="valid",
     )
-    if adapter_id == "hh":
-        url = "https://hh.ru/resume/preferences-fixture"
+    url_host = {"hh": "hh.ru", "hirehi": "hirehi.ru"}.get(adapter_id)
+    if url_host:
+        url = f"https://{url_host}/resume/preferences-fixture"
         cached = _normalize_extracted(
             {
                 "external_id": "preferences-fixture",
@@ -122,7 +138,7 @@ def test_create_session_normalizes_hirehi_limit_and_pro_flag(
                 "about": "Synthetic preferences fixture",
                 "skills": [{"name": "Python"}],
             },
-            adapter_id="hh",
+            adapter_id=adapter_id,
             source_url=url,
         )
         public, _ = _redacted_snapshot(cached)
@@ -191,6 +207,7 @@ async def test_start_accepts_session_without_waiting_for_model(monkeypatch, db, 
         source_url="https://hh.ru/resume/resume-1",
     )
     persist_session_snapshot(db, item.id, full)
+    _add_saved_source(db, full)
     db.commit()
     called = []
 

@@ -142,7 +142,7 @@ def test_post_sessions_returns_202_before_import_and_auto_start_is_durable(runti
     assert len(supervisor.calls) == 1
 
 
-def test_hirehi_launch_pins_source_identity_but_waits_to_pin_fresh_content(runtime_client):
+def test_hirehi_launch_pins_confirmed_cached_content_before_worker_start(runtime_client):
     client, sessions, _supervisor = runtime_client
     with sessions() as db:
         db.add(_source("hirehi"))
@@ -159,12 +159,14 @@ def test_hirehi_launch_pins_source_identity_but_waits_to_pin_fresh_content(runti
         execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
         assert execution.source_url == "https://hirehi.ru/resume/fixture"
         assert execution.source_url_hash == hashlib.sha256(execution.source_url.encode()).hexdigest()
-        assert execution.source_content_hash is None
-        assert db.scalar(
+        saved = db.scalar(select(SavedResumeSource).where(SavedResumeSource.adapter_id == "hirehi"))
+        assert execution.source_content_hash == saved.content_hash
+        pinned = db.scalar(
             select(func.count(api.SessionResumeSnapshot.id)).where(
                 api.SessionResumeSnapshot.session_id == session_id
             )
-        ) == 0
+        )
+        assert pinned == 1
 
 
 def test_start_during_preparation_reuses_one_worker_and_never_imports_in_api(runtime_client, monkeypatch):
@@ -360,16 +362,16 @@ def _runtime_session(sessions, *, auto_start: bool = False, adapter_id: str = "h
             db.flush()
         source.source_url = source_url
         source.source_url_hash = snapshot.source_url_hash
-        # HireHi deliberately imports fresh content after launch.  Its saved
-        # profile hash is allowed to differ until that first import is pinned.
-        source.content_hash = "f" * 64 if adapter_id == "hirehi" else public_snapshot.content_hash
+        source.resume_id_hash = hashlib.sha256(snapshot.source_resume_id.encode()).hexdigest()
+        source.content_hash = public_snapshot.content_hash
+        source.resume_snapshot_payload = _seal_private(snapshot.model_dump(mode="json"))
         execution = SessionExecution(
             session_id=item.id,
             stage="PREPARING",
             generation=4,
             source_url=source_url,
             source_url_hash=snapshot.source_url_hash,
-            source_content_hash=(None if adapter_id == "hirehi" else public_snapshot.content_hash),
+            source_content_hash=public_snapshot.content_hash,
             start_requested=auto_start,
         )
         db.add(execution)
@@ -387,23 +389,18 @@ async def _wait_until(predicate, timeout: float = 3.0):
 
 
 @pytest.mark.asyncio
-async def test_production_worker_import_is_outside_request_and_auto_start_false_is_one_shot(
+async def test_production_worker_uses_hirehi_copy_and_auto_start_false_is_one_shot(
     runtime_client, monkeypatch
 ):
     _client, sessions, _supervisor = runtime_client
     session_id, snapshot = _runtime_session(sessions, adapter_id="hirehi")
-    gate = asyncio.Event()
-    importer_entered = asyncio.Event()
     import_calls = 0
     workflow_calls = 0
 
-    async def blocked_import(db, adapter_id):
+    async def must_not_import(*_args, **_kwargs):
         nonlocal import_calls
         import_calls += 1
-        importer_entered.set()
-        await gate.wait()
-        row = db.scalar(select(SavedResumeSource).where(SavedResumeSource.adapter_id == adapter_id))
-        return row, snapshot
+        raise AssertionError("worker re-read the HireHi resume")
 
     class FakeWorkflow:
         def __init__(self, *, generation=None):
@@ -419,7 +416,7 @@ async def test_production_worker_import_is_outside_request_and_auto_start_false_
     from backend.services import resume_session
 
     monkeypatch.setattr(database, "SessionLocal", sessions)
-    monkeypatch.setattr(resume_session, "revalidate_saved_resume_source", blocked_import)
+    monkeypatch.setattr(resume_session, "revalidate_saved_resume_source", must_not_import)
     monkeypatch.setattr(workflow_module, "WorkflowManager", FakeWorkflow)
     commands = LocalQueue()
     events = LocalQueue()
@@ -427,18 +424,6 @@ async def test_production_worker_import_is_outside_request_and_auto_start_false_
         worker._serve(session_id, 4, BoundedChannel(commands, capacity=8), BoundedChannel(events, capacity=8))
     )
     commands.put(WorkerCommand(session_id, 4, "START"))
-    await importer_entered.wait()
-    with sessions() as db:
-        assert db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id)).stage == "IMPORTING"
-        assert db.scalar(select(func.count(JobSession.id))) == 1
-        assert db.scalar(select(func.count(SavedResumeSource.id))) == 2
-        assert db.scalar(select(func.count(SessionIdempotencyKey.id))) == 0
-    # The importer is still blocked, but this is after the API's immediate
-    # response and is running in the production worker control flow.
-    assert not worker_task.done()
-    gate.set()
-    await _wait_until(lambda: import_calls == 1)
-
     def ready():
         with sessions() as db:
             execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
@@ -455,45 +440,51 @@ async def test_production_worker_import_is_outside_request_and_auto_start_false_
         assert execution.stage == "READY"
         assert execution.source_content_hash == imported.content_hash
         assert imported.content_hash == _redacted_snapshot(snapshot)[0].content_hash
-        assert imported.content_hash != "f" * 64
+        assert imported.full_snapshot["source_site"] == "hirehi"
         assert db.scalar(select(func.count(JobSession.id))) == 1
     assert workflow_calls == 0
     commands.put(WorkerCommand(session_id, 4, "START"))
     await asyncio.wait_for(worker_task, timeout=3)
-    assert import_calls == 1
+    assert import_calls == 0
     assert workflow_calls == 1
     with sessions() as db:
         assert db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id)).generation == 4
 
 
 @pytest.mark.asyncio
-async def test_hirehi_worker_rejects_source_changed_during_import(runtime_client, monkeypatch):
+async def test_hirehi_worker_keeps_frozen_snapshot_after_source_content_refresh(runtime_client, monkeypatch):
     _client, sessions, _supervisor = runtime_client
-    session_id, _old_snapshot = _runtime_session(sessions, adapter_id="hirehi")
-    changed_url = "https://hirehi.ru/resume/changed"
+    session_id, frozen_snapshot = _runtime_session(sessions, auto_start=True, adapter_id="hirehi")
     changed_snapshot = _normalize_extracted(
         {
-            "external_id": "changed",
-            "identity": {"full_name": "Changed Candidate", "gender": "male"},
-            "target": {"title": "Changed Engineer"},
-            "about": "Changed synthetic candidate profile",
+            "external_id": "worker-fixture",
+            "identity": {"full_name": "Updated Candidate", "gender": "male"},
+            "target": {"title": "Updated Engineer"},
+            "about": "Updated synthetic candidate profile",
         },
         adapter_id="hirehi",
-        source_url=changed_url,
+        source_url="https://hirehi.ru/resume/worker-fixture",
     )
+    with sessions() as db:
+        persist_session_snapshot(db, session_id, frozen_snapshot)
+        source = db.scalar(select(SavedResumeSource).where(SavedResumeSource.adapter_id == "hirehi"))
+        source.resume_snapshot_payload = _seal_private(changed_snapshot.model_dump(mode="json"))
+        source.content_hash = _redacted_snapshot(changed_snapshot)[0].content_hash
+        db.commit()
 
-    async def changed_import(db, adapter_id):
-        source = db.scalar(select(SavedResumeSource).where(SavedResumeSource.adapter_id == adapter_id))
-        source.source_url = changed_url
-        source.source_url_hash = changed_snapshot.source_url_hash
-        return source, changed_snapshot
+    async def must_not_reimport(*_args, **_kwargs):
+        pytest.fail("worker reopened a refreshed HireHi source")
 
     class FakeWorkflow:
         def __init__(self, *, generation=None):
             pass
 
         async def run(self, _session_id):
-            pytest.fail("workflow started after source identity changed")
+            with sessions() as db:
+                item = db.get(JobSession, session_id)
+                item.status = SessionStatus.COMPLETED
+                item.finished_at = datetime.now(timezone.utc)
+                db.commit()
 
     from backend.orchestrator import workflow as workflow_module
     from backend.persistence import database
@@ -501,7 +492,7 @@ async def test_hirehi_worker_rejects_source_changed_during_import(runtime_client
     from backend.services import resume_session
 
     monkeypatch.setattr(database, "SessionLocal", sessions)
-    monkeypatch.setattr(resume_session, "revalidate_saved_resume_source", changed_import)
+    monkeypatch.setattr(resume_session, "revalidate_saved_resume_source", must_not_reimport)
     monkeypatch.setattr(workflow_module, "WorkflowManager", FakeWorkflow)
     commands = LocalQueue()
     events = LocalQueue()
@@ -513,18 +504,16 @@ async def test_hirehi_worker_rejects_source_changed_during_import(runtime_client
     with sessions() as db:
         item = db.get(JobSession, session_id)
         execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
-        assert item.status == SessionStatus.FAILED
-        assert "Ссылка источника изменилась" in item.stop_reason
-        assert execution.stage == "FAILED"
-        assert db.scalar(
-            select(func.count(api.SessionResumeSnapshot.id)).where(
-                api.SessionResumeSnapshot.session_id == session_id
-            )
-        ) == 0
+        stored = db.scalar(select(api.SessionResumeSnapshot).where(
+            api.SessionResumeSnapshot.session_id == session_id
+        ))
+        assert item.status == SessionStatus.COMPLETED
+        assert execution.stage == "COMPLETED"
+        assert stored.full_snapshot["identity"]["full_name"]["value"] == "Test Candidate"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("adapter_id", ["hh", "zarplata"])
+@pytest.mark.parametrize("adapter_id", ["hh", "hirehi", "zarplata"])
 async def test_cached_snapshot_tampering_fails_closed_without_reimport(
     runtime_client, monkeypatch, adapter_id
 ):
@@ -577,24 +566,14 @@ async def test_cached_snapshot_tampering_fails_closed_without_reimport(
 
 
 @pytest.mark.asyncio
-async def test_production_worker_cancelled_blocked_import_cannot_persist_late_snapshot(
+async def test_production_worker_cancelled_before_cached_preparation_cannot_persist_snapshot(
     runtime_client, monkeypatch
 ):
     _client, sessions, _supervisor = runtime_client
-    session_id, snapshot = _runtime_session(sessions, adapter_id="hirehi")
-    gate = asyncio.Event()
-    importer_entered = asyncio.Event()
+    session_id, _snapshot = _runtime_session(sessions, adapter_id="hirehi")
 
-    async def late_import(db, adapter_id):
-        importer_entered.set()
-        try:
-            await gate.wait()
-        except asyncio.CancelledError:
-            # Model a browser task that returns a late result despite the
-            # cancellation request; the production fence must discard it.
-            await gate.wait()
-        row = db.scalar(select(SavedResumeSource).where(SavedResumeSource.adapter_id == adapter_id))
-        return row, snapshot
+    async def must_not_reimport(*_args, **_kwargs):
+        pytest.fail("cached HireHi preparation attempted a network import")
 
     class FakeWorkflow:
         def __init__(self, *, generation=None):
@@ -609,20 +588,18 @@ async def test_production_worker_cancelled_blocked_import_cannot_persist_late_sn
     from backend.services import resume_session
 
     monkeypatch.setattr(database, "SessionLocal", sessions)
-    monkeypatch.setattr(resume_session, "revalidate_saved_resume_source", late_import)
+    monkeypatch.setattr(resume_session, "revalidate_saved_resume_source", must_not_reimport)
     monkeypatch.setattr(workflow_module, "WorkflowManager", FakeWorkflow)
     commands = LocalQueue()
     events = LocalQueue()
+    with sessions() as db:
+        request_cancel(db, session_id)
+        db.commit()
     worker_task = asyncio.create_task(
         worker._serve(session_id, 4, BoundedChannel(commands, capacity=8), BoundedChannel(events, capacity=8))
     )
     commands.put(WorkerCommand(session_id, 4, "START"))
-    await importer_entered.wait()
-    with sessions() as db:
-        request_cancel(db, session_id)
-        db.commit()
     commands.put(WorkerCommand(session_id, 4, "STOP"))
-    gate.set()
     await asyncio.wait_for(worker_task, timeout=3)
     with sessions() as db:
         item = db.get(JobSession, session_id)
@@ -633,7 +610,7 @@ async def test_production_worker_cancelled_blocked_import_cannot_persist_late_sn
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("adapter_id", ["hh", "zarplata"])
+@pytest.mark.parametrize("adapter_id", ["hh", "hirehi", "zarplata"])
 async def test_production_worker_recovery_uses_existing_immutable_snapshot_without_reimport(
     runtime_client, monkeypatch, adapter_id
 ):
@@ -689,7 +666,7 @@ async def test_production_worker_recovery_uses_existing_immutable_snapshot_witho
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cached_snapshot", [False, True], ids=["fresh-import", "immutable-snapshot"])
+@pytest.mark.parametrize("cached_snapshot", [False, True], ids=["local-cache", "immutable-snapshot"])
 async def test_running_stage_is_durable_before_workflow_starts(
     runtime_client, monkeypatch, cached_snapshot
 ):

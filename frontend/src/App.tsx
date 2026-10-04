@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Toaster, toast } from "sonner";
 import { Select } from "@base-ui/react/select";
 import { Popover } from "@base-ui/react/popover";
+import { AlertDialog } from "@base-ui/react/alert-dialog";
+import { Dialog } from "@base-ui/react/dialog";
 import { api } from "./api";
 import { formatUtcTimestampLocal, localDateTimeBounds } from "./vacancyDates";
 import { validateVacancyFilters, type VacancyFilterRangeFields } from "./vacancyFilterValidation";
@@ -26,16 +28,16 @@ import {
   resumeSourcesFromResponse,
   sourceRecordFromResponse,
   RESUME_SITES,
-  questionOptionLabel,
-  isResumeQuestionValid,
   resumeQuestions,
+  isResumeQuestionValid,
   previewSections,
   resumeContactLabel,
   statusLabel,
-  resumeDisplayTitle,
-  safeResumeUrlLabel,
   publicResumeSourceUrl,
   safeResumeImportUrl,
+  safeResumeUrlLabel,
+  resumeCompletionStatus,
+  safeCompletionErrorMessage,
   type ResumePreview,
   type ResumePreviewResponse,
   type ResumeSourceRecord,
@@ -129,23 +131,13 @@ function presentationBreakdown(rows: ScoreComponent[] | Record<string, number | 
 
 const nav = [["/", "Обзор", "M4 12h16M12 4l8 8-8 8"], ["/profile", "Профиль", "M20 21a8 8 0 0 0-16 0M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8"], ["/session", "Сессия", "M4 6h16M4 12h16M4 18h16"], ["/vacancies", "Вакансии", "M6 3h9l3 3v15H6zM9 12h6M9 16h6"], ["/model", "Модель", "M4 6h16M4 12h16M4 18h16M8 4v4m8 2v4m-5 4v4"]] as const;
 const STATUS_META: Record<string, { label: string; tone: string }> = {
-  CREATED: { label: "Создана", tone: "neutral" }, RUNNING: { label: "В работе", tone: "success" }, PAUSED: { label: "Приостановлена", tone: "warning" }, STOPPED: { label: "Остановлена", tone: "neutral" }, COMPLETED: { label: "Завершена", tone: "success" }, FAILED: { label: "Ошибка", tone: "danger" },
-  SUCCESS: { label: "Успех", tone: "success" }, PROCESSING: { label: "В процессе", tone: "info" }, REJECTED: { label: "Отклонена", tone: "danger" }, ERROR: { label: "Ошибка", tone: "danger" },
-  CONNECTED: { label: "Соединение есть", tone: "success" }, DISCONNECTED: { label: "Нет соединения", tone: "danger" },
-  AVAILABLE: { label: "Модель доступна", tone: "success" },
-  UNAVAILABLE: { label: "Модель недоступна", tone: "danger" },
-  HEALTHY: { label: "Генерация работает", tone: "success" },
-  UNHEALTHY: { label: "Ошибка генерации", tone: "danger" },
-  PENDING: { label: "Ожидание генерации", tone: "info" },
+  CREATED: { label: "Создана", tone: "warning" }, PREPARING: { label: "Подготовка", tone: "warning" }, RUNNING: { label: "В работе", tone: "warning" }, STOPPING: { label: "Остановка", tone: "warning" }, PROCESSING: { label: "В процессе", tone: "warning" }, LOADING: { label: "Проверяем", tone: "warning" }, PENDING: { label: "Ожидание генерации", tone: "warning" },
+  PAUSED: { label: "Приостановлена", tone: "info" }, STOPPED: { label: "Остановлена", tone: "info" },
+  COMPLETED: { label: "Завершена", tone: "success" }, SUCCESS: { label: "Успех", tone: "success" }, CONNECTED: { label: "Соединение есть", tone: "success" }, AVAILABLE: { label: "Модель доступна", tone: "success" }, HEALTHY: { label: "Генерация работает", tone: "success" },
+  FAILED: { label: "Ошибка", tone: "danger" }, REJECTED: { label: "Отклонена", tone: "danger" }, ERROR: { label: "Ошибка", tone: "danger" }, DISCONNECTED: { label: "Нет соединения", tone: "danger" }, UNAVAILABLE: { label: "Модель недоступна", tone: "danger" }, UNHEALTHY: { label: "Ошибка генерации", tone: "danger" }, STATUS_ERROR: { label: "Статус недоступен", tone: "danger" },
   UNKNOWN: { label: "Ещё не проверено", tone: "neutral" },
-  STATUS_ERROR: { label: "Статус недоступен", tone: "danger" },
-  LOADING: { label: "Проверяем", tone: "neutral" },
+  CANCELLED: { label: "Отменена", tone: "neutral" },
 };
-Object.assign(STATUS_META, {
-  PREPARING: { label: "\u041f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043a\u0430", tone: "neutral" },
-  STOPPING: { label: "\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430", tone: "warning" },
-  CANCELLED: { label: "\u041e\u0442\u043c\u0435\u043d\u0435\u043d\u0430", tone: "neutral" },
-});
 const TERMINAL_SESSION_STATUSES = ["COMPLETED", "STOPPED", "FAILED", "CANCELLED"];
 type VacancyFilters = {
   search: string;
@@ -222,6 +214,7 @@ function vacancyExportUrl(filters: VacancyFilters, format: "csv" | "xlsx" | "xml
   return `/api/vacancies/export?${params}`;
 }
 function humanStatus(value: string) { return STATUS_META[value]?.label ?? value.replaceAll("_", " ").toLowerCase(); }
+function statusTone(value?: string) { return value ? STATUS_META[value]?.tone ?? "neutral" : "neutral"; }
 function localizeNotificationText(value: string): string {
   const statusCodes = "CREATED|PREPARING|RUNNING|STOPPING|STOPPED|PAUSED|COMPLETED|FAILED|CANCELLED";
   const lifecycle = value.match(new RegExp(`^Сессия\\s+#?(\\d+):\\s*статус изменён на\\s+(${statusCodes})$`, "iu"));
@@ -469,12 +462,12 @@ function Empty({ title = "Пока пусто", children, action, className = ""
   );
 }
 function Notice({ children, tone = "neutral", role }: { children: ReactNode; tone?: "neutral" | "success" | "warning" | "danger" | "info"; role?: "status" | "alert" }) {
-  return <p className={`notice notice-${tone}`} role={role ?? (tone === "danger" ? "alert" : "status")}>{children}</p>;
+  return <p className={`notice notice-${tone}`} data-tone={tone} role={role ?? (tone === "danger" ? "alert" : "status")}>{children}</p>;
 }
 function Status({ value, label }: { value: string; label?: string }) {
   const meta = STATUS_META[value];
   return (
-    <span className={`status status-${meta?.tone ?? "neutral"} s-${value.toLowerCase()}`} data-status={value}>
+    <span className={`status status-${meta?.tone ?? "neutral"} s-${value.toLowerCase()}`} data-status={value} data-tone={meta?.tone ?? "neutral"}>
       {label ?? humanStatus(value)}
     </span>
   );
@@ -569,6 +562,42 @@ async function fetchResumeSources(): Promise<Record<string, ResumeSourceRecord>>
   return resumeSourcesFromResponse(await api<unknown>("/resume-sources"));
 }
 
+type ResumeImportErrors = Record<string, string>;
+const RESUME_IMPORT_ERRORS_KEY = ["resume-source-import-errors"] as const;
+
+function updateResumeImportError(queryClient: ReturnType<typeof useQueryClient>, adapterId: string, message?: string) {
+  const current = queryClient.getQueryData<ResumeImportErrors>(RESUME_IMPORT_ERRORS_KEY) ?? {};
+  const next = { ...current };
+  if (message) next[adapterId] = safeCompletionErrorMessage(message) ?? "Не удалось извлечь данные из резюме.";
+  else delete next[adapterId];
+  queryClient.setQueryData(RESUME_IMPORT_ERRORS_KEY, next);
+}
+
+function useResumeImportErrors() {
+  return useQuery<ResumeImportErrors>({
+    queryKey: RESUME_IMPORT_ERRORS_KEY,
+    queryFn: async () => ({}),
+    initialData: {},
+    staleTime: Infinity,
+  }).data;
+}
+
+function resumeCompletionError(record: ResumeSourceRecord | undefined, importError: string | undefined): string | undefined {
+  return safeCompletionErrorMessage(record?.completionErrorMessage)
+    ?? (record?.resumeDataStatus === "missing" || record?.resumeDataStatus === "corrupt"
+      ? safeCompletionErrorMessage(record.resumeDataErrorMessage)
+      : undefined)
+    ?? (record?.completionStatus === "error" ? "Не удалось обработать сохранённое резюме." : undefined)
+    ?? (record ? undefined : safeCompletionErrorMessage(importError));
+}
+
+function resumeLaunchMessage(adapterId: string, status: ReturnType<typeof resumeCompletionStatus>): string | undefined {
+  const label = resumeSite(adapterId).label;
+  if (status === "empty") return `Для сайта ${label} не загружено резюме, проверьте раздел "Профиль"`;
+  if (status === "error") return `Для сайта ${label} не удалось извлечь необходимые данные из резюме, проверьте раздел "Профиль"`;
+  return undefined;
+}
+
 function Dashboard() {
   const resumeSourcesQuery = useQuery({
     queryKey: ["resume-sources"],
@@ -578,6 +607,7 @@ function Dashboard() {
     refetchOnWindowFocus: false,
   });
   const resumeSources = resumeSourcesQuery.data ?? {};
+  const importErrors = useResumeImportErrors();
   const sessions = useQuery({
     queryKey: ["sessions"],
     queryFn: () => api<JobSession[]>("/sessions"),
@@ -591,9 +621,8 @@ function Dashboard() {
   const generationReadiness = generationHealthPresentation(modelStatus.data, modelStatus.isLoading, modelStatus.isError);
   const active = sessions.data?.find((session) => !TERMINAL_SESSION_STATUSES.includes(session.status));
   const hasProfile = Object.keys(resumeSources).length > 0;
-  // HH/Zarplata must have a ready local copy. HireHi retains its confirmed
-  // source flow, including the availability check made by each new launch.
-  const hasResume = Object.values(resumeSources).some((source) => source.confirmed && ((source.adapterId !== "hh" && source.adapterId !== "zarplata") || source.resumeDataStatus === "ready"));
+  // Every supported source needs a ready local copy before a session can use it.
+  const hasResume = Object.entries(resumeSources).some(([adapterId, source]) => source.confirmed && ["complete", "partial"].includes(resumeCompletionStatus(source, importErrors[adapterId])));
   const activeStatus = active ? humanStatus(active.status) : "Нет сессии";
   const primaryHref = hasResume ? "/session" : "/profile";
   const primaryLabel = hasResume ? "Запустить сессию" : "Настроить профиль";
@@ -612,20 +641,20 @@ function Dashboard() {
             <NavLink className="overview-text-link overview-quiet-link" to={secondaryHref}>{secondaryLabel}</NavLink>
           </div>
           <div className="overview-status-strip" aria-label="Готовность к поиску">
-            <span className={catalogReadiness.complete ? "is-done" : ""}><OverviewIcon name="check" />{catalogReadiness.label}</span>
-            <span className={generationReadiness.complete ? "is-done" : ""}><OverviewIcon name="check" />{generationReadiness.label}</span>
-            <span className={hasProfile ? "is-done" : ""}><OverviewIcon name="check" />Источники {hasProfile ? "добавлены" : "не настроены"}</span>
-            <span className={hasResume ? "is-done" : ""}><OverviewIcon name="check" />Резюме {hasResume ? "подтверждено" : "не подтверждено"}</span>
-            <span><i key={`status-pulse-strip-${active?.status ?? "none"}`} className={sessionReady ? "overview-status-pulse" : ""} />Сессия {activeStatus.toLowerCase()}</span>
+            <span className={catalogReadiness.complete ? "is-done" : ""} data-tone={statusTone(catalogReadiness.code)}><OverviewIcon name="check" />{catalogReadiness.label}</span>
+            <span className={generationReadiness.complete ? "is-done" : ""} data-tone={statusTone(generationReadiness.code)}><OverviewIcon name="check" />{generationReadiness.label}</span>
+            <span className={hasProfile ? "is-done" : ""} data-tone={hasProfile ? "success" : "neutral"}><OverviewIcon name="check" />Источники {hasProfile ? "добавлены" : "не настроены"}</span>
+            <span className={hasResume ? "is-done" : ""} data-tone={hasResume ? "success" : "neutral"}><OverviewIcon name="check" />Резюме {hasResume ? "подтверждено" : "не подтверждено"}</span>
+            <span data-tone={statusTone(active?.status)}><i key={`status-pulse-strip-${active?.status ?? "none"}`} className={sessionReady ? "overview-status-pulse" : ""} />Сессия {activeStatus.toLowerCase()}</span>
           </div>
         </div>
         <div className="overview-preview" aria-label="Статус рабочего процесса">
-          <div className="preview-top"><span key={`status-pulse-preview-${active?.status ?? "none"}`} className={`preview-dot${sessionReady ? " overview-status-pulse" : ""}`} />Рабочий процесс <span className="preview-live">{activeStatus}</span></div>
+          <div className="preview-top" data-tone={statusTone(active?.status)}><span key={`status-pulse-preview-${active?.status ?? "none"}`} className={`preview-dot${sessionReady ? " overview-status-pulse" : ""}`} />Рабочий процесс <span className="preview-live">{activeStatus}</span></div>
           <div className="preview-job"><span className="preview-logo">J</span><div><strong>Подходящие вакансии</strong><small>Оценка по резюме и условиям сессии</small></div><b>{sessionReady ? "Оценивает" : active ? activeStatus : hasResume ? "Готово к запуску" : "Нужно настроить"}</b></div>
           <div className="preview-lines">
-            <div className="preview-line"><i className={hasProfile ? "is-done" : ""}>{hasProfile ? "✓" : "1"}</i><span>Источники резюме</span><small>{hasProfile ? "Добавлены" : "Нужно настроить"}</small></div>
-            <div className="preview-line"><i className={hasResume ? "is-done" : ""}>{hasResume ? "✓" : "2"}</i><span>Подтверждённое резюме</span><small>{hasResume ? "Готово к оценке" : "Добавьте ссылку"}</small></div>
-            <div className="preview-line"><i className={sessionReady ? "is-done" : ""}>{sessionReady ? "✓" : "3"}</i><span>Наблюдение за сессией</span><small>{active ? activeStatus : "Настройте критерии и лимиты"}</small></div>
+            <div className="preview-line"><i className={hasProfile ? "is-done" : ""} data-tone={hasProfile ? "success" : "neutral"}>{hasProfile ? "✓" : "1"}</i><span>Источники резюме</span><small>{hasProfile ? "Добавлены" : "Нужно настроить"}</small></div>
+            <div className="preview-line"><i className={hasResume ? "is-done" : ""} data-tone={hasResume ? "success" : "neutral"}>{hasResume ? "✓" : "2"}</i><span>Подтверждённое резюме</span><small>{hasResume ? "Готово к оценке" : "Добавьте ссылку"}</small></div>
+            <div className="preview-line"><i className={sessionReady ? "is-done" : ""} data-tone={statusTone(active?.status)}>{sessionReady ? "✓" : "3"}</i><span>Наблюдение за сессией</span><small>{active ? activeStatus : "Настройте критерии и лимиты"}</small></div>
           </div>
           {active && <div className="preview-proof">
             <div className="preview-proof-head"><div><span>Вакансия оценивается</span><h2>Продуктовая роль</h2><p>Сопоставление с выбранным резюме</p></div><b>Разбор</b></div>
@@ -645,234 +674,332 @@ function resumeSite(adapterId: string) {
   return RESUME_SITES.find((site) => site.id === adapterId) ?? RESUME_SITES[0];
 }
 
-function resumeEditUrl(adapterId: string): string {
-  // Keep the action useful without putting the bearer resume URL (or its
-  // opaque id) into the DOM, session storage, telemetry, or copied markup.
-  return adapterId === "hh"
-    ? "https://hh.ru/applicant/resumes"
-    : adapterId === "hirehi"
-      ? "https://hirehi.ru/profile/resumes"
-      : "https://zarplata.ru/profile/resumes";
+type ResumeSaveCandidate = { preview: ResumePreview; previewToken: string; grammaticalGender?: "male" | "female" };
+
+function ResumeSourceIcon({ name }: { name: "edit" | "cancel" | "delete" }) {
+  return <svg className="resume-source-action-icon" viewBox="0 0 18 18" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+    {name === "edit" && <><path d="m3 12.8-.6 2.8 2.8-.6L14 6.2 11.8 4 3 12.8Z" /><path d="m10.8 5 2.2 2.2" /></>}
+    {name === "cancel" && <path d="m4 4 10 10M14 4 4 14" />}
+    {name === "delete" && <><path d="M3 5h12M7 5V3h4v2m2 0-.7 10H5.7L5 5m2.5 2v5m3-5v5" /></>}
+  </svg>;
 }
 
-function isAllowedResumeUrl(adapterId: string, raw: string): boolean {
-  try {
-    const url = new URL(raw.trim());
-    // The saved source identity is queryless; reject tracking/import variants
-    // before the preview request so the server can return a separate import URL.
-    if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return false;
-    const host = url.hostname.toLowerCase();
-    const hostAllowed = adapterId === "hh"
-      ? host === "hh.ru" || host.endsWith(".hh.ru")
-      : adapterId === "hirehi" ? host === "hirehi.ru" || host === "www.hirehi.ru" : host === "zarplata.ru" || host.endsWith(".zarplata.ru");
-    return hostAllowed && /^\/resume\/[^/]+\/?$/u.test(url.pathname);
-  } catch { return false; }
-}
-
-function sanitizeResumePreview(preview: ResumePreview): ResumePreview {
-  const { source_resume_id: _sourceResumeId, source_edit_url: _sourceEditUrl, ...safePreview } = preview;
-  void _sourceResumeId;
-  void _sourceEditUrl;
-  return safePreview;
-}
-
-function sourceStatusLabel(record: ResumeSourceRecord | undefined, checking = false): string {
-  if (checking) return "Проверяем…";
-  if (!record) return "Не настроено";
-  return record.status === "changed" ? "Обновлено" : record.status === "unavailable" ? "Недоступно" : "Актуально";
-}
-
-function ResumePreviewCard({ adapterId, record, checking, onConfirmed, onPreferenceChange, onRemoved, onRefreshed }: { adapterId: string; record: ResumeSourceRecord | undefined; checking?: boolean; onConfirmed: (record: ResumeSourceRecord) => void; onPreferenceChange: (adapterId: string, grammaticalGender: "male" | "female") => Promise<void>; onRemoved: (adapterId: string) => void; onRefreshed: (record: ResumeSourceRecord) => void }) {
+function ResumePreviewCard({ adapterId, record, queryClient, sourcesBlocked }: {
+  adapterId: string;
+  record: ResumeSourceRecord | undefined;
+  queryClient: ReturnType<typeof useQueryClient>;
+  sourcesBlocked: boolean;
+}) {
   const site = resumeSite(adapterId);
-  const [url, setUrl] = useState("");
-  const savedPreview = record?.preview && Object.keys(record.preview).length > 0 ? record.preview : null;
-  const [preview, setPreview] = useState<ResumePreview | null>(savedPreview);
-  const [token, setToken] = useState("");
-  const [consent, setConsent] = useState(false);
+  const importErrors = useResumeImportErrors();
+  const importError = importErrors[adapterId];
+  const completion = resumeCompletionStatus(record, importError);
+  const completionError = completion === "error" ? resumeCompletionError(record, importError) ?? "Не удалось извлечь необходимые данные из резюме." : undefined;
+  const completionPresentation = {
+    empty: { label: "Не заполнено", tone: "neutral" },
+    complete: { label: "Заполнено", tone: "success" },
+    partial: { label: "Частично", tone: "warning" },
+    error: { label: "Ошибка", tone: "danger" },
+  }[completion];
+  const savedSourceUrl = publicResumeSourceUrl(record?.sourceUrl, adapterId)
+    ?? publicResumeSourceUrl(record?.preview.source_url, adapterId)
+    ?? "";
+  const [url, setUrl] = useState(savedSourceUrl);
   const [editing, setEditing] = useState(false);
-  const [deletePending, setDeletePending] = useState(false);
-  const [resumeAnswers, setResumeAnswers] = useState<Record<string, string>>(() => {
-    const answers: Record<string, string> = {};
-    if (record?.grammaticalGender) answers.grammatical_gender = record.grammaticalGender;
-    return answers;
-  });
+  const [busyAction, setBusyAction] = useState<"preview" | "save" | "refresh" | "delete" | null>(null);
+  const busyRef = useRef(false);
+  const urlInputRef = useRef<HTMLInputElement>(null);
+  const deleteTriggerRef = useRef<HTMLButtonElement>(null);
+  const deleteCancelRef = useRef<HTMLButtonElement>(null);
   const [error, setError] = useState("");
+  const [completionHelpOpen, setCompletionHelpOpen] = useState(false);
+  const [notice, setNotice] = useState<{ tone: "warning"; text: string } | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [genderOpen, setGenderOpen] = useState(false);
+  const [genderChoice, setGenderChoice] = useState<"male" | "female" | "">("");
+  const [pendingSave, setPendingSave] = useState<ResumeSaveCandidate | null>(null);
   useEffect(() => {
-    if (!editing) {
-      setPreview(record?.preview && Object.keys(record.preview).length > 0 ? record.preview : null);
-      setResumeAnswers(record?.grammaticalGender ? { grammatical_gender: record.grammaticalGender } : {});
-    }
-  }, [record?.adapterId, record?.checkedAt, record?.status, record?.preview, record?.grammaticalGender, editing]);
-  const previewMutation = useMutation({
-    mutationFn: () => {
-      if (!isAllowedResumeUrl(adapterId, url)) throw new Error(`Укажите безопасную прямую ссылку на резюме ${site.label} (HTTPS, без параметров).`);
-      return api<{ preview_token: string; preview?: ResumePreview; public_preview?: ResumePreview; source?: ResumePreview }>("/resume-sources/preview", { method: "POST", body: JSON.stringify({ adapter_id: adapterId, resume_url: url.trim() }) });
-    },
-    onSuccess: (result) => {
-      const nextPreview = sanitizeResumePreview(previewFromResponse(result));
-      if (!result.preview_token) { setPreview(null); setToken(""); setError("Сервис не выдал одноразовый токен проверки. Повторите попытку."); return; }
-      if (nextPreview.source_site && nextPreview.source_site !== adapterId) {
-        setPreview(null); setToken(""); setError("Сайт в ответе не совпал с выбранной площадкой. Проверьте ссылку ещё раз."); return;
-      }
-      setPreview(nextPreview); setToken(result.preview_token); setConsent(false); setEditing(true); setError(""); setUrl("");
-      setResumeAnswers({});
-    },
-    onError: (reason) => setError(reason instanceof Error ? reason.message : "Не удалось проверить ссылку."),
-  });
-  const detailsMutation = useMutation({
-    mutationFn: () => {
-      if (!token) throw new Error("Предпросмотр устарел.");
-      return api<ResumePreviewResponse>("/resume-sources/preview-details", {
-        method: "POST",
-        body: JSON.stringify({ preview_token: token }),
-        cache: "no-store",
-      });
-    },
-    onSuccess: (result) => {
-      const details = sanitizeResumePreview(previewFromResponse(result));
-      setPreview((current) => ({ ...(current ?? {}), ...details }));
-      setError("");
-    },
-    onError: (reason) => setError(reason instanceof Error ? reason.message : "Не удалось показать подробности."),
-  });
-  const confirmMutation = useMutation({
-    mutationFn: () => api<unknown>("/resume-sources/confirm", { method: "POST", body: JSON.stringify({ adapter_id: adapterId, preview_token: token, consent: true, ...(resumeAnswers.grammatical_gender ? { grammatical_gender: resumeAnswers.grammatical_gender } : {}) }) }),
-    onSuccess: (result) => {
-      const serverRecord = sourceRecordFromResponse(result);
-      const grammaticalGender = serverRecord?.grammaticalGender ?? (resumeAnswers.grammatical_gender === "male" || resumeAnswers.grammatical_gender === "female" ? resumeAnswers.grammatical_gender : null);
-      const next = serverRecord
-        ? { ...serverRecord, grammaticalGender, preview: Object.keys(serverRecord.preview).length ? serverRecord.preview : preview! }
-        : { adapterId, usesSavedData: adapterId === "hh" || adapterId === "zarplata", resumeDataStatus: adapterId === "hh" || adapterId === "zarplata" ? "missing" as const : null, resumeDataSavedAt: null, resumeDataErrorMessage: null, grammaticalGender, preview: preview!, previewToken: token, confirmed: true, status: "valid" as const };
-      setEditing(false); setConsent(false); setError(""); onConfirmed(next);
-    },
-    onError: (reason) => setError(reason instanceof Error ? reason.message : "Не удалось сохранить резюме."),
-  });
-  const hasSavedSource = Boolean(record);
-  const questions = preview ? resumeQuestions(preview) : [];
-  // The durable preference is intentionally stripped from the public preview
-  // once saved, so keep a small local editor on the source card as well.
-  const profileQuestions = hasSavedSource && !questions.some((question) => question.id === "grammatical_gender")
-    ? [{ id: "grammatical_gender", question: "Какой род использовать в сопроводительных письмах?", options: ["male", "female"], required: true }, ...questions]
-    : questions;
-  const confirm = () => {
-    if (!preview || !token || !consent) return;
-    if (!profileQuestions.every((question) => isResumeQuestionValid(question, resumeAnswers[question.id] ?? ""))) return;
-    confirmMutation.mutate();
-  };
-  const removeMutation = useMutation({
-    mutationFn: () => api<unknown>(`/resume-sources/${adapterId}`, { method: "DELETE" }),
-    onSuccess: () => { setPreview(null); setToken(""); setConsent(false); setEditing(false); setDeletePending(false); setUrl(""); setError(""); onRemoved(adapterId); },
-    onError: (reason) => setError(reason instanceof Error ? reason.message : "Не удалось удалить источник."),
-  });
-  const refreshMutation = useMutation({
-    mutationFn: () => api<unknown>(`/resume-sources/${adapterId}/refresh`, { method: "POST" }),
-    onSuccess: (result) => {
-      const refreshed = sourceRecordFromResponse(result);
-      if (!refreshed) { setError("Не удалось обновить данные резюме."); return; }
-      onRefreshed({ ...refreshed, preview: Object.keys(refreshed.preview).length ? refreshed.preview : record?.preview ?? {} });
-      setError(refreshed.status === "unavailable"
-        ? refreshed.resumeDataErrorMessage || "Обновление не удалось. Последняя сохранённая копия данных остаётся доступной."
-        : "");
-    },
-    onError: (reason) => setError(reason instanceof Error ? reason.message : "Не удалось обновить данные резюме."),
-  });
-  const remove = () => {
-    removeMutation.mutate();
-  };
-  const beginReplace = () => {
-    setEditing(true); setPreview(null); setToken(""); setConsent(false); setDeletePending(false); setError(""); setResumeAnswers({});
-  };
-  const cancelReplace = () => {
-    setPreview(record?.preview && Object.keys(record.preview).length > 0 ? record.preview : null);
-    setToken("");
-    setConsent(false);
-    setResumeAnswers(record?.grammaticalGender ? { grammatical_gender: record.grammaticalGender } : {});
+    setUrl(savedSourceUrl);
     setEditing(false);
-    setDeletePending(false);
+    setPendingSave(null);
+    setGenderOpen(false);
+    setGenderChoice("");
+    setDeleteOpen(false);
+    setError("");
+    setNotice(null);
+  }, [adapterId, savedSourceUrl]);
+
+  const setBusy = (action: "preview" | "save" | "refresh" | "delete" | null) => {
+    busyRef.current = action !== null;
+    setBusyAction(action);
+  };
+  const updateCachedRecord = (updated: ResumeSourceRecord) => {
+    const current = queryClient.getQueryData<Record<string, ResumeSourceRecord>>(["resume-sources"]) ?? {};
+    queryClient.setQueryData(["resume-sources"], { ...current, [adapterId]: updated });
+    updateResumeImportError(queryClient, adapterId);
+  };
+  const performConfirm = async (candidate: ResumeSaveCandidate, gender?: "male" | "female") => {
+    if (busyRef.current) return;
+    setBusy("save");
+    setError("");
+    setNotice(null);
+    try {
+      const result = await api<unknown>("/resume-sources/confirm", {
+        method: "POST",
+        body: JSON.stringify({ adapter_id: adapterId, preview_token: candidate.previewToken, consent: true, ...(gender ? { grammatical_gender: gender } : {}) }),
+      });
+      const updated = sourceRecordFromResponse(result);
+      if (!updated) throw new Error("Сервис не вернул сохранённое резюме.");
+      if (updated.adapterId !== adapterId) throw new Error("Сохранённое резюме вернулось для другой площадки.");
+      updateCachedRecord(updated);
+      updateResumeImportError(queryClient, adapterId);
+      setEditing(false);
+      setPendingSave(null);
+      setGenderOpen(false);
+      setGenderChoice("");
+      setUrl(publicResumeSourceUrl(updated.sourceUrl, adapterId) ?? publicResumeSourceUrl(updated.preview.source_url, adapterId) ?? "");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось сохранить резюме.");
+    } finally {
+      setBusy(null);
+    }
+  };
+  const save = async () => {
+    if (busyRef.current || sourcesBlocked) return;
+    setError("");
+    setNotice(null);
+    if (record && !editing) {
+      setBusy("refresh");
+      try {
+        const result = await api<unknown>(`/resume-sources/${adapterId}/refresh`, { method: "POST" });
+        const updated = sourceRecordFromResponse(result);
+        if (!updated) throw new Error("Сервис не вернул обновлённое резюме.");
+        if (updated.adapterId !== adapterId) throw new Error("Обновлённое резюме вернулось для другой площадки.");
+        updateCachedRecord(updated);
+        if (updated.status === "unavailable") {
+          setNotice({ tone: "warning", text: updated.resumeDataStatus === "ready" ? "Не удалось обновить резюме. Сохранённая копия данных остаётся доступной." : "Сайт не подтвердил актуальность резюме." });
+        }
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Не удалось обновить резюме.");
+      } finally {
+        setBusy(null);
+      }
+      return;
+    }
+
+    const safeUrl = publicResumeSourceUrl(url, adapterId);
+    if (!safeUrl) {
+      setError(`Укажите прямую ссылку на резюме ${site.label} по HTTPS без параметров.`);
+      return;
+    }
+    setBusy("preview");
+    let extractionFailed = true;
+    try {
+      const result = await api<ResumePreviewResponse>("/resume-sources/preview", {
+        method: "POST",
+        body: JSON.stringify({ adapter_id: adapterId, resume_url: safeUrl }),
+      });
+      const preview = previewFromResponse(result);
+      if (typeof result.preview_token !== "string" || result.preview_token.trim().length < 20) throw new Error("Сервис не выдал действительный токен проверки.");
+      if (preview.source_site && preview.source_site !== adapterId) throw new Error("Сайт в ответе не совпал с выбранной площадкой.");
+      const unsupportedQuestion = resumeQuestions(preview).find((question) => question.required !== false && question.id !== "grammatical_gender");
+      if (unsupportedQuestion) throw new Error(`Нельзя сохранить резюме: требуется неподдерживаемый ответ «${unsupportedQuestion.question}».`);
+      const genderQuestion = resumeQuestions(preview).find((question) => question.id === "grammatical_gender" && question.required !== false);
+      const candidate: ResumeSaveCandidate = {
+        preview,
+        previewToken: result.preview_token,
+        ...(genderQuestion && record?.grammaticalGender ? { grammaticalGender: record.grammaticalGender } : {}),
+      };
+      if (genderQuestion && !record?.grammaticalGender) {
+        setPendingSave(candidate);
+        setGenderChoice("");
+        setGenderOpen(true);
+        setBusy(null);
+        return;
+      }
+      setBusy(null);
+      extractionFailed = false;
+      await performConfirm(candidate, candidate.grammaticalGender);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось проверить ссылку на резюме.");
+      if (extractionFailed && (!record || record.resumeDataStatus !== "ready")) {
+        updateResumeImportError(queryClient, adapterId, reason instanceof Error ? reason.message : "Не удалось извлечь необходимые данные из резюме.");
+      }
+      setBusy(null);
+    }
+  };
+  const cancelEditing = () => {
+    setUrl(savedSourceUrl);
+    setEditing(false);
+    setError("");
+    setNotice(null);
+  };
+  const startEditing = () => {
+    if (busyRef.current || sourcesBlocked) return;
+    setEditing(true);
+    setError("");
+    setNotice(null);
+    requestAnimationFrame(() => urlInputRef.current?.focus());
+  };
+  const confirmGender = () => {
+    if (!pendingSave || (genderChoice !== "male" && genderChoice !== "female") || !isResumeQuestionValid({ id: "grammatical_gender", question: "Род для сопроводительных писем", required: true, options: ["male", "female"] }, genderChoice)) return;
+    const candidate = pendingSave;
+    setGenderOpen(false);
+    setPendingSave(null);
+    void performConfirm(candidate, genderChoice);
+  };
+  const cancelGender = () => {
+    setGenderOpen(false);
+    setPendingSave(null);
+    setGenderChoice("");
     setError("");
   };
-  const updateResumeAnswer = (questionId: string, value: string) => {
-    setResumeAnswers((current) => ({ ...current, [questionId]: value }));
-    if (record?.confirmed && !editing) {
-      if (questionId === "grammatical_gender" && (value === "male" || value === "female")) {
-        void onPreferenceChange(adapterId, value).catch((reason) => setError(reason instanceof Error ? reason.message : "Не удалось сохранить предпочтение."));
-      }
+  const remove = async () => {
+    if (busyRef.current) return;
+    if (!record) {
+      updateResumeImportError(queryClient, adapterId);
+      setUrl("");
+      setError("");
+      setNotice(null);
+      return;
+    }
+    setBusy("delete");
+    setError("");
+    try {
+      await api<unknown>(`/resume-sources/${adapterId}`, { method: "DELETE" });
+      const current = queryClient.getQueryData<Record<string, ResumeSourceRecord>>(["resume-sources"]) ?? {};
+      const next = { ...current };
+      delete next[adapterId];
+      queryClient.setQueryData(["resume-sources"], next);
+      updateResumeImportError(queryClient, adapterId);
+      setDeleteOpen(false);
+      setEditing(false);
+      setUrl("");
+      setPendingSave(null);
+      setGenderOpen(false);
+      setGenderChoice("");
+      setError("");
+      setNotice(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось удалить резюме.");
+    } finally {
+      setBusy(null);
     }
   };
-  const isUnavailable = record?.status === "unavailable";
-  const usesSavedData = adapterId === "hh" || adapterId === "zarplata";
-  const savedSourceUrl = publicResumeSourceUrl(record?.sourceUrl, adapterId)
-    ?? publicResumeSourceUrl(record?.preview.source_url, adapterId);
-  const savedAddress = savedSourceUrl
-    ?? (record?.maskedUrl || record?.preview.masked_url
-      ? safeResumeUrlLabel(record.maskedUrl ?? record.preview.masked_url)
-      : "Ссылка сохранена");
-  const savedImportUrl = safeResumeImportUrl(record?.importUrl, adapterId, savedSourceUrl)
-    ?? safeResumeImportUrl(record?.preview.import_url, adapterId, savedSourceUrl);
-  return <article className={`panel resume-source-card${record?.confirmed ? " is-confirmed" : ""}`} aria-labelledby={`resume-source-${adapterId}`}>
-    <div className="resume-source-head"><div><span className="eyebrow">ИСТОЧНИК РЕЗЮМЕ</span><h2 id={`resume-source-${adapterId}`}>{site.label}</h2></div>{(hasSavedSource || checking) && !editing && <span className={`status ${isUnavailable ? "status-danger" : record?.status === "changed" ? "status-warning" : "status-success"}`}><span>{sourceStatusLabel(record, checking)}</span>{record?.status === "valid" && <small className="resume-source-confirmed">Подтверждено</small>}</span>}</div>
-    {(!hasSavedSource || editing) && <>
-      <label className="profile-full-field">Ссылка на резюме на {site.label}
-        <input type="url" aria-label={`Ссылка на резюме на ${site.label}`} value={url} onChange={(event) => { setUrl(event.target.value); setError(""); }} placeholder={`https://${site.id === "hh" ? "hh.ru" : site.id === "hirehi" ? "hirehi.ru" : "zarplata.ru"}/resume/...`} autoComplete="off" />
-      </label>
-      <button type="button" className="secondary" onClick={() => previewMutation.mutate()} disabled={previewMutation.isPending || !url.trim()}>{previewMutation.isPending ? "Проверяем…" : "Проверить ссылку"}</button>
-      {error && <Notice tone="danger" role="alert">{error}</Notice>}
-    </>}
-    {hasSavedSource && <>
-      {usesSavedData && <div className="resume-source-address"><span>Готовность данных</span><small>{record?.resumeDataStatus === "ready" ? "Данные сохранены на этом компьютере" : record?.resumeDataStatus === "corrupt" ? "Сохранённые данные повреждены" : "Данные ещё не сохранены или требуют обновления"}</small>{record?.resumeDataSavedAt && <small>Сохранено: {formatServerUtc(record.resumeDataSavedAt)}</small>}</div>}
-      {usesSavedData && <div className="resume-source-address"><span>Последнее обновление</span><small>{record?.status === "unavailable" ? "Не удалось обновить источник" : record?.checkedAt ? `Проверено: ${formatServerUtc(record.checkedAt)}` : "Ещё не обновлялось"}</small>{record?.resumeDataErrorMessage && <small>{record.resumeDataErrorMessage}</small>}</div>}
-      <div className="resume-source-address" aria-label={`Сохранённая ссылка на резюме ${site.label}`}><span>Сохранённая ссылка</span>{savedSourceUrl ? <a href={savedSourceUrl} target="_blank" rel="noreferrer"><code>{savedAddress}</code></a> : <code>{savedAddress}</code>}</div>
-      {savedImportUrl && <div className="resume-source-address resume-import-address" aria-label={`Ссылка для импорта ${site.label}`}><span>{adapterId === "hirehi" ? "Ссылка для импорта" : "Печатная версия резюме"}</span><small>{adapterId === "hirehi" ? "Эта ссылка используется для получения резюме с HireHi." : "Приложение получает данные резюме из его печатной версии."}</small><a href={savedImportUrl} target="_blank" rel="noreferrer"><code>{savedImportUrl}</code></a></div>}
-    </>}
-    {preview && <div className="resume-source-preview" aria-label={`Предпросмотр резюме ${site.label}`}>
-      <div className="resume-source-summary"><strong>{resumeDisplayTitle(preview)}</strong></div>
-      {editing && token && <button type="button" className="secondary" onClick={() => detailsMutation.mutate()} disabled={detailsMutation.isPending}>{detailsMutation.isPending ? "Загружаем подробности…" : "Показать все разделы и контакты"}</button>}
-      {profileQuestions.length > 0 && <div className="resume-source-block resume-source-questions"><h3>Уточните о себе</h3>{profileQuestions.map((question) => <label className="resume-source-question" key={question.id}><span>{question.id === "grammatical_gender" ? "Ваш пол" : question.question}{question.required !== false && <em aria-hidden="true"> *</em>}</span>{question.options?.length ? <select aria-label={question.question} value={resumeAnswers[question.id] ?? ""} onChange={(event) => updateResumeAnswer(question.id, event.target.value)}><option value="">Выберите вариант</option>{question.options.map((option) => <option key={option} value={option}>{questionOptionLabel(question, option)}</option>)}</select> : <input aria-label={question.question} value={resumeAnswers[question.id] ?? ""} onChange={(event) => updateResumeAnswer(question.id, event.target.value)} placeholder="Короткий ответ" />}</label>)}</div>}
-      {previewSections(preview).length > 0 && <div className="resume-source-block resume-coverage"><h3>Полнота резюме</h3><ul className="resume-source-list">{previewSections(preview).map((item) => <li key={`${item.label}-${item.status}`}><span>{item.label}</span><small>{statusLabel(item.status)}</small></li>)}</ul></div>}
-      {preview.contacts && <div className="resume-source-block resume-coverage"><h3>Контакты</h3><p>{[...(preview.contacts.found ?? []).map(resumeContactLabel), ...(preview.contacts.hidden ?? []).map((item) => `${resumeContactLabel(item)} (скрыто)`)].join(", ") || "Контакты не найдены"}</p></div>}
-      {(!record?.confirmed || editing) && <>
-        <label className="checkline resume-source-consent"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} /> Это моё резюме. {usesSavedData ? "Разрешаю сохранить ссылку и данные резюме локально для использования в сессиях." : "Разрешаю сохранить ссылку и проверять актуальность резюме перед запуском сессий."}</label>
-        {usesSavedData && <p>Для первого чтения и обновления откройте доступ к резюме по ссылке. После сохранения данных доступ можно закрыть.</p>}
-        <button type="button" className="primary" onClick={confirm} disabled={!consent || confirmMutation.isPending || !profileQuestions.every((question) => isResumeQuestionValid(question, resumeAnswers[question.id] ?? ""))}>{confirmMutation.isPending ? "Сохраняем…" : "Подтвердить резюме"}</button>
-      </>}
-      {hasSavedSource && !editing && <div className="actions">{usesSavedData && <button type="button" className="secondary" onClick={() => refreshMutation.mutate()} disabled={refreshMutation.isPending}>{refreshMutation.isPending ? "Обновляем…" : "Обновить данные"}</button>}<button type="button" className="secondary" onClick={beginReplace}>Заменить источник</button><button type="button" className="danger" onClick={() => setDeletePending(true)}>Удалить источник</button><a className="button-link secondary" href={resumeEditUrl(adapterId)} target="_blank" rel="noreferrer">{site.editLabel}</a></div>}
-    </div>}
-    {hasSavedSource && !editing && !preview && <div className="actions">{usesSavedData && <button type="button" className="secondary" onClick={() => refreshMutation.mutate()} disabled={refreshMutation.isPending}>{refreshMutation.isPending ? "Обновляем…" : "Обновить данные"}</button>}<button type="button" className="secondary" onClick={beginReplace}>Заменить источник</button><button type="button" className="danger" onClick={() => setDeletePending(true)}>Удалить источник</button><a className="button-link secondary" href={resumeEditUrl(adapterId)} target="_blank" rel="noreferrer">{site.editLabel}</a></div>}
-    {error && !editing && hasSavedSource && <Notice tone="danger" role="alert">{error}</Notice>}
-    {deletePending && hasSavedSource && !editing && <div className="resume-source-delete-confirm" role="alert"><p>Удалить сохранённый источник {site.label}? Его можно будет добавить снова.</p><div className="actions"><button type="button" className="danger" onClick={remove} disabled={removeMutation.isPending}>{removeMutation.isPending ? "Удаляем…" : "Удалить"}</button><button type="button" className="secondary" onClick={() => setDeletePending(false)}>Отмена</button></div></div>}
-    {hasSavedSource && editing && !preview && <button type="button" className="secondary" onClick={cancelReplace}>Отмена замены</button>}
+
+  const sections = record ? previewSections(record.preview) : [];
+  const contacts = [
+    ...(record?.preview.contacts?.found ?? []).map((label) => ({ label: resumeContactLabel(label), status: "present" })),
+    ...(record?.preview.contacts?.hidden ?? []).map((label) => ({ label: resumeContactLabel(label), status: "hidden" })),
+  ];
+  const receivedItems = [...sections];
+  for (const contact of contacts) {
+    if (!receivedItems.some((item) => item.label === contact.label)) receivedItems.push(contact);
+  }
+  const statusIcon = (label: string, status: string) => {
+    const present = status === "present";
+    const accessibleStatus = statusLabel(status);
+    return <span className="resume-section-status" data-tone={present ? "success" : "danger"} role="img" aria-label={`${label}: ${accessibleStatus}`} title={accessibleStatus}>
+      <svg viewBox="0 0 18 18" width="18" height="18" fill="none" aria-hidden="true" focusable="false" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        {present ? <path d="m4 9 3.2 3.2L14 5.8" /> : <path d="m5 5 8 8M13 5l-8 8" />}
+      </svg>
+    </span>;
+  };
+  const controlsDisabled = sourcesBlocked || busyAction !== null || deleteOpen || genderOpen;
+  const primaryLabel = busyAction === "preview" ? "Проверяем…"
+    : busyAction === "save" ? "Сохраняем…"
+    : busyAction === "refresh" ? "Обновляем…"
+      : record ? editing ? "Сохранить изменения" : "Обновить данные" : "Сохранить ссылку";
+  const deleteAddress = savedSourceUrl || (record?.maskedUrl ? safeResumeUrlLabel(record.maskedUrl) : "Ссылка сохранена");
+  return <article className="panel resume-source-card" aria-labelledby={`resume-source-${adapterId}`}>
+    <div className="resume-completion-row">
+      <span className="resume-completion-status status" data-tone={completionPresentation.tone} role="status" aria-label={completionPresentation.label}>{completionPresentation.label}</span>
+      {completionError && <span className="resume-completion-help" onMouseEnter={() => setCompletionHelpOpen(true)} onMouseLeave={() => setCompletionHelpOpen(false)}>
+        <button type="button" className="resume-completion-help-trigger" aria-label={`Причина ошибки для ${site.label}`} aria-describedby={`resume-completion-error-${adapterId}`} onFocus={() => setCompletionHelpOpen(true)} onBlur={() => setCompletionHelpOpen(false)}>
+          <svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true" focusable="false"><circle cx="10" cy="10" r="7.5" /><path d="M10 9v4m0-6h.01" strokeLinecap="round" /></svg>
+        </button>
+        {completionHelpOpen && <span className="resume-completion-tooltip" id={`resume-completion-error-${adapterId}`} role="tooltip">{completionError}</span>}
+      </span>}
+    </div>
+    <h2 id={`resume-source-${adapterId}`}>{site.label}</h2>
+    <label className="profile-full-field">Ссылка на резюме на {site.label}
+      <input ref={urlInputRef} className="resume-source-url-input" type="url" aria-label={`Ссылка на резюме на ${site.label}`} value={url} onChange={(event) => { setUrl(event.target.value); setError(""); setNotice(null); if (!record && !event.target.value.trim()) updateResumeImportError(queryClient, adapterId); }} placeholder={`https://${site.id === "hh" ? "hh.ru" : site.id === "hirehi" ? "hirehi.ru" : "zarplata.ru"}/resume/...`} autoComplete="off" readOnly={Boolean(record && !editing)} disabled={controlsDisabled} />
+    </label>
+    <div className="resume-source-actions">
+      <button type="button" className="primary resume-source-primary-action" onClick={() => void save()} disabled={controlsDisabled || ((!record || editing) && !url.trim())}>{primaryLabel}</button>
+      <div className="resume-source-secondary-actions">
+        <button type="button" className="secondary resume-source-icon-action" aria-label={editing ? `Отменить редактирование ссылки на ${site.label}` : `Редактировать ссылку на ${site.label}`} title={editing ? "Отменить редактирование" : "Редактировать ссылку"} onClick={editing ? cancelEditing : startEditing} disabled={controlsDisabled || !record}>
+          <ResumeSourceIcon name={editing ? "cancel" : "edit"} />
+        </button>
+        <button ref={deleteTriggerRef} type="button" className="secondary resume-source-icon-action" aria-label={record ? `Удалить резюме для ${site.label}` : `Сбросить ошибку импорта для ${site.label}`} title={record ? "Удалить резюме" : "Сбросить ошибку импорта"} onClick={() => { setError(""); if (record) setDeleteOpen(true); else void remove(); }} disabled={controlsDisabled || (!record && !importError)}>
+          <ResumeSourceIcon name="delete" />
+        </button>
+      </div>
+    </div>
+    {error && !deleteOpen && !genderOpen && <Notice tone="danger" role="alert">{error}</Notice>}
+    {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
+    {record && <details className="resume-coverage">
+      <summary className="resume-coverage-summary"><span>Полученные данные</span><ChevronIcon className="resume-coverage-chevron" /></summary>
+      <ul className="resume-source-list">
+        {receivedItems.length > 0
+          ? receivedItems.map((item) => <li key={`${item.label}-${item.status}`}><span>{item.label}</span>{statusIcon(item.label, item.status)}</li>)
+          : <li className="resume-source-empty">Платформа не передала разделы или контакты.</li>}
+      </ul>
+    </details>}
+
+    <AlertDialog.Root open={deleteOpen} onOpenChange={(open) => { if (!busyRef.current) setDeleteOpen(open); }}>
+      <AlertDialog.Portal>
+        <AlertDialog.Backdrop className="resume-source-dialog-backdrop" />
+        <AlertDialog.Viewport className="resume-source-dialog-viewport">
+          <AlertDialog.Popup className="resume-source-dialog" initialFocus={deleteCancelRef} finalFocus={() => record ? deleteTriggerRef.current : urlInputRef.current}>
+            <AlertDialog.Title className="resume-source-dialog-title">Удалить резюме?</AlertDialog.Title>
+            <AlertDialog.Description className="resume-source-dialog-description">Вы точно хотите удалить резюме {deleteAddress} для сайта {site.label}?</AlertDialog.Description>
+            {error && deleteOpen ? <Notice tone="danger" role="alert">{error}</Notice> : null}
+            <div className="resume-source-dialog-actions">
+              <AlertDialog.Close render={<button ref={deleteCancelRef} type="button" className="secondary" disabled={busyAction === "delete"} />}>Нет</AlertDialog.Close>
+              <button type="button" className="danger" onClick={() => void remove()} disabled={busyAction === "delete"}>{busyAction === "delete" ? "Удаляем…" : "Да"}</button>
+            </div>
+          </AlertDialog.Popup>
+        </AlertDialog.Viewport>
+      </AlertDialog.Portal>
+    </AlertDialog.Root>
+
+    <Dialog.Root open={genderOpen} onOpenChange={(open) => { if (!busyRef.current) { if (open) setGenderOpen(true); else cancelGender(); } }}>
+      <Dialog.Portal>
+        <Dialog.Backdrop className="resume-source-dialog-backdrop" />
+        <Dialog.Viewport className="resume-source-dialog-viewport">
+          <Dialog.Popup className="resume-source-dialog">
+            <Dialog.Title className="resume-source-dialog-title">Род для сопроводительных писем</Dialog.Title>
+            <Dialog.Description className="resume-source-dialog-description">Какой род использовать в сопроводительных письмах?</Dialog.Description>
+            <label className="profile-full-field">Род
+              <select aria-label="Род" value={genderChoice} onChange={(event) => setGenderChoice(event.target.value === "male" || event.target.value === "female" ? event.target.value : "")}>
+                <option value="">Выберите вариант</option>
+                <option value="male">Мужской</option>
+                <option value="female">Женский</option>
+              </select>
+            </label>
+            {error && <Notice tone="danger" role="alert">{error}</Notice>}
+            <div className="resume-source-dialog-actions">
+              <Dialog.Close render={<button type="button" className="secondary" onClick={cancelGender} />}>Отмена</Dialog.Close>
+              <button type="button" className="primary" onClick={confirmGender} disabled={!genderChoice || busyAction !== null}>Сохранить</button>
+            </div>
+          </Dialog.Popup>
+        </Dialog.Viewport>
+      </Dialog.Portal>
+    </Dialog.Root>
   </article>;
 }
 
 function ResumeSourcesPage() {
-  const qc = useQueryClient();
+  const queryClient = useQueryClient();
   const sourcesQuery = useQuery({ queryKey: ["resume-sources"], queryFn: () => fetchResumeSources(), staleTime: 30_000, refetchInterval: false, refetchOnWindowFocus: false });
   const sources = sourcesQuery.data ?? {};
-  const removeSource = (adapterId: string) => { const next = { ...sources }; delete next[adapterId]; qc.setQueryData(["resume-sources"], next); };
-  const saveSource = (record: ResumeSourceRecord) => {
-    const current = qc.getQueryData<Record<string, ResumeSourceRecord>>(["resume-sources"]) ?? {};
-    qc.setQueryData(["resume-sources"], { ...current, [record.adapterId]: record });
-  };
-  const saveRefresh = (record: ResumeSourceRecord) => saveSource(record);
-  const savePreference = async (adapterId: string, grammaticalGender: "male" | "female") => {
-    const result = await api<unknown>(`/resume-sources/${adapterId}`, { method: "PATCH", body: JSON.stringify({ grammatical_gender: grammaticalGender }) });
-    const updated = sourceRecordFromResponse(result);
-    const current = qc.getQueryData<Record<string, ResumeSourceRecord>>(["resume-sources"]) ?? {};
-    const existing = current[adapterId];
-    const merged = updated
-      ? { ...existing, ...updated, preview: Object.keys(updated.preview).length ? updated.preview : existing?.preview }
-      : existing;
-    qc.setQueryData(["resume-sources"], {
-      ...current,
-      [adapterId]: {
-        ...merged,
-        grammaticalGender: updated?.grammaticalGender ?? grammaticalGender,
-      },
-    });
-  };
+  const sourcesLoadError = sourcesQuery.isError && !sourcesQuery.data;
+  const sourcesBlocked = sourcesQuery.isPending || sourcesLoadError;
   return <section className="page profile-sources-page">
-    <Title eyebrow="ИСТОЧНИКИ РЕЗЮМЕ" note="Добавьте ссылку на резюме и подтвердите её.">Профиль — ссылки на резюме</Title>
-    <div className="resume-source-grid">{RESUME_SITES.map((site) => <ResumePreviewCard key={site.id} adapterId={site.id} record={sources[site.id]} checking={sourcesQuery.isLoading} onConfirmed={saveSource} onPreferenceChange={savePreference} onRemoved={removeSource} onRefreshed={saveRefresh} />)}</div>
+    <Title eyebrow="ИСТОЧНИКИ РЕЗЮМЕ" note="Ссылка проверяется и сохраняется после нажатия кнопки.">Профиль — ссылки на резюме</Title>
+    {sourcesLoadError && <><Notice tone="danger" role="alert">Не удалось загрузить сохранённые резюме.</Notice><button type="button" className="secondary" onClick={() => void sourcesQuery.refetch()} disabled={sourcesQuery.isFetching}>{sourcesQuery.isFetching ? "Загружаем…" : "Повторить"}</button></>}
+    <div className="resume-source-grid">{RESUME_SITES.map((site) => <ResumePreviewCard key={site.id} adapterId={site.id} record={sources[site.id]} queryClient={queryClient} sourcesBlocked={sourcesBlocked} />)}</div>
   </section>;
 }
 
@@ -932,19 +1059,19 @@ function sessionFailureReason(session: JobSession): string {
   return sessionReasonText(reason?.trim()) || "Причина сбоя не указана.";
 }
 
-function lifecycleNotice(session: JobSession): { tone: "info" | "success" | "warning" | "danger"; text: string } {
+function lifecycleNotice(session: JobSession): { tone: "neutral" | "info" | "success" | "warning" | "danger"; text: string } {
   const prefix = `Сессия #${session.id}`;
   switch (session.status) {
-    case "CREATED": return { tone: "info", text: `${prefix} создана и ожидает запуска.` };
-    case "PREPARING": return { tone: "info", text: `${prefix} готовится к запуску.` };
-    case "RUNNING": return { tone: "success", text: `${prefix} запущена.` };
-    case "PAUSED": return { tone: "warning", text: `${prefix} приостановлена. ${pausedSessionMessage(session.stop_reason)}` };
+    case "CREATED": return { tone: "warning", text: `${prefix} создана и ожидает запуска.` };
+    case "PREPARING": return { tone: "warning", text: `${prefix} готовится к запуску.` };
+    case "RUNNING": return { tone: "warning", text: `${prefix} запущена.` };
+    case "PAUSED": return { tone: "info", text: `${prefix} приостановлена. ${pausedSessionMessage(session.stop_reason)}` };
     case "STOPPING": return { tone: "warning", text: `${prefix}: остановка запрошена, ожидаем завершения.` };
     case "STOPPED": return { tone: "info", text: `${prefix} остановлена.` };
     case "COMPLETED": return { tone: "success", text: `${prefix} завершена.` };
-    case "CANCELLED": return { tone: "info", text: `${prefix} отменена.` };
+    case "CANCELLED": return { tone: "neutral", text: `${prefix} отменена.` };
     case "FAILED": return { tone: "danger", text: `${prefix} завершилась с ошибкой: ${sessionFailureReason(session)}` };
-    default: return { tone: "info", text: `${prefix}: состояние ${humanStatus(session.status)}.` };
+    default: return { tone: statusTone(session.status) as "neutral" | "info" | "success" | "warning" | "danger", text: `${prefix}: состояние ${humanStatus(session.status)}.` };
   }
 }
 
@@ -961,6 +1088,7 @@ function SessionPage() {
     refetchOnWindowFocus: false,
   });
   const resumeSources = resumeSourcesQuery.data ?? {};
+  const importErrors = useResumeImportErrors();
   const sessions = useQuery({
     queryKey: ["sessions"],
     queryFn: async () => sessionItems(await api<unknown>("/sessions", { cache: "no-store" })),
@@ -974,21 +1102,12 @@ function SessionPage() {
   // shown or whether the user may try to launch again.
   const genderPreferenceRequired = Boolean(resumeSource && resumeQuestions(resumeSource.preview).some((question) => question.id === "grammatical_gender" && question.required !== false));
   const missingGenderPreference = Boolean(genderPreferenceRequired && resumeSource?.grammaticalGender == null);
-  const savedDataRequired = adapter === "hh" || adapter === "zarplata";
-  const resumeDataReady = !savedDataRequired || resumeSource?.resumeDataStatus === "ready";
+  const savedDataRequired = adapter === "hh" || adapter === "hirehi" || adapter === "zarplata";
+  const currentResumeStatus = resumeCompletionStatus(resumeSource, importErrors[adapter]);
+  const resumeDataReady = savedDataRequired && (currentResumeStatus === "complete" || currentResumeStatus === "partial");
   const profileReady = Boolean(resumeSource && resumeDataReady && !missingGenderPreference);
-  const profileUnavailable = resumeSource?.status === "unavailable";
-  const resumeDataBlocked = Boolean(savedDataRequired && resumeSource && !resumeDataReady);
-  const resumeSourceUrl = resumeSource
-    ? publicResumeSourceUrl(resumeSource.sourceUrl, adapter)
-      ?? publicResumeSourceUrl(resumeSource.preview.source_url, adapter)
-    : undefined;
-  const resumeAddress = resumeSource
-    ? resumeSourceUrl
-      ?? (resumeSource.maskedUrl || resumeSource.preview.masked_url
-        ? safeResumeUrlLabel(resumeSource.maskedUrl ?? resumeSource.preview.masked_url)
-        : "Ссылка сохранена")
-    : "";
+  const resumeDataBlocked = Boolean(savedDataRequired && currentResumeStatus === "error");
+  const sourceFetchBlocked = resumeSourcesQuery.isPending || (resumeSourcesQuery.isError && !resumeSourcesQuery.data);
   const desiredJobDescriptionRef = useRef<HTMLTextAreaElement>(null);
   const idempotencyKeyRef = useRef<string | null>(null);
   const createInFlightRef = useRef(false);
@@ -1029,9 +1148,8 @@ function SessionPage() {
   const coverLetterMaxWordsAreValid = coverLetterMaxWordsValue === "" || (/^[1-9]\d*$/.test(coverLetterMaxWordsValue) && Number(coverLetterMaxWordsValue) <= 10000);
   const create = useMutation({
     mutationFn: async () => {
-      // HH/Zarplata launches use the durable local copy; HireHi revalidates
-      // its source as part of this create request. Never add a separate
-      // browser-token lifecycle or source refetch here.
+      // Launches use the durable local copy captured when the source was
+      // confirmed or explicitly refreshed.
       if (!idempotencyKeyRef.current) idempotencyKeyRef.current = createIntentKey();
       const idempotencyKey = idempotencyKeyRef.current;
       const response = await api<unknown>("/sessions", {
@@ -1074,6 +1192,12 @@ function SessionPage() {
   });
   const launchSession = () => {
     if (createInFlightRef.current || create.isPending) return;
+    if (sourceFetchBlocked) return;
+    const blockedMessage = resumeLaunchMessage(adapter, currentResumeStatus);
+    if (blockedMessage) {
+      toast.error(blockedMessage);
+      return;
+    }
     createInFlightRef.current = true;
     create.mutate();
   };
@@ -1084,6 +1208,17 @@ function SessionPage() {
     }
   }, [create.isError]);
   const action = async (sessionId: number, name: string) => {
+    if (name === "start") {
+      if (sourceFetchBlocked) return;
+      const session = (sessions.data ?? []).find((item) => item.id === sessionId);
+      const sessionAdapter = session?.adapter_id ?? adapter;
+      const sessionResumeStatus = resumeCompletionStatus(resumeSources[sessionAdapter], importErrors[sessionAdapter]);
+      const blockedMessage = resumeLaunchMessage(sessionAdapter, sessionResumeStatus);
+      if (blockedMessage) {
+        toast.error(blockedMessage);
+        return;
+      }
+    }
     const actionKey = `${sessionId}:${name}`;
     setPendingActions((current) => ({ ...current, [actionKey]: true }));
     try {
@@ -1094,9 +1229,9 @@ function SessionPage() {
       const actionMessage = response.message || (name === "stop"
         ? "Запрос на остановку принят. Сессия завершится после остановки текущего шага."
         : name === "start" ? "Запрос на запуск принят." : name === "resume" ? "Запрос на продолжение принят." : "Состояние сессии обновлено.");
-      setMessageTone(name === "stop" ? "info" : "success");
+      setMessageTone(name === "stop" ? "warning" : "success");
       setMessage(actionMessage);
-      if (name === "stop") toast.info(actionMessage); else toast.success(actionMessage);
+      if (name === "stop") toast.warning(actionMessage); else toast.success(actionMessage);
       await qc.invalidateQueries({ queryKey: ["sessions"] });
       await qc.invalidateQueries({ queryKey: ["session-report"] });
       await qc.invalidateQueries({ queryKey: ["session-history"] });
@@ -1168,10 +1303,6 @@ function SessionPage() {
                 <span className="checkline"><input aria-label="Без ограничений: отправка откликов" type="checkbox" checked={unlimitedApplications} onChange={(e) => updateDraft({ unlimitedApplications: e.target.checked })} />Без ограничений</span>
               </label>}
             </div>
-            <div className={`session-resume-requirement${profileReady ? " is-ready" : ""}`} aria-live="polite">
-              <div><strong>Резюме для {resumeSite(adapter).label}</strong>{resumeSource ? <><code className="session-resume-address">{resumeAddress}</code>{savedDataRequired && resumeDataReady && <span>Сессия использует сохранённые данные резюме.</span>}{profileUnavailable && !savedDataRequired && <span>Источник сохранён; актуальность будет проверена при запуске.</span>}{resumeDataBlocked && <span>Обновите данные резюме во вкладке «Профиль».</span>}{missingGenderPreference && <span>Заполните данные резюме в профиле.</span>}</> : <span>Нужно добавить и подтвердить ссылку на этой площадке.</span>}</div>
-              <NavLink className="button-link secondary" to="/profile">{resumeDataBlocked ? "Обновить в профиле" : resumeSource ? "Открыть источник" : "Добавить ссылку в профиле"}</NavLink>
-            </div>
             <label className="profile-full-field session-description-field">
               Описание желаемой вакансии
               <textarea
@@ -1233,7 +1364,7 @@ function SessionPage() {
           </section>
           <button type="button" className="primary"
             onClick={launchSession}
-            disabled={!profileReady || create.isPending || !limitsAreValid || !coverLetterIsValid || !coverLetterMaxWordsAreValid || blockedByAdapter}
+            disabled={sourceFetchBlocked || (resumeDataReady && missingGenderPreference) || create.isPending || !limitsAreValid || !coverLetterIsValid || !coverLetterMaxWordsAreValid || blockedByAdapter}
           >
             {create.isPending ? "Запускаем…" : "Создать и запустить"}
           </button>
@@ -1249,13 +1380,11 @@ function SessionPage() {
           {!coverLetterMaxWordsAreValid && (
             <Notice tone="danger" role="alert">Укажите целое число от 1 до 10000 слов или оставьте поле пустым.</Notice>
           )}
-          {!profileReady && !resumeDataBlocked && !profileUnavailable && !missingGenderPreference && (
-            <Notice tone="warning">
-              <>Для запуска нужно проверить и подтвердить резюме на сайте {resumeSite(adapter).label}. <NavLink className="button-link secondary" to="/profile">Открыть профиль</NavLink></>
-            </Notice>
+          {!profileReady && !resumeDataBlocked && !missingGenderPreference && (
+            <Notice tone="info">Добавьте ссылку на резюме сайта {resumeSite(adapter).label} во вкладке <NavLink to="/profile">Профиль</NavLink>.</Notice>
           )}
-          {resumeDataBlocked && <Notice tone="warning">Обновите данные резюме во вкладке «Профиль». <NavLink className="button-link secondary" to="/profile">Открыть профиль</NavLink></Notice>}
-          {missingGenderPreference && <Notice tone="warning">Заполните данные резюме в профиле перед запуском сессии. <NavLink className="button-link secondary" to="/profile">Открыть профиль</NavLink></Notice>}
+          {resumeDataBlocked && <Notice tone="info">Обновите данные резюме во вкладке <NavLink to="/profile">Профиль</NavLink>.</Notice>}
+          {missingGenderPreference && <Notice tone="info">Укажите род для сопроводительных писем в <NavLink to="/profile">профиле</NavLink>.</Notice>}
         </article>
       {createdLifecycle && createdSession?.status !== "FAILED" && <Notice tone={createdLifecycle.tone} role={createdLifecycle.tone === "danger" ? "alert" : "status"}>{createdLifecycle.text}</Notice>}
       {visibleFailures.map((failure) => <Notice key={failure.id} tone="danger" role="alert">
@@ -1274,9 +1403,7 @@ function SessionPage() {
         return <SessionCard key={session.id} session={session} formatSessionLimit={formatSessionLimit} action={action} pendingAction={Object.keys(pendingActions).find((key) => key.startsWith(`${session.id}:`))?.split(":")[1]} />;
       })}
       {history.data?.total ? <details className="session-history" open={historyOpen} onToggle={(event) => setHistoryOpen(event.currentTarget.open)} aria-labelledby="session-history-heading">
-        <summary>
-          <span className="session-history-head"><span><span className="eyebrow">ИСТОРИЯ</span><strong id="session-history-heading">Завершённые сессии ({history.data.total})</strong></span><span className="session-history-total">{history.data.total}</span></span>
-        </summary>
+        <summary className="session-history-head"><ChevronIcon className="session-history-chevron" /><strong id="session-history-heading">Завершённые сессии ({history.data.total})</strong><span className="session-history-total">{history.data.total}</span></summary>
         {history.error ? <p className="vacancy-error-message" role="alert">Не удалось загрузить историю сессий.</p> : historyItems.length === 0 ? <p className="empty-score">История пока пуста.</p> : <>
           {historyItems.map((session) => <SessionCard key={session.id} session={session} formatSessionLimit={formatSessionLimit} action={action} pendingAction={Object.keys(pendingActions).find((key) => key.startsWith(`${session.id}:`))?.split(":")[1]} />)}
           <div className="session-history-pagination"><button type="button" className="secondary" onClick={() => setHistoryOffset((value) => Math.max(0, value - 10))} disabled={historyOffset === 0 || history.isFetching}>Назад</button><span>Показаны {historyOffset + 1}–{Math.min(historyOffset + historyItems.length, history.data?.total ?? historyOffset + historyItems.length)}</span><button type="button" className="secondary" onClick={() => setHistoryOffset((value) => value + 10)} disabled={!history.data?.has_more || history.isFetching}>Дальше</button></div>
@@ -1546,9 +1673,9 @@ function VacanciesPage() {
           ? <button key={format} type="button" className="button-link secondary" disabled aria-disabled="true">{format.toUpperCase()}</button>
           : <a key={format} className="button-link secondary" download href={vacancyExportUrl(filters, format)}>{format.toUpperCase()}</a>)}</div>
       </div>
-      {hasFilterErrors ? <Notice tone="danger" role="alert">Исправьте отмеченные фильтры: список вакансий и экспорт появятся после исправления.</Notice> : q.isFetching && q.data ? <Notice role="status">{"\u041e\u0431\u043d\u043e\u0432\u043b\u044f\u0435\u043c \u0441\u043f\u0438\u0441\u043e\u043a \u0432\u0430\u043a\u0430\u043d\u0441\u0438\u0439\u2026"}</Notice> : null}
+      {hasFilterErrors ? <Notice tone="danger" role="alert">Исправьте отмеченные фильтры: список вакансий и экспорт появятся после исправления.</Notice> : q.isFetching && q.data ? <Notice tone="warning" role="status">{"\u041e\u0431\u043d\u043e\u0432\u043b\u044f\u0435\u043c \u0441\u043f\u0438\u0441\u043e\u043a \u0432\u0430\u043a\u0430\u043d\u0441\u0438\u0439\u2026"}</Notice> : null}
       {!hasFilterErrors && q.error && q.data && <Notice tone="danger" role="alert">{"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0431\u043d\u043e\u0432\u0438\u0442\u044c \u0441\u043f\u0438\u0441\u043e\u043a; \u043f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0435\u043c \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 \u0434\u0430\u043d\u043d\u044b\u0435."}</Notice>}
-      {!hasFilterErrors && (!q.data && q.isLoading ? <Notice role="status">{"\u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430 \u0432\u0430\u043a\u0430\u043d\u0441\u0438\u0439"}</Notice> : q.error && !q.data ? <Notice tone="danger" role="alert">{"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0432\u0430\u043a\u0430\u043d\u0441\u0438\u0438."}</Notice> : displayedVacancies.length ? (
+      {!hasFilterErrors && (!q.data && q.isLoading ? <Notice tone="warning" role="status">{"\u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430 \u0432\u0430\u043a\u0430\u043d\u0441\u0438\u0439"}</Notice> : q.error && !q.data ? <Notice tone="danger" role="alert">{"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0432\u0430\u043a\u0430\u043d\u0441\u0438\u0438."}</Notice> : displayedVacancies.length ? (
         <div className="vacancy-list">
           {displayedVacancies.map((v) => <VacancyCard key={v.id} v={v} />)}
           {q.data?.has_more && <button type="button" className="secondary" onClick={() => setOffset((value) => value + 30)} disabled={q.isFetching}>{"\u041f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0435\u0449\u0451"}</button>}
@@ -1582,9 +1709,6 @@ function ModelPage() {
   const loadModels = async () => { setLoadingModels(true); setMessageTone("neutral"); setMessage(""); try { const result = await api<{ models: string[] }>("/model/models", { method: "POST", body: JSON.stringify({ base_url: baseUrl, ...(apiKey ? { api_key: apiKey } : {}) }) }); setModels(result.models); setMessageTone("success"); if (result.models.length && !result.models.includes(model)) setModel(result.models[0]); setMessage(`Доступно моделей: ${result.models.length}`); toast.success(`Доступно моделей: ${result.models.length}`); } catch (error) { const message = error instanceof Error ? error.message : "Не удалось загрузить модели"; setMessageTone("danger"); setMessage(message); toast.error(message); } finally { setLoadingModels(false); } };
   const save = async () => { setSaving(true); try { await api("/model/settings", { method: "PUT", body: JSON.stringify({ base_url: baseUrl, model, ...(apiKey ? { api_key: apiKey } : {}) }) }); setApiKey(""); setMessageTone("success"); setMessage("Модель ответила корректно. Настройки сохранены"); toast.success("Настройки сохранены"); void qc.invalidateQueries({ queryKey: ["model-settings"] }); void qc.invalidateQueries({ queryKey: ["model-status"] }); } catch (error) { const message = error instanceof Error ? error.message : "Не удалось сохранить настройки"; setMessageTone("danger"); setMessage(message); toast.error(message); } finally { setSaving(false); } };
   const catalogHealth = catalogHealthPresentation(q.data, q.isLoading, q.isError);
-  const generationHealth = generationHealthPresentation(q.data, q.isLoading, q.isError);
-  const generation = q.data?.generation_health;
-  const lastGeneration = generation?.healthy === false ? generation.last_failure : generation?.last_success;
   return (
     <section className="page">
       <Title
@@ -1596,23 +1720,12 @@ function ModelPage() {
       <article className="panel model model-health-panel">
         <div className="model-health-grid">
           <section className="model-health-item" aria-labelledby="catalog-health-heading">
-            <div className={`orb ${catalogHealth.complete ? "online" : ""}`} aria-hidden="true"></div>
+            <div className={`orb ${catalogHealth.complete ? "online" : ""}`} data-tone={statusTone(catalogHealth.code)} aria-hidden="true"></div>
             <div>
               <span className="model-health-kicker">Доступность каталога</span>
               <Status value={catalogHealth.code} label={catalogHealth.label} />
               <h2 id="catalog-health-heading">{q.data?.model || "Модель не указана"}</h2>
               <p>{catalogHealth.detail}</p>
-            </div>
-          </section>
-          <section className="model-health-item" aria-labelledby="generation-health-heading">
-            <div className={`orb ${generationHealth.complete ? "online" : ""}`} aria-hidden="true"></div>
-            <div>
-              <span className="model-health-kicker">Работоспособность генерации</span>
-              <Status value={generationHealth.code} label={generationHealth.label} />
-              <h2 id="generation-health-heading">Реальные запросы</h2>
-              <p>{generationHealth.detail}</p>
-              {generation && <p className="model-health-counts">Успешно: {generation.success_count} · Ошибок: {generation.failure_count} · В работе: {generation.running} · В очереди: {generation.queued}</p>}
-              {lastGeneration && <small>Последнее наблюдение: <time dateTime={lastGeneration.at}>{formatServerUtc(lastGeneration.at)}</time>{lastGeneration.diagnostic_id && <> · диагностика {lastGeneration.diagnostic_id}</>}</small>}
             </div>
           </section>
         </div>

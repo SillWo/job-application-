@@ -28,6 +28,21 @@ function Write-Step {
     Write-Host "`n==> $Message" -ForegroundColor Cyan
 }
 
+function Merge-ProcessPath {
+    param([string[]]$PathValues)
+    $entries = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($value in $PathValues) {
+        if ($null -eq $value) { continue }
+        foreach ($rawEntry in ($value -split ';')) {
+            $entry = $rawEntry.Trim()
+            if (-not $entry) { continue }
+            if ($seen.Add($entry)) { [void]$entries.Add($entry) }
+        }
+    }
+    return ($entries -join ';')
+}
+
 function Assert-NativeSuccess {
     param([string]$Step)
     if ($LASTEXITCODE -ne 0) {
@@ -41,10 +56,7 @@ function Refresh-ProcessPath {
     # usable without opening another terminal.
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $parts = @($env:PATH, $userPath, $machinePath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    if ($parts.Count -gt 0) {
-        $env:PATH = ($parts -join ';')
-    }
+    $env:PATH = Merge-ProcessPath @($env:PATH, $userPath, $machinePath)
 }
 
 function Get-CommandPath {
@@ -356,6 +368,24 @@ function Ensure-PythonEnvironment {
     return [PSCustomObject]@{ Python = $venvPython; Fingerprint = $dependencyFingerprint }
 }
 
+function Test-FrontendToolchain {
+    param([string]$Frontend)
+    $nodeModules = Join-Path $Frontend 'node_modules'
+    $typeScriptShim = Join-Path $nodeModules '.bin\tsc.cmd'
+    $viteShim = Join-Path $nodeModules '.bin\vite.cmd'
+    $typeScriptEntry = Join-Path $nodeModules 'typescript\bin\tsc'
+    $viteEntry = Join-Path $nodeModules 'vite\bin\vite.js'
+    foreach ($path in @($typeScriptShim, $viteShim, $typeScriptEntry, $viteEntry)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    }
+
+    foreach ($tool in @($typeScriptShim, $viteShim)) {
+        $result = Invoke-NativeProbe $tool @('--version')
+        if ($result.ExitCode -ne 0) { return $false }
+    }
+    return $true
+}
+
 function Ensure-FrontendDependencies {
     param([string]$Npm)
     $frontend = Join-Path $root 'frontend'
@@ -365,18 +395,22 @@ function Ensure-FrontendDependencies {
     )
     $nodeModules = Join-Path $frontend 'node_modules'
     $marker = Join-Path $nodeModules '.job-application-node-dependencies.sha256'
-    if ($ForceSetup -or -not (Test-Path -LiteralPath $nodeModules -PathType Container) -or (Read-Marker $marker) -ne $fingerprint) {
+    $toolchainReady = Test-FrontendToolchain $frontend
+    if ($ForceSetup -or -not $toolchainReady -or -not (Test-Path -LiteralPath $nodeModules -PathType Container) -or (Read-Marker $marker) -ne $fingerprint) {
         Write-Step 'Installing frontend dependencies'
         Push-Location -LiteralPath $frontend
         try {
             if (Test-Path -LiteralPath 'package-lock.json' -PathType Leaf) {
-                & $Npm ci
+                & $Npm ci --include=dev --bin-links=true
             } else {
-                & $Npm install
+                & $Npm install --include=dev --bin-links=true
             }
             Assert-NativeSuccess 'Installing frontend dependencies'
         } finally {
             Pop-Location
+        }
+        if (-not (Test-FrontendToolchain $frontend)) {
+            throw 'Frontend dependencies were installed, but the TypeScript/Vite toolchain is still incomplete or failed its version check. Run npm ci manually from frontend and inspect the installation output.'
         }
         Write-Marker $marker $fingerprint
     } else {

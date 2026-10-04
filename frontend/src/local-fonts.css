@@ -10,3 +10,10 @@
 .model h2 {
   font-weight: 700;
 }
+
+@media (min-width: 901px) {
+  .title h1,
+  .model h2 {
+    font-weight: 600;
+  }
+}

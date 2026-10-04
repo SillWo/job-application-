@@ -32,6 +32,7 @@ from backend.adapters.base.resume_import import (
     bool_field,
     coverage_for,
     finalize_snapshot,
+    gender_field,
     integer_field,
     list_field,
     now_utc,
@@ -489,7 +490,7 @@ class HHResumeExtractor:
         await _validate_content_sections(page)
         identity = ResumeIdentity(
             full_name=await text_field(page, L.NAME, "identity", label="full_name"),
-            gender=await text_field(page, L.GENDER, "identity", label="gender"),
+            gender=await gender_field(page, L.GENDER),
             age=await integer_field(page, L.AGE, "identity"),
             birth_date=await text_field(page, L.BIRTH_DATE, "identity", label="birth_date"),
             has_photo=await bool_field(page, L.PHOTO, "identity", label="has_photo"),

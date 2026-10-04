@@ -15,7 +15,7 @@ function seedResumeSource(adapterId = 'hh') {
 let seededAdapter: string | null = null
 function seededResumeResponse(url: string, init?: RequestInit) {
   if (!seededAdapter) return null
-  const record = { adapter_id: seededAdapter, status: 'valid', checked_at: '2026-09-01T00:00:00.000Z', uses_saved_data: seededAdapter === 'hh' || seededAdapter === 'zarplata', resume_data_status: seededAdapter === 'hh' || seededAdapter === 'zarplata' ? 'ready' : null, resume_data_saved_at: seededAdapter === 'hh' || seededAdapter === 'zarplata' ? '2026-09-01T00:00:00.000Z' : null, resume_data_error_message: null, preview_token: 'test-preview-token', preview: { source_site: seededAdapter, target_title: 'Test role', questions: [] }, changed: false }
+  const record = { adapter_id: seededAdapter, status: 'valid', checked_at: '2026-09-01T00:00:00.000Z', uses_saved_data: true, resume_data_status: 'ready', resume_data_saved_at: '2026-09-01T00:00:00.000Z', resume_data_error_message: null, preview_token: 'test-preview-token', preview: { source_site: seededAdapter, target_title: 'Test role', questions: [] }, changed: false }
   if (url.endsWith('/api/resume-sources') && !init?.method) return Promise.resolve({ ok: true, json: async () => [record] })
   if (url.endsWith(`/api/resume-sources/${seededAdapter}/refresh`) && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ ...record, preview_token: 'fresh-test-preview-token' }) })
   return null
@@ -1094,18 +1094,38 @@ test.each(['COMPLETED', 'CANCELLED'])(
 )
 
 test.each([
-  ['STOPPED', 'остановлена'],
-  ['COMPLETED', 'завершена'],
-])('reports a persisted %s session truthfully after reload', async (status, expected) => {
+  ['RUNNING', 'запущена', 'warning'],
+  ['PAUSED', 'приостановлена', 'info'],
+  ['STOPPED', 'остановлена', 'info'],
+  ['COMPLETED', 'завершена', 'success'],
+  ['CANCELLED', 'отменена', 'neutral'],
+] as const)('reports a persisted %s session truthfully after reload', async (status, expected, tone) => {
   localStorage.setItem('job-orchestrator.last-created-session', '74')
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
     if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: [{ id: 74, adapter_id: 'hh', status, counters: {} }], total: 1, limit: 10, offset: 0, has_more: false }) })
-    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => ['RUNNING', 'PAUSED'].includes(status) ? [{ id: 74, adapter_id: 'hh', status, counters: {} }] : [] })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
-  expect(await screen.findByText(`Сессия #74 ${expected}.`)).toBeInTheDocument()
+  const lifecycle = await screen.findByText((_, element) => element?.classList.contains('notice') === true && element.textContent?.startsWith(`Сессия #74 ${expected}`) === true)
+  expect(lifecycle).toHaveAttribute('data-tone', tone)
+})
+
+test.each([
+  ['RUNNING', 'warning'],
+  ['PAUSED', 'info'],
+] as const)('overview colors active %s session as %s', async (status, tone) => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [{ id: 1, adapter_id: 'hh', status, counters: {} }] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/']}><App /></MemoryRouter></QueryClientProvider>)
+  const sessionLabel = await screen.findByText(`Сессия ${status === 'RUNNING' ? 'в работе' : 'приостановлена'}`)
+  expect(sessionLabel.closest('span')).toHaveAttribute('data-tone', tone)
+  expect(document.querySelector('.preview-top')).toHaveAttribute('data-tone', tone)
+  expect(document.querySelector('.preview-line:last-child i')).toHaveAttribute('data-tone', tone)
 })
 
 test('HireHi launch hides per-session resume controls', async () => {
@@ -1636,10 +1656,11 @@ test.each([
   const status = await screen.findByText(label)
   expect(status).toHaveClass(`status-${tone}`)
   expect(status).toHaveAttribute('data-status', dataStatus)
-  expect(screen.getByText('Генерация ещё не проверена')).toHaveAttribute('data-status', 'UNKNOWN')
+  expect(status).toHaveAttribute('data-tone', tone)
+  expect(screen.queryByText('Генерация ещё не проверена')).not.toBeInTheDocument()
 })
 
-test('model page reports a catalog success and a real generation failure independently', async () => {
+test('model page keeps catalog and settings controls while hiding generation health', async () => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({
@@ -1664,10 +1685,15 @@ test('model page reports a catalog success and a real generation failure indepen
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/model']}><App /></MemoryRouter></QueryClientProvider>)
 
   expect(await screen.findByText('Модель доступна в каталоге')).toHaveAttribute('data-status', 'AVAILABLE')
-  expect(screen.getByText('Генерация требует проверки')).toHaveAttribute('data-status', 'UNHEALTHY')
-  expect(screen.getByText(/После ошибки запросы ожидают свободный рабочий слот: 3/)).toBeInTheDocument()
-  expect(screen.getByText(/Успешно: 4 · Ошибок: 1 · В работе: 0 · В очереди: 3/)).toBeInTheDocument()
-  expect(screen.getByText(/диагностика safe-failure-id/)).toBeInTheDocument()
+  expect(screen.getByText('Модель доступна в каталоге')).toHaveAttribute('data-tone', 'success')
+  expect(screen.getByRole('button', { name: 'Проверить снова' })).toBeInTheDocument()
+  expect(screen.getByRole('textbox', { name: /Base URL/ })).toBeInTheDocument()
+  expect(screen.getByRole('textbox', { name: 'Модель' })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Загрузить модели' })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Сохранить изменения' })).toBeInTheDocument()
+  expect(screen.queryByText('Работоспособность генерации')).not.toBeInTheDocument()
+  expect(screen.queryByText('Генерация требует проверки')).not.toBeInTheDocument()
+  expect(screen.queryByText(/После ошибки запросы ожидают свободный рабочий слот|Успешно: 4 · Ошибок: 1|диагностика safe-failure-id/)).not.toBeInTheDocument()
   expect(screen.queryByText(/provider|secret|internal error/i)).not.toBeInTheDocument()
 })
 
@@ -1683,10 +1709,13 @@ test('model page distinguishes loading and status request failure', async () => 
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/model']}><App /></MemoryRouter></QueryClientProvider>)
 
   expect(await screen.findByText('Проверяем каталог')).toHaveAttribute('data-status', 'LOADING')
-  expect(screen.getByText('Проверяем историю генерации')).toHaveAttribute('data-status', 'LOADING')
+  expect(screen.getByText('Проверяем каталог')).toHaveAttribute('data-tone', 'warning')
+  expect(screen.queryByText('Проверяем историю генерации')).not.toBeInTheDocument()
+  expect(screen.queryByText('Работоспособность генерации')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Проверить снова' })).toBeInTheDocument()
   rejectStatus?.(new Error('private provider failure'))
   expect(await screen.findByText('Статус каталога недоступен')).toHaveAttribute('data-status', 'STATUS_ERROR')
-  expect(screen.getByText('Статус генерации недоступен')).toHaveAttribute('data-status', 'STATUS_ERROR')
+  expect(screen.queryByText('Статус генерации недоступен')).not.toBeInTheDocument()
   expect(screen.queryByText(/private provider failure/)).not.toBeInTheDocument()
 })
 

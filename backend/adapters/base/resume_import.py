@@ -157,6 +157,20 @@ async def text_field(page: Any, selector: str, section: str, *, label: str | Non
     return SourceField(availability=FieldAvailability.HIDDEN, source_section=section)
 
 
+def normalize_gender(field: SourceField[str]) -> SourceField[str]:
+    """Normalize only explicit Russian gender labels on present fields."""
+    if field.availability is FieldAvailability.PRESENT and field.value:
+        normalized = {"мужчина": "male", "женщина": "female"}.get(field.value.casefold())
+        if normalized is not None:
+            field.value = normalized
+    return field
+
+
+async def gender_field(page: Any, selector: str, section: str = "identity") -> SourceField[str]:
+    """Read a visible gender label and normalize only explicit Russian values."""
+    return normalize_gender(await text_field(page, selector, section, label="gender"))
+
+
 async def attribute_field(page: Any, selector: str, attribute: str, section: str,
                           *, label: str | None = None) -> SourceField[str]:
     locator = page.locator(selector)

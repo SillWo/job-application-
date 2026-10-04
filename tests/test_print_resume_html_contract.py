@@ -10,7 +10,7 @@ from backend.adapters.hh.resume import extractor as hh_extractor
 from backend.adapters.hh.resume import validate_resume_url as validate_hh
 from backend.adapters.zarplata.resume import extractor as zarplata_extractor
 from backend.adapters.zarplata.resume import validate_resume_url as validate_zarplata
-from backend.services.resume_session import ResumeImportError, _normalize_extracted
+from backend.services.resume_session import ResumeImportError, _normalize_extracted, public_preview
 
 PRINT_HTML = """
 <body class="bloko-print"><main>
@@ -143,6 +143,62 @@ async def test_print_contract_maps_structured_variable_sections(extractor, url, 
     assert len(snapshot.education) == 1
     assert len(snapshot.languages) == 2
     assert [item.name.value for item in snapshot.skills] == ["Python", "SQL"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extractor", "validator", "url"),
+    [
+        (hh_extractor, validate_hh, "https://hh.ru/resume/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        (zarplata_extractor, validate_zarplata, "https://zarplata.ru/resume/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    ],
+)
+async def test_print_contract_normalizes_explicit_russian_gender_and_keeps_provenance(
+    extractor, validator, url
+):
+    async with async_playwright() as playwright:
+        browser, context, page = await _offline_page(playwright)
+        try:
+            ref = validator(url)
+            for label, expected in (
+                ("мУЖЧиНа", "male"), ("  ЖЕНЩИНА  ", "female"),
+                ("male", "male"), ("female", "female"), ("Other", "Other"),
+            ):
+                html = PRINT_HTML.replace(
+                    '<span data-qa="resume-personal-gender">Other</span>',
+                    f'<span data-qa="resume-personal-gender">{label}</span>',
+                )
+                await page.set_content(html)
+                snapshot = await extractor.extract(page, ref, extractor.policy)
+                assert snapshot.identity.gender.value == expected
+                assert snapshot.identity.gender.availability.value == "present"
+                assert snapshot.identity.gender.source_section == "identity"
+                preview = public_preview(snapshot)
+                if expected in {"male", "female"}:
+                    assert preview["grammatical_gender"] == expected
+                    assert preview["questions"] == []
+                else:
+                    assert preview["grammatical_gender"] is None
+                    assert len(preview["questions"]) == 1
+
+            hidden_html = PRINT_HTML.replace(
+                '<span data-qa="resume-personal-gender">Other</span>',
+                '<span data-qa="resume-personal-gender" style="display:none">Мужчина</span>',
+            )
+            await page.set_content(hidden_html)
+            hidden = await extractor.extract(page, ref, extractor.policy)
+            assert hidden.identity.gender.value is None
+            assert hidden.identity.gender.availability.value == "hidden"
+
+            missing_html = PRINT_HTML.replace(
+                '<span data-qa="resume-personal-gender">Other</span>', ""
+            )
+            await page.set_content(missing_html)
+            missing = await extractor.extract(page, ref, extractor.policy)
+            assert missing.identity.gender.value is None
+            assert missing.identity.gender.availability.value == "not_provided"
+        finally:
+            await browser.close()
 
 
 @pytest.mark.asyncio

@@ -43,14 +43,17 @@ def cached_launch_client(tmp_path, monkeypatch):
     engine.dispose()
 
 
-def _saved_source(adapter_id: str, *, cached: bool = True, payload: str | None = None):
-    host = "hh.ru" if adapter_id == "hh" else "zarplata.ru"
+def _saved_source(
+    adapter_id: str, *, cached: bool = True, payload: str | None = None,
+    name: str = "Synthetic Candidate",
+):
+    host = {"hh": "hh.ru", "zarplata": "zarplata.ru", "hirehi": "hirehi.ru"}[adapter_id]
     resume_id = f"cached-{adapter_id}-fixture"
     url = f"https://{host}/resume/{resume_id}"
     snapshot = _normalize_extracted(
         {
             "external_id": resume_id,
-            "identity": {"full_name": "Synthetic Candidate", "gender": "male"},
+            "identity": {"full_name": name, "gender": "male"},
             "contacts": {"email": "candidate@example.test"},
             "target": {"title": "Engineer"},
             "about": f"Saved {adapter_id} profile data",
@@ -74,7 +77,13 @@ def _saved_source(adapter_id: str, *, cached: bool = True, payload: str | None =
     return source, snapshot
 
 
-@pytest.mark.parametrize("adapter_id", ["hh", "zarplata"])
+def _launch_error(adapter_id: str, *, missing: bool) -> str:
+    names = {"hh": "HH.ru", "hirehi": "HireHi", "zarplata": "Zarplata.ru"}
+    wording = "не загружено резюме" if missing else "не удалось извлечь необходимые данные из резюме"
+    return f'Для сайта {names[adapter_id]} {wording}, проверьте раздел "Профиль"'
+
+
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
 def test_create_session_uses_cached_snapshot_without_network_and_pins_it(
     cached_launch_client, monkeypatch, adapter_id
 ):
@@ -103,7 +112,7 @@ def test_create_session_uses_cached_snapshot_without_network_and_pins_it(
     assert starts == [{"site_id": adapter_id, "session_id": session_id}]
 
 
-@pytest.mark.parametrize("adapter_id", ["hh", "zarplata"])
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
 @pytest.mark.parametrize("source_kind", ["missing", "corrupt", "url_only"])
 def test_create_rejects_unusable_cached_source_before_creating_session_or_lease(
     cached_launch_client, adapter_id, source_kind
@@ -122,7 +131,7 @@ def test_create_rejects_unusable_cached_source_before_creating_session_or_lease(
     response = client.post("/api/sessions", json={"adapter_id": adapter_id})
 
     assert response.status_code == 400
-    assert "Обновите данные резюме во вкладке «Профиль»" in response.json()["detail"]
+    assert response.json()["detail"] == _launch_error(adapter_id, missing=source_kind == "missing")
     with sessions() as db:
         assert db.scalar(select(func.count(JobSession.id))) == 0
         assert db.scalar(select(func.count(SiteExecutionLease.site_id))) == 0
@@ -130,7 +139,7 @@ def test_create_rejects_unusable_cached_source_before_creating_session_or_lease(
     assert starts == []
 
 
-@pytest.mark.parametrize("adapter_id", ["hh", "zarplata"])
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
 def test_legacy_created_session_starts_from_local_snapshot_without_network(
     cached_launch_client, monkeypatch, adapter_id
 ):
@@ -155,7 +164,7 @@ def test_legacy_created_session_starts_from_local_snapshot_without_network(
     assert starts == [{"site_id": adapter_id, "session_id": session_id}]
 
 
-@pytest.mark.parametrize("adapter_id", ["hh", "zarplata"])
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
 @pytest.mark.parametrize("source_kind", ["missing", "corrupt"])
 def test_legacy_created_session_rejects_unusable_local_snapshot_before_start(
     cached_launch_client, adapter_id, source_kind
@@ -173,9 +182,92 @@ def test_legacy_created_session_rejects_unusable_local_snapshot_before_start(
     response = client.post(f"/api/sessions/{session_id}/start")
 
     assert response.status_code == 422
-    assert "Обновите данные резюме во вкладке «Профиль»" in response.json()["detail"]
+    assert response.json()["detail"] == _launch_error(adapter_id, missing=source_kind == "missing")
     with sessions() as db:
         assert db.get(JobSession, session_id).status == SessionStatus.CREATED
         assert db.scalar(select(func.count(SessionResumeSnapshot.session_id))) == 0
         assert db.scalar(select(func.count(SiteExecutionLease.site_id))) == 0
     assert starts == []
+
+
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
+def test_existing_pinned_session_keeps_its_snapshot_when_profile_copy_changes(
+    cached_launch_client, adapter_id
+):
+    client, sessions, starts = cached_launch_client
+    source, original = _saved_source(adapter_id)
+    with sessions() as db:
+        db.add(source)
+        db.commit()
+
+    created = client.post("/api/sessions", json={"adapter_id": adapter_id})
+    assert created.status_code == 202, created.text
+    session_id = created.json()["id"]
+    with sessions() as db:
+        session_copy = db.scalar(
+            select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == session_id)
+        )
+        pinned_hash = session_copy.content_hash
+        updated_source, replacement = _saved_source(adapter_id, name="Replacement Candidate")
+        source_row = db.scalar(select(SavedResumeSource).where(SavedResumeSource.adapter_id == adapter_id))
+        source_row.resume_snapshot_payload = updated_source.resume_snapshot_payload
+        source_row.content_hash = updated_source.content_hash
+        source_row.source_url_hash = updated_source.source_url_hash
+        source_row.resume_id_hash = updated_source.resume_id_hash
+        source_row.source_url = updated_source.source_url
+        db.commit()
+
+    started = client.post(f"/api/sessions/{session_id}/start")
+    assert started.status_code == 200, started.text
+    with sessions() as db:
+        session_copy = db.scalar(
+            select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == session_id)
+        )
+        assert session_copy.content_hash == pinned_hash
+        assert session_copy.full_snapshot["identity"]["full_name"]["value"] == original.identity.full_name.value
+        assert session_copy.full_snapshot["identity"]["full_name"]["value"] != replacement.identity.full_name.value
+    assert starts == [
+        {"site_id": adapter_id, "session_id": session_id},
+        {"site_id": adapter_id, "session_id": session_id},
+    ]
+
+
+@pytest.mark.parametrize("adapter_id", ["hh", "zarplata", "hirehi"])
+@pytest.mark.parametrize("source_state", ["missing", "corrupt"])
+def test_existing_pinned_session_requires_current_usable_profile_before_start(
+    cached_launch_client, adapter_id, source_state
+):
+    client, sessions, starts = cached_launch_client
+    source, _ = _saved_source(adapter_id)
+    with sessions() as db:
+        db.add(source)
+        db.commit()
+
+    created = client.post("/api/sessions", json={"adapter_id": adapter_id})
+    assert created.status_code == 202, created.text
+    session_id = created.json()["id"]
+    with sessions() as db:
+        pinned = db.scalar(
+            select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == session_id)
+        )
+        pinned_hash = pinned.content_hash
+        lease_count = db.scalar(select(func.count(SiteExecutionLease.site_id)))
+        source_row = db.scalar(select(SavedResumeSource).where(SavedResumeSource.adapter_id == adapter_id))
+        if source_state == "missing":
+            db.delete(source_row)
+        else:
+            source_row.resume_snapshot_payload = "sealed-test:damaged"
+        db.commit()
+
+    response = client.post(f"/api/sessions/{session_id}/start")
+    assert response.status_code == 422
+    assert response.json()["detail"] == _launch_error(adapter_id, missing=source_state == "missing")
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        pinned = db.scalar(
+            select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == session_id)
+        )
+        assert item.status == SessionStatus.PREPARING
+        assert pinned.content_hash == pinned_hash
+        assert db.scalar(select(func.count(SiteExecutionLease.site_id))) == lease_count
+    assert starts == [{"site_id": adapter_id, "session_id": session_id}]

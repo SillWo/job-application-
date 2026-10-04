@@ -100,6 +100,27 @@ from backend.services.resume_session import (
 
 router = APIRouter(prefix="/api")
 _SAVED_RESUME_REFRESH_ERROR = 'Обновите данные резюме во вкладке «Профиль»'
+_SAVED_RESUME_LAUNCH_ERRORS = {
+    "hh": (
+        'Для сайта HH.ru не загружено резюме, проверьте раздел "Профиль"',
+        'Для сайта HH.ru не удалось извлечь необходимые данные из резюме, проверьте раздел "Профиль"',
+    ),
+    "hirehi": (
+        'Для сайта HireHi не загружено резюме, проверьте раздел "Профиль"',
+        'Для сайта HireHi не удалось извлечь необходимые данные из резюме, проверьте раздел "Профиль"',
+    ),
+    "zarplata": (
+        'Для сайта Zarplata.ru не загружено резюме, проверьте раздел "Профиль"',
+        'Для сайта Zarplata.ru не удалось извлечь необходимые данные из резюме, проверьте раздел "Профиль"',
+    ),
+}
+
+
+def _saved_resume_launch_error(adapter_id: str, *, missing: bool) -> str:
+    errors = _SAVED_RESUME_LAUNCH_ERRORS.get(adapter_id)
+    if errors is None:
+        return _SAVED_RESUME_REFRESH_ERROR
+    return errors[0 if missing else 1]
 
 
 def _validate_session_resume_snapshot(snapshot: SessionResumeSnapshot, adapter_id: str) -> SiteResumeSnapshot:
@@ -703,10 +724,9 @@ def _create_session(
         adapter_registry.get(payload.adapter_id)
     except KeyError as exc:
         raise HTTPException(400, str(exc)) from exc
-    # Durable runtime path: HH/Zarplata pin their confirmed local copy here;
-    # HireHi retains its network import in the spawned worker. Check idempotency
-    # before the mutable saved-source row so a retry keeps its original ID
-    # even if the profile was edited between requests.
+    # Durable runtime path: cache-backed sites pin their confirmed local copy
+    # here. Check idempotency before the mutable saved-source row so a retry
+    # keeps its original ID even if the profile was edited between requests.
     key = (request.headers.get("Idempotency-Key") if request is not None else "") or ""
     key = key.strip()
     payload_hash = canonical_payload_hash(payload.model_dump(mode="json"))
@@ -729,17 +749,21 @@ def _create_session(
     )
     if saved_source is None:
         if uses_saved_resume_data(payload.adapter_id):
-            raise HTTPException(400, _SAVED_RESUME_REFRESH_ERROR)
+            raise HTTPException(
+                400, _saved_resume_launch_error(payload.adapter_id, missing=True)
+            )
         raise HTTPException(400, "Сначала проверьте и подтвердите ссылку на резюме выбранного сайта")
-    # HH and Zarplata sessions are pinned synchronously to the last locally
-    # confirmed full snapshot.  This happens before a JobSession or lease is
+    # Cache-backed sessions are pinned synchronously to the last locally
+    # confirmed full snapshot. This happens before a JobSession or lease is
     # created, so a missing/corrupt cache cannot leave accepted work behind.
     saved_snapshot = None
     if uses_saved_resume_data(payload.adapter_id):
         try:
             saved_snapshot = load_saved_resume_data(saved_source)
         except ResumeImportError as exc:
-            raise HTTPException(400, _SAVED_RESUME_REFRESH_ERROR) from exc
+            raise HTTPException(
+                400, _saved_resume_launch_error(payload.adapter_id, missing=False)
+            ) from exc
     site_id = adapter_registry.get(payload.adapter_id).site_id
     current_lease = db.get(SiteExecutionLease, site_id)
     if current_lease is not None:
@@ -1000,6 +1024,24 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     if item.status not in {SessionStatus.PREPARING, SessionStatus.CREATED}:
         raise HTTPException(409, "Запустить можно только новую сессию")
     snapshot = db.scalar(select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == item.id))
+    saved_source = None
+    if uses_saved_resume_data(item.adapter_id):
+        saved_source = db.scalar(
+            select(SavedResumeSource).where(SavedResumeSource.adapter_id == item.adapter_id)
+        )
+        if saved_source is None:
+            raise HTTPException(
+                422, _saved_resume_launch_error(item.adapter_id, missing=True)
+            )
+        try:
+            # A launch requires the profile's current saved copy to remain
+            # usable. The session still runs from its own pinned snapshot when
+            # one exists; this check never replaces that immutable copy.
+            load_saved_resume_data(saved_source)
+        except ResumeImportError as exc:
+            raise HTTPException(
+                422, _saved_resume_launch_error(item.adapter_id, missing=False)
+            ) from exc
     if snapshot is not None:
         _validate_session_resume_snapshot(snapshot, item.adapter_id)
         if _private_gender_value(snapshot.private_view) is None:
@@ -1008,17 +1050,16 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
         # Older PREPARING sessions were created before the API pinned their
         # local source copy.  Backfill once from disk/database, never from the
         # public site, before requesting the worker start.
-        source = db.scalar(
-            select(SavedResumeSource).where(SavedResumeSource.adapter_id == item.adapter_id)
-        )
         try:
-            if source is None:
-                raise ResumeImportError(_SAVED_RESUME_REFRESH_ERROR)
-            full = load_saved_resume_data(source)
+            # saved_source was checked above, before any snapshot or lease
+            # mutation, so this is also the source for one-time legacy repair.
+            full = load_saved_resume_data(saved_source)
             snapshot = persist_session_snapshot(db, session_id, full)
         except ResumeImportError as exc:
             db.rollback()
-            raise HTTPException(422, _SAVED_RESUME_REFRESH_ERROR) from exc
+            raise HTTPException(
+                422, _saved_resume_launch_error(item.adapter_id, missing=False)
+            ) from exc
         _validate_session_resume_snapshot(snapshot, item.adapter_id)
         ensure_execution(
             db,

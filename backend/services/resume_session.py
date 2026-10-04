@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from backend.adapters import adapter_registry
 from backend.adapters.base.resume_import import (
+    coverage_for,
     open_resume_page,
 )
 from backend.adapters.base.resume_import import (
@@ -719,11 +720,15 @@ def _apply_saved_gender(
 
 
 _SAVED_RESUME_DATA_ERROR = "Обновите данные резюме во вкладке «Профиль»"
+_MAIN_RESUME_SECTIONS = frozenset({
+    "identity", "contacts", "target", "location", "experience", "skills",
+    "education", "languages", "about", "total_experience",
+})
 
 
 def uses_saved_resume_data(adapter_id: str) -> bool:
     """Whether this site uses an explicitly saved local resume snapshot."""
-    return adapter_id in {"hh", "zarplata"}
+    return adapter_id in {"hh", "zarplata", "hirehi"}
 
 
 def _validated_saved_snapshot(row: SavedResumeSource) -> SiteResumeSnapshot:
@@ -787,8 +792,18 @@ def _validated_saved_snapshot(row: SavedResumeSource) -> SiteResumeSnapshot:
         raise ResumeImportError(_SAVED_RESUME_DATA_ERROR) from exc
 
 
+def _saved_snapshot_completion(snapshot: SiteResumeSnapshot) -> str:
+    """Classify main-section coverage from the full validated snapshot."""
+    # Coverage stored by older extractors may be stale or omit newer sections.
+    # Recompute it on a copy, using the canonical schema's field availability.
+    measured = snapshot.model_copy(deep=True)
+    coverage_for(measured)
+    present = set(measured.coverage.present_sections)
+    return "complete" if present >= _MAIN_RESUME_SECTIONS else "partial"
+
+
 def load_saved_resume_data(row: SavedResumeSource) -> SiteResumeSnapshot:
-    """Load a complete saved HH/Zarplata snapshot using local data only."""
+    """Load a complete saved resume snapshot using local data only."""
     if not uses_saved_resume_data(row.adapter_id):
         raise ResumeImportError(_SAVED_RESUME_DATA_ERROR)
     return _validated_saved_snapshot(row)
@@ -1060,8 +1075,6 @@ def confirm_saved_resume_source(
             snapshot = _apply_saved_gender(snapshot, selected_gender)
             snapshot = snapshot.model_copy(update={"content_hash": _snapshot_hash(snapshot)})
         else:
-            # Keep the existing HireHi flow: it persists only the redacted
-            # profile projection and relies on a live import when starting.
             snapshot = public_preview_snapshot
         public_snapshot, _ = _redacted_snapshot(snapshot)
         # ``public_snapshot`` redacts identity/contact values and their
@@ -1170,12 +1183,14 @@ def saved_resume_source_record(
     }
     if uses_saved_resume_data(row.adapter_id):
         try:
-            _validated_saved_snapshot(row)
+            snapshot = _validated_saved_snapshot(row)
             result.update({
                 "uses_saved_data": True,
                 "resume_data_status": "ready",
                 "resume_data_saved_at": row.resume_data_saved_at.isoformat() if row.resume_data_saved_at else None,
                 "resume_data_error_message": None,
+                "completion_status": _saved_snapshot_completion(snapshot),
+                "completion_error_message": None,
             })
         except ResumeImportError:
             state = "missing" if not getattr(row, "resume_snapshot_payload", None) else "corrupt"
@@ -1184,6 +1199,8 @@ def saved_resume_source_record(
                 "resume_data_status": state,
                 "resume_data_saved_at": row.resume_data_saved_at.isoformat() if row.resume_data_saved_at else None,
                 "resume_data_error_message": _SAVED_RESUME_DATA_ERROR,
+                "completion_status": "error",
+                "completion_error_message": _SAVED_RESUME_DATA_ERROR,
             })
     else:
         result.update({
@@ -1191,6 +1208,8 @@ def saved_resume_source_record(
             "resume_data_status": None,
             "resume_data_saved_at": None,
             "resume_data_error_message": None,
+            "completion_status": "empty",
+            "completion_error_message": None,
         })
     if row.error_code:
         result["error_code"] = row.error_code
@@ -1225,11 +1244,11 @@ async def _read_saved_resume_source(
 async def revalidate_saved_resume_source(
     db: Session, adapter_id: str
 ) -> tuple[SavedResumeSource, SiteResumeSnapshot]:
-    """Re-read a saved URL and update its durable status/preview.
+    """Re-read a saved URL during explicit refresh and update its local copy.
 
     Errors are deliberately converted to ``unavailable`` while retaining the
-    source row.  The fresh snapshot is returned only for the caller's current
-    session and is never used as a replacement for the durable URL.
+    source row and last good resume snapshot. On success, the refreshed full
+    snapshot replaces the local cache while the confirmed source URL remains.
     """
     checked_at = datetime.now(timezone.utc)
     try:
@@ -1314,9 +1333,10 @@ async def list_saved_resume_sources(
 ) -> list[tuple[SavedResumeSource, str | None]]:
     """List durable sources without touching the network or token store.
 
-    Source checking belongs to session launch or an explicit refresh action.
-    A transient browser failure must therefore never turn a normal GET into a
-    disappearing source or replace its token behind the caller's back.
+    Site checking belongs to explicit refresh. Session launch reads only the
+    locally saved copy. A transient browser failure must never turn a normal
+    GET into a disappearing source or replace its token behind the caller's
+    back.
     """
     rows = list(db.scalars(select(SavedResumeSource).order_by(SavedResumeSource.adapter_id)))
     return [(row, None) for row in rows]

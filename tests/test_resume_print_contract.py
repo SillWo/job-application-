@@ -9,6 +9,7 @@ from playwright.async_api import async_playwright
 from backend.adapters.base.resume_import import (
     ResumeURLPolicy,
     _require_print_layout,
+    normalize_gender,
     open_resume_page,
     snapshot_hash,
 )
@@ -51,6 +52,20 @@ HIREHI = ResumeURLPolicy(
     "hirehi", "hirehi.ru", r"/resume/(?P<id>[A-Za-z0-9_-]{6,128})/?",
     r"[A-Za-z0-9_-]{6,128}", r"^(?:www\.)?hirehi\.ru$", requires_print=False,
 )
+
+
+@pytest.mark.parametrize(
+    "availability",
+    [FieldAvailability.NOT_PROVIDED, FieldAvailability.HIDDEN, FieldAvailability.PARSE_ERROR],
+)
+def test_gender_normalization_preserves_non_present_field_provenance(availability):
+    field = SourceField[str](
+        value="Мужчина", availability=availability, source_section="identity"
+    )
+    normalized = normalize_gender(field)
+    assert normalized.value == "Мужчина"
+    assert normalized.availability is availability
+    assert normalized.source_section == "identity"
 
 
 def test_resume_ref_has_stable_source_and_print_import_url():
