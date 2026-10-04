@@ -9,7 +9,15 @@ from test_workflow_non_captcha_continuation import runtime as recovery_runtime
 
 from backend.adapters.base.protocol import ApplicationForm, Blocker, JobRef, SubmissionResult
 from backend.orchestrator import workflow
-from backend.persistence.models import Application, BrowserEvent, Evaluation, JobSession, Vacancy
+from backend.persistence.models import (
+    Application,
+    ApplicationPlanRecord,
+    BrowserEvent,
+    Evaluation,
+    JobSession,
+    SessionResumeSnapshot,
+    Vacancy,
+)
 from backend.schemas.domain import (
     DesiredJobPolicy,
     FlagMatch,
@@ -17,6 +25,7 @@ from backend.schemas.domain import (
     PreferenceFlag,
     SessionStatus,
 )
+from backend.services.resume_session import _normalize_extracted, persist_session_snapshot
 
 runtime = recovery_runtime
 
@@ -111,7 +120,70 @@ async def test_process_crash_after_send_is_reconciled_without_second_click(runti
 
 
 @pytest.mark.asyncio
-async def test_submitting_without_verifier_is_unconfirmed_and_next_vacancy_runs(runtime, monkeypatch):
+async def test_confirmed_submit_reconciles_even_with_corrupted_legacy_private_plan(runtime, monkeypatch):
+    server = {"sent": False, "clicks": 0, "verifications": 0}
+
+    class Adapter(FakeAdapter):
+        async def can_retry_application(self, page):
+            return not server["sent"]
+
+        async def verify_submission(self, page):
+            server["verifications"] += 1
+            return SubmissionResult(
+                status="already_applied" if server["sent"] else "unknown",
+                message="server state",
+            )
+
+        async def submit_application(self, page):
+            server.update(sent=True, clicks=server["clicks"] + 1)
+            raise asyncio.CancelledError()
+
+    adapter = Adapter(refs("private-contact"))
+    configure(monkeypatch, adapter)
+    sessions, session_id = runtime
+    with sessions() as db:
+        snapshot = _normalize_extracted(
+            {
+                "external_id": "fixture",
+                "identity": {"full_name": "Test", "gender": "male"},
+                "contacts": {
+                    "phone": "+7 (999) 123-45-67",
+                    "messengers": ["https://wa.me/79991234567"],
+                },
+                "target": {"title": "Role"},
+                "about": "Fixture professional background",
+                "skills": [{"name": "Python"}],
+            },
+            adapter_id="fake",
+            source_url="https://fake/resume/fixture",
+        )
+        persist_session_snapshot(db, session_id, snapshot)
+
+    with pytest.raises(asyncio.CancelledError):
+        await workflow.WorkflowManager().run(session_id)
+
+    with sessions() as db:
+        vacancy = db.scalar(select(Vacancy))
+        plan = db.scalar(
+            select(ApplicationPlanRecord).where(ApplicationPlanRecord.vacancy_id == vacancy.id)
+        )
+        assert vacancy.state == "SUBMITTING"
+        assert plan is not None
+        plan.data["cover_letter"] = "WhatsApp: https://wa.me/{{phone}}"
+        db.commit()
+
+    configure(monkeypatch, Adapter(refs("private-contact")))
+    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=5)
+
+    with sessions() as db:
+        assert db.get(JobSession, session_id).counters["submitted"] == 1
+        assert db.scalar(select(Vacancy)).state == "SUBMITTED"
+        assert len(list(db.scalars(select(Application)))) == 1
+    assert server == {"sent": True, "clicks": 1, "verifications": 1}
+
+
+@pytest.mark.asyncio
+async def test_submitting_without_verifier_is_error_and_next_vacancy_runs(runtime, monkeypatch):
     class Adapter(FakeAdapter):
         verify_submission = None
 
@@ -142,7 +214,7 @@ async def test_submitting_without_verifier_is_unconfirmed_and_next_vacancy_runs(
         assert item.status == SessionStatus.COMPLETED
         assert item.counters["errors"] == 1
         assert item.counters["submitted"] == 1
-        assert rows["stuck"].state == "UNCONFIRMED"
+        assert rows["stuck"].state == "ERROR"
         assert rows["stuck"].data["error_code"] == "SUBMISSION_UNCONFIRMED"
         assert db.scalar(select(Application).where(Application.vacancy_id == rows["stuck"].id)).status == "unknown"
         assert rows["healthy"].state == "SUBMITTED"
@@ -153,8 +225,11 @@ async def test_submitting_without_verifier_is_unconfirmed_and_next_vacancy_runs(
 async def test_blocked_submission_distinguishes_ambiguous_from_confirmed(
     runtime, monkeypatch, confirmed
 ):
+    calls = {"submit": 0}
+
     class Adapter(FakeAdapter):
         async def submit_application(self, page):
+            calls["submit"] += 1
             return SubmissionResult(
                 status="blocked", message="site response", confirmed=confirmed
             )
@@ -169,12 +244,14 @@ async def test_blocked_submission_distinguishes_ambiguous_from_confirmed(
             assert vacancy.state == "ERROR"
             assert vacancy.data["error_code"] == "SUBMISSION_BLOCKED"
             assert item.counters["errors"] == 1
+            assert calls["submit"] == 1
         else:
-            assert vacancy.state == "UNCONFIRMED"
+            assert vacancy.state == "ERROR"
             assert vacancy.data["error_code"] == "SUBMISSION_UNCONFIRMED"
             assert item.counters.get("errors") == 1
             application = db.scalar(select(Application).where(Application.vacancy_id == vacancy.id))
             assert application.status == "unknown"
+            assert calls["submit"] == 1
 
 
 @pytest.mark.asyncio
@@ -282,6 +359,411 @@ async def test_recovery_budget_exhaustion_fails_stalled_session(runtime, monkeyp
             "kind": "recovery_exhausted",
             "attempts": workflow._SESSION_RECOVERY_RETRY_LIMIT,
         }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [workflow.ModelUnavailable, workflow.AuthenticationPending])
+async def test_external_dependency_recovery_is_unbounded_and_model_backoff_grows(runtime, error_type):
+    manager = workflow.WorkflowManager()
+    manager.retry_base_seconds = 0.001
+    manager.retry_max_seconds = 10
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        item.status = SessionStatus.RUNNING
+        item.recovery = {"attempt": workflow._SESSION_RECOVERY_RETRY_LIMIT}
+        db.commit()
+
+    for _ in range(workflow._SESSION_RECOVERY_RETRY_LIMIT + 3):
+        assert await manager._recover(runtime[1], error_type("dependency unavailable"))
+
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        retries = list(db.scalars(select(BrowserEvent).where(
+            BrowserEvent.session_id == runtime[1],
+            BrowserEvent.event_type == "recovery_retry",
+        )))
+        failures = list(db.scalars(select(BrowserEvent).where(
+            BrowserEvent.session_id == runtime[1],
+            BrowserEvent.event_type == "session_failed",
+        )))
+        assert item.status == SessionStatus.RUNNING
+        delays = [event.data["delay_seconds"] for event in retries]
+        if error_type is workflow.ModelUnavailable:
+            assert delays == [
+                min(manager.retry_max_seconds, manager.retry_base_seconds * 2 ** min(index, 10))
+                for index in range(workflow._SESSION_RECOVERY_RETRY_LIMIT, workflow._SESSION_RECOVERY_RETRY_LIMIT + len(delays))
+            ]
+        else:
+            assert all(delay == manager.retry_base_seconds for delay in delays)
+        assert not failures
+
+
+@pytest.mark.asyncio
+async def test_recovery_budget_resets_only_after_counter_progress(runtime):
+    manager = workflow.WorkflowManager()
+    manager.retry_base_seconds = 0
+    manager.retry_max_seconds = 0
+    error = workflow.RecoverableFailure("same stage remains pending")
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        item.status = SessionStatus.RUNNING
+        db.commit()
+
+    assert await manager._recover(runtime[1], error)
+    assert await manager._recover(runtime[1], error)
+    with runtime[0]() as db:
+        assert db.get(JobSession, runtime[1]).recovery["attempt"] == 2
+        db.get(JobSession, runtime[1]).counters = {"viewed": 1}
+        db.commit()
+    assert await manager._recover(runtime[1], error)
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        assert item.recovery["attempt"] == 1
+        assert item.recovery[workflow._RECOVERY_COUNTERS_KEY] == {"viewed": 1}
+
+
+@pytest.mark.asyncio
+async def test_clean_pass_clears_recovery_progress_snapshot(runtime, monkeypatch):
+    configure(monkeypatch, FakeAdapter(refs("one")))
+    with runtime[0]() as db:
+        item = db.get(JobSession, runtime[1])
+        item.recovery = {
+            "attempt": 3,
+            workflow._RECOVERY_COUNTERS_KEY: {"viewed": 0},
+        }
+        db.commit()
+    await asyncio.wait_for(workflow.WorkflowManager().run(runtime[1]), timeout=5)
+    with runtime[0]() as db:
+        recovery = db.get(JobSession, runtime[1]).recovery
+        assert recovery["attempt"] == 0
+        assert workflow._RECOVERY_COUNTERS_KEY not in recovery
+
+
+@pytest.mark.asyncio
+async def test_model_outage_retries_saved_vacancy_without_reopening_search(runtime, monkeypatch):
+    class Adapter(FakeAdapter):
+        searches = 0
+        opens = 0
+
+        async def open_search(self, page, filters):
+            self.searches += 1
+            return await super().open_search(page, filters)
+
+        async def open_job(self, page, ref):
+            self.opens += 1
+            return await super().open_job(page, ref)
+
+    adapter = Adapter(refs("recover-in-place", "healthy"))
+    configure(monkeypatch, adapter)
+    calls = 0
+
+    async def flaky_evaluation(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise workflow.ModelUnavailable("temporary outage")
+        return evaluation("apply")
+
+    monkeypatch.setattr(workflow, "evaluate", flaky_evaluation)
+    await asyncio.wait_for(workflow.WorkflowManager().run(runtime[1]), timeout=5)
+
+    with runtime[0]() as db:
+        vacancies = {
+            row.external_id: row
+            for row in db.scalars(select(Vacancy).where(Vacancy.session_id == runtime[1]))
+        }
+        retries = list(db.scalars(select(BrowserEvent).where(
+            BrowserEvent.session_id == runtime[1],
+            BrowserEvent.event_type == "model_stage_retry",
+        )))
+        submissions = list(db.scalars(select(BrowserEvent).where(
+            BrowserEvent.session_id == runtime[1],
+            BrowserEvent.event_type == "submission",
+        ).order_by(BrowserEvent.id)))
+        assert vacancies["recover-in-place"].state == "SUBMITTED"
+        assert vacancies["healthy"].state == "SUBMITTED"
+        assert vacancies["recover-in-place"].data.get("model_retry_budgets") is None
+        assert len(retries) == 1
+        assert retries[0].data["stage"] == "evaluation"
+        healthy_submit = next(
+            event for event in submissions
+            if event.data.get("vacancy_id") == vacancies["healthy"].id
+        )
+        delayed_submit = next(
+            event for event in submissions
+            if event.data.get("vacancy_id") == vacancies["recover-in-place"].id
+        )
+        assert retries[0].id < healthy_submit.id < delayed_submit.id
+    assert calls == 3
+    assert adapter.searches == 1
+
+
+@pytest.mark.asyncio
+async def test_permanent_model_error_finishes_only_its_vacancy(runtime, monkeypatch):
+    adapter = FakeAdapter(refs("permanent", "healthy"))
+    configure(monkeypatch, adapter)
+    calls = 0
+
+    async def one_permanent_error(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise workflow.ModelPermanentError("invalid model output")
+        return evaluation("apply")
+
+    monkeypatch.setattr(workflow, "evaluate", one_permanent_error)
+    await asyncio.wait_for(workflow.WorkflowManager().run(runtime[1]), timeout=5)
+
+    with runtime[0]() as db:
+        vacancies = {
+            row.external_id: row
+            for row in db.scalars(select(Vacancy).where(Vacancy.session_id == runtime[1]))
+        }
+        assert vacancies["permanent"].state == "ERROR"
+        assert vacancies["healthy"].state == "SUBMITTED"
+        assert db.get(JobSession, runtime[1]).counters["submitted"] == 1
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_hh_letter_retry_resumes_after_confirmed_cv_without_second_response(runtime, monkeypatch):
+    class HHAdapter(FakeAdapter):
+        site_id = "hh"
+
+        def __init__(self, jobs):
+            super().__init__(jobs)
+            self.cv_clicks = 0
+            self.letter_resumes = 0
+            self.progress = {
+                "cv_confirmed": False,
+                "cover_letter_pending": False,
+                "cover_letter_confirmed": False,
+            }
+
+        async def open_application(self, page):
+            self.cv_clicks += 1
+            self.progress = {
+                "cv_confirmed": True,
+                "cover_letter_pending": True,
+                "cover_letter_confirmed": False,
+            }
+            return ApplicationForm()
+
+        async def verify_cv_submission(self, page):
+            return SubmissionResult(status="submitted", message="CV confirmed")
+
+        async def resume_application(
+            self, page, plan, *, cv_confirmed, cover_letter_pending
+        ):
+            assert cv_confirmed and cover_letter_pending
+            self.letter_resumes += 1
+            return ApplicationForm()
+
+        def get_submission_progress(self):
+            return dict(self.progress)
+
+    sessions, session_id = runtime
+    adapter = HHAdapter(refs("cv-and-letter"))
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.adapter_id = "hh"
+        item.recovery = {"search_filters": {}}
+        snapshot = _normalize_extracted(
+            {
+                "external_id": "fixture",
+                "identity": {"full_name": "Test", "gender": "male"},
+                "target": {"title": "Role"},
+                "about": "Fixture professional background",
+                "skills": [{"name": "Python"}],
+            },
+            adapter_id="hh",
+            source_url="https://hh/resume/fixture",
+        )
+        persist_session_snapshot(db, session_id, snapshot)
+        db.commit()
+
+    configure(monkeypatch, adapter)
+    monkeypatch.setattr(workflow, "AdaptiveSearch", lambda raw, *_args, **_kwargs: raw)
+    application_calls = 0
+
+    async def interrupted_then_resumed(*_args, **_kwargs):
+        nonlocal application_calls
+        application_calls += 1
+        if application_calls == 1:
+            raise workflow.ModelUnavailable("letter stage temporarily unavailable")
+        adapter.progress = {
+            "cv_confirmed": True,
+            "cover_letter_pending": False,
+            "cover_letter_confirmed": True,
+        }
+        return type("Outcome", (), {
+            "submission": SubmissionResult(status="submitted", message="letter confirmed"),
+            "stopped": False,
+            "error_code": None,
+            "error_message": None,
+        })()
+
+    monkeypatch.setattr(workflow, "complete_application", interrupted_then_resumed)
+    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=5)
+
+    with sessions() as db:
+        vacancy = db.scalar(select(Vacancy).where(Vacancy.session_id == session_id))
+        saved_plan = db.scalar(select(ApplicationPlanRecord).where(
+            ApplicationPlanRecord.vacancy_id == vacancy.id
+        ))
+        assert vacancy.state == "SUBMITTED", (
+            vacancy.state, vacancy.data.get("error_code"),
+            vacancy.data.get("error_message"), vacancy.data.get("submission_progress"),
+            saved_plan.data.get(workflow._RESUME_HASH_KEY) if saved_plan else None,
+            workflow._snapshot_content_hash(db.scalar(select(SessionResumeSnapshot).where(
+                SessionResumeSnapshot.session_id == session_id
+            ))),
+            adapter.cv_clicks, adapter.letter_resumes, application_calls,
+            [
+                (event.event_type, event.data)
+                for event in db.scalars(select(BrowserEvent).where(
+                    BrowserEvent.session_id == session_id,
+                ).order_by(BrowserEvent.id))
+            ],
+        )
+        assert vacancy.data["submission_progress"] == {
+            "cv_confirmed": True,
+            "cover_letter_pending": False,
+            "cover_letter_confirmed": True,
+        }
+    assert application_calls == 2
+    assert adapter.cv_clicks == 1
+    assert adapter.letter_resumes == 1
+
+
+@pytest.mark.parametrize(
+    ("session_status", "error_code"),
+    [
+        (SessionStatus.STOPPED, "SESSION_STOPPED"),
+        (SessionStatus.FAILED, "SESSION_FAILED"),
+        (SessionStatus.COMPLETED, "VACANCY_PROCESSING_FAILED"),
+    ],
+)
+def test_terminal_cleanup_closes_processing_vacancies_idempotently(
+    runtime, session_status, error_code
+):
+    sessions, session_id = runtime
+    pending_states = [
+        "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING",
+    ]
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.status = session_status
+        item.counters = {"errors": 2}
+        db.add_all([
+            Vacancy(
+                session_id=session_id,
+                source="fake",
+                external_id=f"pending-{index}",
+                url=f"https://fake/pending-{index}",
+                title="Pending",
+                state=state,
+                data={},
+            )
+            for index, state in enumerate(pending_states)
+        ])
+        db.commit()
+        manager = workflow.WorkflowManager()
+        assert manager._terminalize_pending_vacancies(db, item) == len(pending_states)
+        db.commit()
+        assert manager._terminalize_pending_vacancies(db, item) == 0
+        db.commit()
+        rows = list(db.scalars(select(Vacancy).where(Vacancy.session_id == session_id)))
+        assert {row.state for row in rows} == {"ERROR"}
+        assert {row.data["error_code"] for row in rows} == {error_code}
+        assert item.counters["errors"] == 2 + len(pending_states)
+
+
+def test_save_refs_prioritizes_all_started_vacancies_before_new_refs(runtime):
+    sessions, session_id = runtime
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.recovery = {
+            "pending_refs": [
+                {"external_id": "new-one", "url": "https://fake/new-one"},
+                {"external_id": "new-two", "url": "https://fake/new-two"},
+            ]
+        }
+        db.add_all([
+            Vacancy(
+                session_id=session_id,
+                source="fake",
+                external_id=external_id,
+                url=f"https://fake/{external_id}",
+                title="Started",
+                state=state,
+                data={},
+            )
+            for external_id, state in [
+                ("old-evaluating", "EVALUATING"),
+                ("old-ready", "READY_TO_SUBMIT"),
+                ("old-submitting", "SUBMITTING"),
+            ]
+        ])
+        db.commit()
+
+    queued = workflow.WorkflowManager()._save_refs(
+        session_id,
+        refs("new-one", "new-two"),
+    )
+
+    assert [ref.external_id for ref in queued] == [
+        "old-submitting", "old-evaluating", "old-ready", "new-one", "new-two"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_submission_reconciliation_prioritizes_first_ref_and_retries_immediately(
+    runtime, monkeypatch
+):
+    events = []
+
+    class Adapter(FakeAdapter):
+        first_submission = True
+
+        async def can_retry_application(self, page):
+            events.append(("can_retry", self.current_ref.external_id))
+            return self.current_ref.external_id == "first" and not self.first_submission
+
+        async def verify_submission(self, page):
+            events.append(("verify", self.current_ref.external_id))
+            return SubmissionResult(status="unknown", message="нет подтверждения")
+
+        async def submit_application(self, page):
+            external_id = self.current_ref.external_id
+            events.append(("submit", external_id))
+            if external_id == "first" and self.first_submission:
+                self.first_submission = False
+                return SubmissionResult(status="unknown", message="таймаут")
+            return SubmissionResult(status="submitted", message="отправлено")
+
+    async def apply(*args, **kwargs):
+        job = next(value for value in args if hasattr(value, "external_id"))
+        events.append(("evaluate", job.external_id))
+        return evaluation("apply")
+
+    async def letter(*args, **kwargs):
+        return "Fixture cover letter"
+
+    adapter = Adapter(refs("first", "second"))
+    monkeypatch.setattr(workflow.adapter_registry, "get", lambda _: adapter)
+    monkeypatch.setattr(workflow, "evaluate", apply)
+    monkeypatch.setattr(workflow, "write_cover_letter", letter)
+    await asyncio.wait_for(workflow.WorkflowManager().run(runtime[1]), timeout=5)
+
+    submissions = [event for event in events if event[0] == "submit"]
+    assert submissions == [("submit", "first"), ("submit", "first"), ("submit", "second")]
+    first_retry = events.index(("submit", "first"), events.index(("submit", "first")) + 1)
+    second_ref = next(index for index, event in enumerate(events) if event == ("submit", "second"))
+    second_evaluation = next(index for index, event in enumerate(events) if event == ("evaluate", "second"))
+    assert any(event == ("verify", "first") for event in events[:first_retry])
+    assert first_retry < second_ref
+    assert first_retry < second_evaluation
 
 
 def test_startup_recovers_only_accepted_active_work(runtime, monkeypatch):

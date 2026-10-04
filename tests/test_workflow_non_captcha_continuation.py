@@ -18,7 +18,9 @@ from backend.adapters.base.protocol import (
     SubmissionResult,
 )
 from backend.api.router import pause_session
+from backend.intelligence.broker_gateway import BrokeredModelGateway
 from backend.intelligence.letter_writer import CoverLetterValidationError
+from backend.intelligence.model_broker import ModelRequestClient
 from backend.orchestrator import hh_application, workflow
 from backend.persistence.database import Base
 from backend.persistence.models import (
@@ -27,6 +29,7 @@ from backend.persistence.models import (
     Notification,
     Vacancy,
 )
+from backend.persistence.pipeline_models import PipelineItem
 from backend.schemas.domain import (
     ApplicationField,
     ApplicationPlan,
@@ -108,6 +111,12 @@ class FakeAdapter:
             raise RuntimeError(self.application_error)
         return ApplicationForm(questions=self.questions)
 
+    async def prepare_application(self, page, plan):
+        return ApplicationForm()
+
+    async def read_application(self, page):
+        return ApplicationForm()
+
     async def fill_application(self, page, plan):
         return FillResult(success=True)
 
@@ -148,15 +157,203 @@ def runtime(tmp_path, monkeypatch):
     return sessions, session_id
 
 
-async def run_workflow(runtime, monkeypatch, adapter, evaluate_impl=None):
+async def run_workflow(runtime, monkeypatch, adapter, evaluate_impl=None, *, timeout=20):
     sessions, session_id = runtime
     monkeypatch.setattr(workflow.adapter_registry, "get", lambda adapter_id: adapter)
     if evaluate_impl is None:
         async def evaluate_impl(*args, **kwargs):
             return evaluation()
     monkeypatch.setattr(workflow, "evaluate", evaluate_impl)
-    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=20)
+    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=timeout)
     return sessions, session_id
+
+
+def test_production_workflow_gateway_uses_durable_broker(runtime, monkeypatch):
+    _sessions, session_id = runtime
+    direct_gateway = workflow._INJECTABLE_DIRECT_GATEWAY
+    monkeypatch.setattr(workflow, "ModelGateway", direct_gateway)
+
+    def fail_if_provider_gateway_is_constructed(*args, **kwargs):
+        raise AssertionError("workflow constructed a provider-bearing ModelGateway")
+
+    monkeypatch.setattr(direct_gateway, "__init__", fail_if_provider_gateway_is_constructed)
+    gateway = workflow.WorkflowManager()._model_gateway(session_id, "fake")
+
+    assert isinstance(gateway, BrokeredModelGateway)
+    assert isinstance(gateway.client, ModelRequestClient)
+    assert gateway.session_id == session_id
+    assert gateway.site_id == "fake"
+
+
+def test_cancelled_session_terminalizes_pending_vacancy_without_error(runtime):
+    sessions, session_id = runtime
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.status = SessionStatus.CANCELLED
+        item.counters = {"errors": 2}
+        vacancy = Vacancy(
+            session_id=session_id,
+            source="fake",
+            external_id="pending",
+            url="https://fake/pending",
+            title="Pending",
+            state="EVALUATING",
+            data={},
+        )
+        db.add(vacancy)
+        db.flush()
+
+        terminalized = workflow.WorkflowManager()._terminalize_pending_vacancies(db, item)
+
+        assert terminalized == 1
+        assert vacancy.state == "CANCELLED"
+        assert vacancy.data["cancellation_code"] == "SESSION_CANCELLED"
+        assert item.counters == {"errors": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submission_after_failure", [False, True], ids=["retry-at-window-end", "retry-after-submission"])
+async def test_historical_hh_duplicates_release_queue_for_new_reference(
+    runtime, monkeypatch, submission_after_failure
+):
+    sessions, session_id = runtime
+    current_ids = ["retry", "new"] if submission_after_failure else ["new"]
+    refs = [
+        JobRef(external_id=f"historic-{index}", url=f"https://hh.ru/vacancy/historic-{index}")
+        for index in range(10)
+    ] + [JobRef(external_id=ref_id, url=f"https://hh.ru/vacancy/{ref_id}") for ref_id in current_ids]
+    adapter = FakeAdapter(refs)
+    adapter.site_id = "hh"
+    opened = []
+    original_open_job = adapter.open_job
+
+    async def tracked_open_job(page, ref):
+        opened.append(ref.external_id)
+        await original_open_job(page, ref)
+
+    adapter.open_job = tracked_open_job
+    original_extract_job = adapter.extract_job
+    extraction_attempts = 0
+
+    async def fail_extraction_once(page):
+        nonlocal extraction_attempts
+        extraction_attempts += 1
+        if extraction_attempts == 1:
+            raise RuntimeError("temporary extraction outage")
+        return await original_extract_job(page)
+
+    adapter.extract_job = fail_extraction_once
+    discovery_refills = 0
+    with sessions() as db:
+        current = db.get(JobSession, session_id)
+        current.adapter_id = "hh"
+        current.application_limit = len(current_ids)
+        snapshot = _normalize_extracted(
+            {"external_id": "fixture", "identity": {"full_name": "Test", "gender": "male"},
+             "target": {"title": "Role"}, "about": "Fixture professional background",
+             "skills": [{"name": "Python"}]},
+            adapter_id="hh", source_url="https://hh.ru/resume/fixture",
+        )
+        persist_session_snapshot(db, session_id, snapshot)
+        db.commit()
+
+    class FakeHHSearch:
+        def __init__(self, raw_adapter, *_args, **_kwargs):
+            self.adapter = raw_adapter
+            self.search_exhausted = True
+            self.last_discovery_batch = {}
+
+        def __getattr__(self, name):
+            return getattr(self.adapter, name)
+
+        async def open_search(self, page, filters):
+            return await self.adapter.open_search(page, filters)
+
+        async def collect_job_refs(self, page):
+            return await self.adapter.collect_job_refs(page)
+
+        async def collect_more_job_refs(self, page):
+            nonlocal discovery_refills
+            discovery_refills += 1
+            return []
+
+        def search_checkpoint(self):
+            return {}
+
+    monkeypatch.setattr(workflow.adapter_registry, "get", lambda _adapter_id: adapter)
+    monkeypatch.setattr(workflow, "AdaptiveSearch", FakeHHSearch)
+
+    async def no_portfolio(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(workflow, "plan_portfolio", no_portfolio)
+
+    async def apply_new_reference(*_args, **_kwargs):
+        return evaluation("apply")
+
+    monkeypatch.setattr(workflow, "evaluate", apply_new_reference)
+
+    async def short_cover_letter(*_args, **_kwargs):
+        return "Сопроводительное письмо для тестовой вакансии"
+
+    monkeypatch.setattr(workflow, "write_cover_letter", short_cover_letter)
+    recoveries = []
+    original_recover = workflow.WorkflowManager._recover
+
+    async def capture_recovery(self, current_session_id, exc):
+        recoveries.append(repr(exc))
+        return await original_recover(self, current_session_id, exc)
+
+    monkeypatch.setattr(workflow.WorkflowManager, "_recover", capture_recovery)
+    with sessions() as db:
+        historical_session = JobSession(
+            adapter_id="hh", status=SessionStatus.COMPLETED, counters={"submitted": 99}
+        )
+        db.add(historical_session)
+        db.flush()
+        db.add_all([
+            Vacancy(
+                session_id=historical_session.id,
+                source="hh",
+                external_id=f"historic-{index}",
+                url=f"https://hh.ru/vacancy/historic-{index}",
+                title=f"Historical role {index}",
+                state="REPORTED",
+                data={"preserve": index},
+            )
+            for index in range(10)
+        ])
+        db.commit()
+
+    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=5)
+
+    assert opened == (["retry", "new", "retry"] if submission_after_failure else ["new", "new"])
+    assert extraction_attempts == len(current_ids) + 1
+    assert discovery_refills == 0
+    assert any("RecoverableFailure" in error for error in recoveries)
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        assert item.status == SessionStatus.COMPLETED, (item.status, recoveries, item.recovery)
+        assert item.counters["submitted"] == len(current_ids)
+        assert item.counters["errors"] == 0
+        vacancies = list(db.scalars(select(Vacancy).where(
+            Vacancy.session_id == historical_session.id
+        )))
+        assert [vacancy.data for vacancy in vacancies] == [
+            {"preserve": index} for index in range(10)
+        ]
+        pipeline_items = list(db.scalars(select(PipelineItem).where(
+            PipelineItem.session_id == session_id,
+            PipelineItem.site_id == "hh",
+        )))
+        by_id = {row.external_id: row for row in pipeline_items}
+        assert all(by_id[f"historic-{index}"].status == "completed" for index in range(10))
+        for ref_id in current_ids:
+            assert by_id[ref_id].status == "completed"
+            assert db.scalar(select(Vacancy).where(
+                Vacancy.session_id == session_id,
+                Vacancy.external_id == ref_id,
+            )).state == "SUBMITTED"
 
 
 def test_internal_form_transition_is_recorded_as_an_error(runtime):
@@ -403,8 +600,11 @@ async def test_long_mixed_blocker_run_finishes(runtime, monkeypatch):
     refs = [JobRef(external_id=str(i), url=f"https://fake/{i}") for i in range(200)]
     kinds = ("test", "unknown_form", "mfa", "blocked", "sensitive")
     blockers = {str(i): kinds[(i // 2) % len(kinds)] for i in range(0, 200, 2)}
+    # This stress case intentionally exercises 200 durable queue transitions.
+    # SQLite's synchronous commits dominate the measured runtime (~13s across
+    # 1,276 commits), so it gets a wider wall clock budget than small fixtures.
     sessions, session_id = await run_workflow(
-        runtime, monkeypatch, FakeAdapter(refs, job_blockers=blockers)
+        runtime, monkeypatch, FakeAdapter(refs, job_blockers=blockers), timeout=40
     )
     with sessions() as db:
         assert db.get(JobSession, session_id).status == SessionStatus.COMPLETED
@@ -645,9 +845,8 @@ async def test_model_unavailable_resume_retries_same_vacancy(runtime, monkeypatc
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("adapter_kwargs", "state"), [
     ({"questions": ["Неизвестный вопрос"]}, "ERROR"),
-    # A submit transport failure is ambiguous: the click may have reached
-    # the site, so reconciliation ends in UNCONFIRMED rather than ERROR.
-    ({"submission_error": "submit failed"}, "UNCONFIRMED"),
+    # A bounded submit reconciliation failure is a terminal vacancy error.
+    ({"submission_error": "submit failed"}, "ERROR"),
 ])
 async def test_form_and_submission_failures_do_not_pause(runtime, monkeypatch, adapter_kwargs, state):
     refs = [JobRef(external_id="one", url="https://fake/one"),
@@ -667,7 +866,7 @@ async def test_form_and_submission_failures_do_not_pause(runtime, monkeypatch, a
         assert db.get(JobSession, session_id).status == SessionStatus.COMPLETED
         assert {v.state for v in db.scalars(select(Vacancy))} == {state}
         item = db.get(JobSession, session_id)
-        if state == "UNCONFIRMED":
+        if adapter_kwargs.get("submission_error"):
             assert item.counters.get("errors") == 2
 
 

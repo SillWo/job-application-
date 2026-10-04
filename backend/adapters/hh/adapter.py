@@ -428,6 +428,11 @@ class HHAdapter(ResumeImportMixin):
         # one-click response closes the form immediately and then exposes the
         # same topic link used for responses that existed before this attempt.
         self._application_attempt_clicked = False
+        self._hh_cv_submission_confirmed = False
+        self._hh_cover_letter_pending = False
+        self._hh_cover_letter_confirmed = False
+        self._hh_cover_letter_dialog_pending = False
+        self._hh_cover_letter_submit_clicked = False
         response = page.locator(locators.RESPONSE_BUTTON).first
         if not await response.count():
             return ApplicationForm()
@@ -462,7 +467,85 @@ class HHAdapter(ResumeImportMixin):
                 await button.click()
                 await page.wait_for_timeout(800)
                 return await self.read_application(page)
+        if (
+            plan.submission_allowed
+            and plan.cover_letter
+            and (
+                getattr(self, "_application_attempt_clicked", False)
+                or getattr(self, "_hh_cv_submission_confirmed", False)
+            )
+            and not getattr(self, "_hh_cover_letter_dialog_pending", False)
+        ):
+            # A one-click response can be accepted before HH renders its
+            # separate cover-letter action. Never click RESPONSE_BUTTON again:
+            # wait briefly for the success action, and only follow it when
+            # this adapter instance initiated the current response.
+            response_submit = page.locator(locators.RESPONSE_SUBMIT).first
+            if not (await response_submit.count() and await response_submit.is_visible()):
+                for attempt in range(10):
+                    self._validate_application_domain(page)
+                    attach = page.locator(locators.ATTACH_COVER_LETTER).first
+                    if await attach.count() and await attach.is_visible():
+                        await attach.click()
+                        self._hh_cv_submission_confirmed = True
+                        self._hh_cover_letter_dialog_pending = True
+                        self._hh_cover_letter_pending = True
+                        for dialog_attempt in range(10):
+                            dialog = page.locator(locators.COVER_LETTER_DIALOG).first
+                            if await dialog.count() and await dialog.is_visible():
+                                break
+                            if dialog_attempt < 9:
+                                await page.wait_for_timeout(250)
+                        break
+                    # A response link alone is not evidence that HH has
+                    # finished rendering the one-click success state.
+                    if attempt < 9:
+                        await page.wait_for_timeout(300)
+                form = await self.read_application(page)
         return form
+
+    def get_submission_progress(self) -> dict[str, bool]:
+        """Expose the two HH one-click actions separately for durable recovery."""
+        return {
+            "cv_confirmed": bool(getattr(self, "_hh_cv_submission_confirmed", False)),
+            "cover_letter_pending": bool(getattr(self, "_hh_cover_letter_pending", False)),
+            "cover_letter_confirmed": bool(getattr(self, "_hh_cover_letter_confirmed", False)),
+        }
+
+    async def verify_cv_submission(self, page) -> SubmissionResult:
+        """Reconcile the CV response from visible HH page state after restart."""
+        self._validate_application_domain(page)
+        if await page.locator(locators.ALREADY_APPLIED).count():
+            self._hh_cv_submission_confirmed = True
+            return SubmissionResult(status="submitted", message="hh.ru подтвердил отправку резюме")
+        if await page.locator(locators.SUBMISSION_CONFIRMED).count():
+            self._hh_cv_submission_confirmed = True
+            return SubmissionResult(status="submitted", message="hh.ru подтвердил отправку резюме")
+        text = (await page.locator("body").inner_text()).lower()
+        if any(marker in text for marker in locators.SUBMISSION_TEXT_MARKERS):
+            self._hh_cv_submission_confirmed = True
+            return SubmissionResult(status="submitted", message="hh.ru подтвердил отправку резюме")
+        return SubmissionResult(status="unknown", message="HH.ru не подтвердил отправку резюме")
+
+    async def resume_application(
+        self,
+        page,
+        plan: ApplicationPlan,
+        *,
+        cv_confirmed: bool,
+        cover_letter_pending: bool,
+    ) -> ApplicationForm:
+        """Resume only the separate letter action; this path never clicks RESPONSE_BUTTON."""
+        self._validate_application_domain(page)
+        if not cv_confirmed:
+            return ApplicationForm(questions=["Отправка резюме не подтверждена"])
+        result = await self.verify_cv_submission(page)
+        if result.status != "submitted":
+            return ApplicationForm(questions=["Не удалось подтвердить ранее отправленное резюме"])
+        self._hh_cover_letter_pending = bool(cover_letter_pending)
+        self._hh_cover_letter_confirmed = not cover_letter_pending
+        self._hh_cover_letter_submit_clicked = False
+        return await self.prepare_application(page, plan)
 
     async def fill_application(self, page, plan: ApplicationPlan) -> FillResult:
         self._validate_application_domain(page)
@@ -471,11 +554,20 @@ class HHAdapter(ResumeImportMixin):
         letter_input = page.locator(locators.COVER_LETTER_INPUT)
         if plan.cover_letter and not await letter_input.count():
             toggle = page.locator(locators.COVER_LETTER_TOGGLE)
-            if await toggle.count():
+            if not getattr(self, "_hh_cover_letter_dialog_pending", False) and await toggle.count():
                 await toggle.click()
                 await page.wait_for_timeout(300)
-        if plan.cover_letter and await letter_input.count():
+        if plan.cover_letter:
+            if getattr(self, "_hh_cover_letter_dialog_pending", False):
+                dialog = page.locator(locators.COVER_LETTER_DIALOG).first
+                if not (await dialog.count() and await dialog.is_visible()):
+                    return FillResult(success=False, unknown_questions=["Сопроводительное письмо"])
+                letter_input = dialog.locator(locators.COVER_LETTER_INPUT).first
+            if not (await letter_input.count() and await letter_input.is_visible() and await letter_input.is_enabled()):
+                return FillResult(success=False, unknown_questions=["Сопроводительное письмо"])
             await letter_input.fill(plan.cover_letter)
+            if await letter_input.input_value() != plan.cover_letter:
+                return FillResult(success=False, unknown_questions=["Сопроводительное письмо"])
         return await forms.fill_fields(page, plan)
 
     async def can_retry_application(self, page) -> bool:
@@ -489,6 +581,23 @@ class HHAdapter(ResumeImportMixin):
 
     async def submit_application(self, page) -> SubmissionResult:
         self._validate_application_domain(page)
+        if getattr(self, "_hh_cover_letter_dialog_pending", False):
+            dialog = page.locator(locators.COVER_LETTER_DIALOG).first
+            submit_letter = dialog.locator(locators.COVER_LETTER_SUBMIT).first
+            if await dialog.count() and await dialog.is_visible() and await submit_letter.count() and await submit_letter.is_visible():
+                # A single click is followed by letter-specific reconciliation;
+                # ALREADY_APPLIED in the page background only describes the CV.
+                if getattr(self, "_hh_cover_letter_submit_clicked", False):
+                    return await self._verify_cover_letter_submission(page)
+                await submit_letter.click()
+                self._hh_cover_letter_submit_clicked = True
+                return await self._verify_cover_letter_submission(page)
+            if await dialog.count() and await dialog.is_visible():
+                return SubmissionResult(status="needs_input", message="HH.ru ожидает заполнения сопроводительного письма")
+            if not getattr(self, "_hh_cover_letter_submit_clicked", False):
+                return SubmissionResult(status="unknown", message="Форма сопроводительного письма не подтверждена")
+            return await self._verify_cover_letter_submission(page)
+
         submit = page.locator(locators.RESPONSE_SUBMIT).first
         # HH can render the topic link while the response popup is still
         # active. The active submit control is authoritative in that state.
@@ -507,6 +616,58 @@ class HHAdapter(ResumeImportMixin):
             )
         return await self.verify_submission(page)
 
+    async def _verify_cover_letter_submission(self, page) -> SubmissionResult:
+        """Confirm only the separate letter action, never the background CV response."""
+        timeout_ms = getattr(self, "_hh_cover_letter_verify_timeout_ms", 30_000)
+        interval_ms = 500
+        max_attempts = max(1, timeout_ms // interval_ms)
+        for attempt in range(max_attempts):
+            self._validate_application_domain(page)
+            dialog = page.locator(locators.COVER_LETTER_DIALOG).first
+            if not (await dialog.count() and await dialog.is_visible()):
+                self._hh_cover_letter_dialog_pending = False
+                self._hh_cover_letter_pending = False
+                self._hh_cover_letter_confirmed = True
+                return SubmissionResult(
+                    status="submitted", message="HH.ru подтвердил отправку сопроводительного письма"
+                )
+            error = dialog.locator(locators.FORM_ERROR).first
+            if await error.count() and await error.is_visible():
+                return SubmissionResult(status="needs_input", message="HH.ru отклонил сопроводительное письмо")
+            submit = dialog.locator(locators.COVER_LETTER_SUBMIT).first
+            try:
+                busy_markers = dialog.locator(locators.COVER_LETTER_BUSY)
+                visible_busy_marker = False
+                for marker_index in range(await busy_markers.count()):
+                    if await busy_markers.nth(marker_index).is_visible(timeout=250):
+                        visible_busy_marker = True
+                        break
+                busy = (
+                    (await submit.count() and (
+                        not await submit.is_enabled(timeout=250)
+                        or await submit.get_attribute("aria-disabled", timeout=250) == "true"
+                        or await submit.get_attribute("aria-busy", timeout=250) == "true"
+                    ))
+                    or await dialog.get_attribute("aria-busy", timeout=250) == "true"
+                    or visible_busy_marker
+                )
+            except PlaywrightError:
+                # The dialog can close between the first visibility check and
+                # reading its loading state. Reconcile again at the top of the
+                # loop instead of treating that transition as a timeout.
+                continue
+            # If HH leaves an enabled form unchanged, a short bounded wait is
+            # enough to rule out the normal async close. A disabled/busy
+            # control is a pending transport, so keep reconciling up to the
+            # longer cap without ever clicking it again.
+            if attempt >= 9 and not busy:
+                break
+            if attempt + 1 < max_attempts:
+                await page.wait_for_timeout(interval_ms)
+        return SubmissionResult(
+            status="unknown", message="HH.ru не подтвердил результат отправки сопроводительного письма"
+        )
+
     async def verify_submission(self, page, just_submitted: bool = False) -> SubmissionResult:
         # HH updates the response form asynchronously. A fixed 1.2 second
         # delay was too short in session 9 and classified six response flows
@@ -517,6 +678,13 @@ class HHAdapter(ResumeImportMixin):
             notice = page.get_by_text(locators.FOREIGN_NOTICE, exact=False)
             if await notice.count() and await notice.first.is_visible():
                 return SubmissionResult(status="needs_input", message="HH.ru запросил подтверждение страны")
+            letter_dialog = page.locator(locators.COVER_LETTER_DIALOG).first
+            if await letter_dialog.count() and await letter_dialog.is_visible():
+                if getattr(self, "_hh_cover_letter_submit_clicked", False):
+                    return await self._verify_cover_letter_submission(page)
+                return SubmissionResult(
+                    status="needs_input", message="HH.ru ожидает отправки сопроводительного письма"
+                )
             submit = page.locator(locators.RESPONSE_SUBMIT).first
             active_form = bool(await submit.count() and await submit.is_visible())
             if active_form:
@@ -526,6 +694,7 @@ class HHAdapter(ResumeImportMixin):
                 return SubmissionResult(status="needs_input", message="HH.ru ожидает заполнения формы")
             if await page.locator(locators.ALREADY_APPLIED).count():
                 if just_submitted:
+                    self._hh_cv_submission_confirmed = True
                     return SubmissionResult(
                         status="submitted", message="hh.ru подтвердил отправку отклика"
                     )
@@ -534,11 +703,13 @@ class HHAdapter(ResumeImportMixin):
                     message="hh.ru показывает ранее отправленный отклик",
                 )
             if await page.locator(locators.SUBMISSION_CONFIRMED).count():
+                self._hh_cv_submission_confirmed = True
                 return SubmissionResult(
                     status="submitted", message="hh.ru подтвердил отправку отклика"
                 )
             text = (await page.locator("body").inner_text()).lower()
             if any(marker in text for marker in locators.SUBMISSION_TEXT_MARKERS):
+                self._hh_cv_submission_confirmed = True
                 return SubmissionResult(
                     status="submitted", message="hh.ru подтвердил отправку отклика"
                 )

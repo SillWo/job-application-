@@ -24,6 +24,14 @@ def set_browser(session_id: int, executor: BrowserExecutor) -> None:
     open_browsers[session_id] = executor
 
 
+async def bring_browser_to_front(session_id: int) -> None:
+    """Focus the worker-owned page for a session, without touching its URL."""
+    executor = get_browser(session_id)
+    if executor is None:
+        raise RuntimeError("Браузер сессии ещё не готов")
+    await executor.bring_to_front()
+
+
 def acquire_browser_lease(session_id: int, site_id: str) -> bool:
     """Reserve a site's persistent profile for *session_id*.
 

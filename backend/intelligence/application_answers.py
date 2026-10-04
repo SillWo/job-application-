@@ -291,11 +291,23 @@ def _salary_matches(field, values: list[str], rule: SalaryRule) -> bool:
             and _periods(field.label) <= {rule.period} and _periods(text) <= {rule.period})
 
 
+def _resume_desired_salary(resume: dict) -> str:
+    """Read legacy salary fields and the normalized snapshot's target field."""
+    value = resume.get("desired_salary")
+    if value is None:
+        target = resume.get("target")
+        value = target.get("desired_salary") if isinstance(target, dict) else None
+    # Snapshot fields use SourceField: {value, source, confidence, ...}.
+    if isinstance(value, dict):
+        value = value.get("value")
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _has_salary_orientation(source_text: str, rules: SalaryRules, resumes: list[dict]) -> bool:
     """Do we have a monetary orientation from which an estimate can be grounded?"""
     if rules.rules or _amounts(source_text):
         return True
-    return any(_amounts(str(resume.get("desired_salary") or "")) for resume in resumes)
+    return any(_amounts(_resume_desired_salary(resume)) for resume in resumes)
 
 
 def _human_reason(value: str | None, fallback: str) -> str:
@@ -378,10 +390,16 @@ async def _estimate_salary(
         source_currencies = set().union(*(_currencies(rule.quote) for rule in grounded_rules))
     if not source_currencies:
         source_currencies = set().union(*(
-            _currencies(str(resume.get("desired_salary") or "")) for resume in resumes
+            _currencies(_resume_desired_salary(resume)) for resume in resumes
         ))
     if len(source_currencies) == 1 and estimate.currency not in source_currencies:
         return ResolvedSalary(reason="Оценка требует неподтверждённого пересчёта валюты")
+    if source == "resume":
+        source_taxes = _taxes(source_text)
+        if (len(source_currencies) != 1
+                or (source_taxes and estimate.gross not in source_taxes)
+                or (not source_taxes and estimate.gross is not None)):
+            return ResolvedSalary(reason="Оценка содержит неподтверждённую валюту или налоговую базу")
     if (requested_currency and estimate.currency != requested_currency
             or requested_gross is not None and estimate.gross != requested_gross
             or requested_period and estimate.period != requested_period):
@@ -430,7 +448,7 @@ async def resolve_salary(
     preference_salary = answer_scope is not None or rules.has_salary_rules or bool(rules.rules)
     source = "preferences"
     if not preference_salary:
-        salaries = list(dict.fromkeys(str(resume.get("desired_salary") or "").strip() for resume in resumes))
+        salaries = list(dict.fromkeys(_resume_desired_salary(resume) for resume in resumes))
         salaries = [salary for salary in salaries if salary]
         source = "resume"
         if not salaries:
@@ -440,6 +458,11 @@ async def resolve_salary(
         if len(salaries) != 1:
             return ResolvedSalary(reason="В выбранных резюме зарплата отсутствует или различается")
         source_text = salaries[0]
+        source_currencies = _currencies(source_text)
+        if len(source_currencies) != 1:
+            return ResolvedSalary(reason="В резюме валюта зарплатного ожидания не указана или неоднозначна")
+        if len(_taxes(source_text)) > 1:
+            return ResolvedSalary(reason="В резюме неоднозначно указана налоговая база зарплаты")
         rules = await gateway.structured("application_salary_rules", {"text": source_text}, SalaryRules)
         assert_safe_output(rules.model_dump(mode="json"), context="salary rules")
     if answer_scope is not None:
@@ -541,7 +564,10 @@ async def prepare_answers(gateway, form: ApplicationForm, plan: ApplicationPlan,
     salary = (await resolve_salary(gateway, job, safe_resumes, safe_description, applicable_memory, salary_question)
               if salary_fields else ResolvedSalary())
     # Remove raw salary fields so lower-priority resume amounts cannot leak into a composite answer.
-    sources = {key: value for key, value in sources.items() if not key.endswith(".desired_salary")}
+    sources = {
+        key: value for key, value in sources.items()
+        if not key.endswith((".desired_salary", ".desired_salary.value"))
+    }
     if salary.rule:
         sources["salary"] = salary.display()
     if salary.source == "estimate":

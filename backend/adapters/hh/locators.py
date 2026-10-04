@@ -16,6 +16,14 @@ RESPONSE_BUTTON = "[data-qa='vacancy-response-link-top'], [data-qa='vacancy-resp
 RESPONSE_SUBMIT = "[data-qa='vacancy-response-submit-popup']"
 COVER_LETTER_TOGGLE = "[data-qa='vacancy-response-letter-toggle']"
 COVER_LETTER_INPUT = "[data-qa='vacancy-response-popup-form-letter-input']"
+ATTACH_COVER_LETTER = "[data-qa='responded-success-attach-cover-letter']"
+COVER_LETTER_DIALOG = (
+    "[role='dialog']:has([data-qa='vacancy-response-popup-form-letter-input'])"
+    ":has([data-qa='vacancy-response-letter-submit'])"
+    ":not(:has([data-qa='vacancy-response-submit-popup']))"
+)
+COVER_LETTER_SUBMIT = "[data-qa='vacancy-response-letter-submit']"
+COVER_LETTER_BUSY = "[aria-busy='true'], [data-qa*='loading'], [data-qa*='spinner'], [class*='spinner']"
 APPLICATION_QUESTION = "[data-qa^='vacancy-response-popup-form'] label"
 APPLICATION_CONTROL = "textarea, select, input, [contenteditable='true'], [role='combobox']:not(select), [role='textbox']:not(input):not(textarea)"
 # Limit controls to the actual response form; vacancy pages also have search,

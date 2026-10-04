@@ -18,6 +18,9 @@ class _DB:
         # This double represents a legacy session with no resume snapshot.
         return None
 
+    def scalars(self, statement):
+        return iter(())
+
     def commit(self):
         pass
 
@@ -85,7 +88,7 @@ async def test_workflow_run_closes_browser_only_for_terminal_status(monkeypatch,
 
 @pytest.mark.asyncio
 async def test_open_session_browser_releases_lease_when_start_fails(monkeypatch):
-    item = _session(SessionStatus.RUNNING, "hh")
+    item = _session(SessionStatus.CREATED, "hh")
     db = _DB(item)
     adapter = SimpleNamespace(site_id="hh", allowed_domains=["hh.ru"], display_name="HH")
     released = []
@@ -107,6 +110,84 @@ async def test_open_session_browser_releases_lease_when_start_fails(monkeypatch)
         await router.open_session_browser(1, db)
 
     assert released == [(1, "hh")]
+
+
+@pytest.mark.asyncio
+async def test_open_browser_routes_to_active_worker_without_creating_api_context(monkeypatch):
+    item = _session(SessionStatus.RUNNING, "hh")
+    db = _DB(item)
+    adapter = SimpleNamespace(site_id="hh", allowed_domains=["hh.ru"], display_name="HH")
+    worker = SimpleNamespace(session_id=1, process=SimpleNamespace(is_alive=lambda: True))
+    calls = []
+
+    class Supervisor:
+        def worker(self, site_id):
+            assert site_id == "hh"
+            return worker
+
+        async def open_browser(self, **kwargs):
+            calls.append(kwargs)
+            return {"ok": True, "message": "Открыто окно браузера сессии"}
+
+    monkeypatch.setattr(router, "runtime_supervisor", Supervisor())
+    monkeypatch.setattr(router.adapter_registry, "get", lambda _adapter_id: adapter)
+    monkeypatch.setattr(router, "get_browser", lambda _session_id: pytest.fail("API registry was consulted"))
+    monkeypatch.setattr(router, "BrowserExecutor", lambda *_args, **_kwargs: pytest.fail("duplicate context created"))
+
+    result = await router.open_session_browser(1, db)
+
+    assert result["ok"] is True
+    assert calls == [{"site_id": "hh", "session_id": 1}]
+
+
+@pytest.mark.asyncio
+async def test_open_browser_reports_worker_failure_instead_of_claiming_success(monkeypatch):
+    item = _session(SessionStatus.RUNNING, "hh")
+    db = _DB(item)
+    adapter = SimpleNamespace(site_id="hh", allowed_domains=["hh.ru"], display_name="HH")
+    worker = SimpleNamespace(session_id=1, process=SimpleNamespace(is_alive=lambda: True))
+
+    class Supervisor:
+        def worker(self, _site_id):
+            return worker
+
+        async def open_browser(self, **_kwargs):
+            return {"ok": False, "message": "Браузер сессии ещё не готов"}
+
+    monkeypatch.setattr(router, "runtime_supervisor", Supervisor())
+    monkeypatch.setattr(router.adapter_registry, "get", lambda _adapter_id: adapter)
+    monkeypatch.setattr(router, "BrowserExecutor", lambda *_args, **_kwargs: pytest.fail("duplicate context created"))
+
+    with pytest.raises(router.HTTPException) as error:
+        await router.open_session_browser(1, db)
+    assert error.value.status_code == 503
+    assert error.value.detail == "Браузер сессии ещё не готов"
+
+
+@pytest.mark.asyncio
+async def test_active_worker_login_status_uses_worker_ack(monkeypatch):
+    item = _session(SessionStatus.RUNNING, "hh")
+    db = _DB(item)
+    adapter = SimpleNamespace(site_id="hh", allowed_domains=["hh.ru"], display_name="HH")
+    worker = SimpleNamespace(session_id=1, process=SimpleNamespace(is_alive=lambda: True))
+    calls = []
+
+    class Supervisor:
+        def worker(self, _site_id):
+            return worker
+
+        async def check_login(self, **kwargs):
+            calls.append(kwargs)
+            return {"ok": True, "authenticated": True, "message": "Вход подтверждён", "url": "https://hh.ru/"}
+
+    monkeypatch.setattr(router, "runtime_supervisor", Supervisor())
+    monkeypatch.setattr(router.adapter_registry, "get", lambda _adapter_id: adapter)
+    monkeypatch.setattr(router, "get_browser", lambda _session_id: pytest.fail("API registry was consulted"))
+
+    result = await router.session_browser_login_status(1, db)
+
+    assert result == {"authenticated": True, "message": "Вход подтверждён", "url": "https://hh.ru/"}
+    assert calls == [{"site_id": "hh", "session_id": 1}]
 
 
 @pytest.mark.asyncio

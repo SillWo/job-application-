@@ -615,7 +615,20 @@ class ZarplataAdapter(ResumeImportMixin):
 
     async def can_retry_application(self, page) -> bool:
         """The loaded vacancy explicitly offers a new application, with no prior response."""
-        if not (await self.get_login_state(page)).authenticated:
+        # This check runs while the workflow is on the vacancy page. Do not
+        # re-check authentication here: the fallback protected-route probe in
+        # ``get_login_state`` navigates away and destroys the vacancy context.
+        try:
+            current = urlparse(str(getattr(page, "url", "")))
+            hostname = (current.hostname or "").lower().rstrip(".")
+            path = unquote(current.path or "")
+        except Exception:
+            return False
+        if (
+            current.scheme not in {"http", "https"}
+            or hostname not in self.allowed_domains
+            or not re.fullmatch(r"/vacancy/\d+/?", path)
+        ):
             return False
         if await page.locator(locators.ALREADY_APPLIED).count():
             return False

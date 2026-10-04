@@ -29,13 +29,14 @@ class LaunchDraft(BaseModel):
     applicationLimit: str = Field(default="5", max_length=32)
     desiredJobDescription: str = Field(default="", max_length=2000)
     unlimitedApplications: bool = False
+    hirehiProEnabled: bool = False
     influence: Influence = Field(default_factory=Influence)
     coverLetterAuto: bool = True
     coverLetterTemplate: str = Field(default="", max_length=12000)
     # Empty keeps the setting unset while the user is editing the form. The
     # launch API converts an entered value to an integer and applies its own
     # bounds check.
-    coverLetterMaxWords: str = Field(default="", max_length=5, pattern=r"^(?:[1-9]\d{0,3}|10000)?$")
+    coverLetterMaxWords: str = Field(default="", max_length=32)
 
 
 class DraftUpdate(BaseModel):
@@ -61,6 +62,7 @@ def read_draft(db: Session = Depends(get_db)) -> dict:
         desiredJobDescription=previous.desired_job_description,
         applicationLimit=str(previous.application_limit or 5),
         unlimitedApplications=previous.application_limit is None,
+        hirehiProEnabled=bool(previous.hirehi_pro_enabled),
         coverLetterAuto=previous.cover_letter_auto,
         coverLetterTemplate=previous.cover_letter_template,
         coverLetterMaxWords=str(previous.cover_letter_max_words or ""),

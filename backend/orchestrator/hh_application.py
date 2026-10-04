@@ -11,7 +11,7 @@ from backend.intelligence.security import (
     sanitize_untrusted_input,
 )
 from backend.orchestrator.application_guard import unresolved_application_questions
-from backend.services.resume_session import render_local_private
+from backend.services.private_text import render_local_private
 
 
 @dataclass

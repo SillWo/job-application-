@@ -1,4 +1,5 @@
 """Pure scheduling state: discounted yield per second with mandatory exploration."""
+import time
 from dataclasses import asdict, dataclass, field
 from math import log, sqrt
 
@@ -22,6 +23,7 @@ class Source:
     next_refresh: int = 0
     stale_refreshes: int = 0
     retry_after: int = 0
+    retry_at: float = 0
     failures: int = 0
 
     def score(self, total):
@@ -48,10 +50,16 @@ class Scheduler:
         available = [s for s in self.sources.values() if not s.exhausted]
         if not available:
             return None
-        ready = [s for s in available if s.retry_after <= self.turn]
+        now = time.time()
+        ready = [s for s in available if s.retry_after <= self.turn and s.retry_at <= now]
         if not ready:
-            self.turn = min(s.retry_after for s in available)
-            ready = [s for s in available if s.retry_after <= self.turn]
+            time_ready = [s for s in available if s.retry_at <= now]
+            if not time_ready:
+                return None
+            self.turn = min(s.retry_after for s in time_ready)
+            ready = [s for s in time_ready if s.retry_after <= self.turn]
+            if not ready:
+                return None
         available = ready
         # Ten-page cycle: 60% recommendation preference, 20% productive search,
         # 20% oldest-first exploration. Empty lanes donate their turns.

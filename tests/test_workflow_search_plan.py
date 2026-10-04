@@ -9,8 +9,9 @@ from sqlalchemy.orm import sessionmaker
 from backend.adapters.base.protocol import LoginState
 from backend.intelligence.hirehi_category import HireHiCategoryChoice
 from backend.orchestrator import workflow
+from backend.orchestrator.search_version import HIREHI_SEARCH_ADAPTIVE_V3
 from backend.persistence.database import Base
-from backend.persistence.models import JobSession
+from backend.persistence.models import BrowserEvent, JobSession
 from backend.schemas.domain import SessionStatus
 from backend.services.resume_session import _normalize_extracted, persist_session_snapshot
 
@@ -149,3 +150,133 @@ async def test_empty_plan_finishes_without_text_fallback(search_runtime, monkeyp
     assert adapter.filters == [{"queries": []}]
     with sessions() as db:
         assert db.get(JobSession, session_id).status == SessionStatus.COMPLETED
+
+
+async def _run_adaptive_restore_case(search_runtime, monkeypatch, *, corrupt: bool):
+    sessions, session_id = search_runtime
+    order = []
+    planner_calls = []
+    collected = []
+
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.adapter_id = "hirehi"
+        item.recovery = {
+            "search_version": HIREHI_SEARCH_ADAPTIVE_V3,
+            "search_checkpoint": {"corrupt": corrupt},
+        }
+        persist_session_snapshot(
+            db,
+            session_id,
+            _normalize_extracted(
+                {"external_id": "fixture", "identity": {"full_name": "Test", "gender": "male"},
+                 "target": {"title": "Python developer"}, "about": "Fixture professional background",
+                 "skills": [{"name": "Python"}]},
+                adapter_id="hirehi", source_url="https://hirehi.ru/resume/fixture",
+            ),
+        )
+        db.commit()
+
+    class AdaptiveAdapter(_Adapter):
+        collect_more_job_refs = None
+
+        async def open_source(self, page, spec, cursor=0):
+            return None
+
+        async def collect_card_refs(self, page):
+            return []
+
+        async def collect_job_refs(self, page):
+            collected.append("initial")
+            return []
+
+    raw_adapter = AdaptiveAdapter("hirehi")
+
+    class FakeAdaptiveEngine:
+        def __init__(self, adapter, *_args, **_kwargs):
+            self.adapter = adapter
+            self.portfolio = {}
+            self.scheduler = SimpleNamespace(sources={})
+            self.rejection_reasons = {}
+
+        def __getattr__(self, name):
+            return getattr(self.adapter, name)
+
+        async def restore_search_checkpoint(self, checkpoint):
+            order.append("restore")
+            if checkpoint.get("corrupt"):
+                raise ValueError("fixture checkpoint is corrupt")
+            self.portfolio = {"saved": {"source_id": "saved"}}
+
+        async def open_search(self, page, filters):
+            order.append("open")
+            if not self.portfolio:
+                planner_calls.append("fresh")
+                self.portfolio = {"fresh": {"source_id": "fresh"}}
+
+        def search_checkpoint(self):
+            return {
+                "criteria_hash": "fresh" if planner_calls else "saved",
+                "portfolio": list(self.portfolio),
+            }
+
+        def metrics(self):
+            return {"D": 0, "N": 0, "R": 0}
+
+        def audit_metrics(self):
+            return {"eligible": 0, "selected": 0, "audited_relevant": 0, "fnr": 0.0}
+
+    monkeypatch.setattr(workflow.adapter_registry, "get", lambda _: raw_adapter)
+    monkeypatch.setattr(workflow, "HireHiAdaptiveSearch", FakeAdaptiveEngine)
+    monkeypatch.setattr(workflow, "ModelGateway", lambda: object())
+    metric_identities = []
+    monkeypatch.setattr(
+        workflow.search_metrics,
+        "initialize",
+        lambda _db, _item, _profile, _resumes, **kwargs: metric_identities.append(kwargs),
+    )
+
+    await workflow.WorkflowManager()._run(session_id)
+    return sessions, session_id, order, planner_calls, collected, metric_identities
+
+
+@pytest.mark.asyncio
+async def test_hirehi_adaptive_restores_before_open_without_replanning(search_runtime, monkeypatch):
+    sessions, session_id, order, planner_calls, collected, metric_identities = (
+        await _run_adaptive_restore_case(search_runtime, monkeypatch, corrupt=False)
+    )
+
+    assert order == ["restore", "open"]
+    assert planner_calls == []
+    assert collected == []
+    assert metric_identities[-1]["criteria_hash"] == "saved"
+    with sessions() as db:
+        checkpoint = db.get(JobSession, session_id).recovery["search_checkpoint"]
+        assert checkpoint["portfolio"] == ["saved"]
+        assert not db.scalar(
+            select(BrowserEvent).where(
+                BrowserEvent.session_id == session_id,
+                BrowserEvent.event_type == "checkpoint_discarded",
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_hirehi_adaptive_corrupt_checkpoint_falls_back_to_one_fresh_plan(search_runtime, monkeypatch):
+    sessions, session_id, order, planner_calls, collected, metric_identities = (
+        await _run_adaptive_restore_case(search_runtime, monkeypatch, corrupt=True)
+    )
+
+    assert order == ["restore", "open"]
+    assert planner_calls == ["fresh"]
+    assert collected == ["initial"]
+    assert metric_identities[-1]["criteria_hash"] == "fresh"
+    with sessions() as db:
+        event = db.scalar(
+            select(BrowserEvent).where(
+                BrowserEvent.session_id == session_id,
+                BrowserEvent.event_type == "checkpoint_discarded",
+            )
+        )
+        assert event is not None
+        assert event.data["kind"] == "invalid_adaptive_checkpoint"

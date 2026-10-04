@@ -27,9 +27,8 @@ def test_history_cleanup_preserves_good_history(tmp_path):
     )
     hh, hirehi = [row[0] for row in db.execute("select id from sessions order by id")]
     db.executemany(
-        "insert into vacancies (session_id, source, site, external_id, url, title, state, "
-        "status_changed_at, data, updated_at) values (?, ?, '', ?, ?, ?, ?, "
-        "'2026-09-01 00:00:00', '{}', '2026-01-01')",
+        "insert into vacancies (session_id, source, external_id, url, title, state, "
+        "data, updated_at) values (?, ?, ?, ?, ?, ?, '{}', '2026-01-01')",
         [
             (hh, "hh", "good", "https://example.test/good", "Good", "SUBMITTED"),
             (hh, "hh", "bad", "https://example.test/bad", "Bad", "ERROR"),

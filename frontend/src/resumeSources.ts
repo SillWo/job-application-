@@ -41,6 +41,8 @@ export type ResumePreview = {
   source_edit_url?: string | null;
   /** Full public URL returned by the server for a saved source. */
   source_url?: string | null;
+  /** Safe import URL. HH/Zarplata may include only ?print=true. */
+  import_url?: string | null;
   masked_url?: string | null;
 };
 
@@ -62,6 +64,10 @@ export type ResumePreviewResponse = {
 
 export type ResumeSourceRecord = {
   adapterId: string;
+  usesSavedData: boolean;
+  resumeDataStatus: "ready" | "missing" | "corrupt" | null;
+  resumeDataSavedAt: string | null;
+  resumeDataErrorMessage: string | null;
   grammaticalGender?: "male" | "female" | null;
   previewToken?: string;
   preview: ResumePreview;
@@ -72,6 +78,8 @@ export type ResumeSourceRecord = {
   maskedUrl?: string;
   /** Full public, allowlisted URL returned by the server. */
   sourceUrl?: string;
+  /** Safe import URL returned by the server for the printable HTML. */
+  importUrl?: string;
   importedAt?: string;
 };
 
@@ -142,8 +150,42 @@ export function publicResumeSourceUrl(value: unknown, adapterId?: string): strin
         ? host === "hirehi.ru" || host === "www.hirehi.ru"
         : adapterId === "zarplata"
           ? host === "zarplata.ru" || host.endsWith(".zarplata.ru")
-          : true;
+      : false;
     return allowed && /^\/resume\/[^/]+\/?$/u.test(parsed.pathname) ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Validate the URL used to import/display a saved resume. This is separate
+ * from the canonical profile URL: HH and Zarplata expose printable HTML only
+ * with the exact `?print=true` query, while HireHi keeps its ordinary URL.
+ */
+export function safeResumeImportUrl(value: unknown, adapterId?: string, sourceUrl?: string): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const candidate = value.trim();
+  if (!candidate || !adapterId) return undefined;
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port || parsed.hash) return undefined;
+    const host = parsed.hostname.toLowerCase();
+    const allowed = adapterId === "hh"
+      ? host === "hh.ru" || host.endsWith(".hh.ru")
+      : adapterId === "hirehi"
+        ? host === "hirehi.ru" || host === "www.hirehi.ru"
+        : adapterId === "zarplata"
+          ? host === "zarplata.ru" || host.endsWith(".zarplata.ru")
+          : false;
+    if (!allowed || !/^\/resume\/[^/]+\/?$/u.test(parsed.pathname)) return undefined;
+    if (sourceUrl) {
+      const source = publicResumeSourceUrl(sourceUrl, adapterId);
+      if (!source) return undefined;
+      const sourceParsed = new URL(source);
+      if (sourceParsed.hostname.toLowerCase() !== host || sourceParsed.pathname.replace(/\/$/u, "") !== parsed.pathname.replace(/\/$/u, "")) return undefined;
+    }
+    if (adapterId === "hirehi") return parsed.search ? undefined : candidate;
+    return parsed.search === "?print=true" ? candidate : undefined;
   } catch {
     return undefined;
   }
@@ -163,6 +205,7 @@ export function sourceRecordFromResponse(value: unknown): ResumeSourceRecord | n
     if (nested) {
       if (!nested.previewToken && typeof value.preview_token === "string") nested.previewToken = value.preview_token;
       nested.sourceUrl = publicResumeSourceUrl(value.source_url, nested.adapterId) ?? nested.sourceUrl;
+      nested.importUrl = safeResumeImportUrl(value.import_url, nested.adapterId, nested.sourceUrl) ?? nested.importUrl;
     }
     return nested;
   }
@@ -172,12 +215,24 @@ export function sourceRecordFromResponse(value: unknown): ResumeSourceRecord | n
   const preview = previewValue ? sanitizePreviewValue(previewValue as ResumePreview) : {};
   const sourceUrl = publicResumeSourceUrl(value.source_url, value.adapter_id)
     ?? publicResumeSourceUrl(previewValue?.source_url, value.adapter_id);
+  const importUrl = safeResumeImportUrl(value.import_url, value.adapter_id, sourceUrl)
+    ?? safeResumeImportUrl(previewValue?.import_url, value.adapter_id, sourceUrl);
   const previewToken = typeof value.preview_token === "string" && value.preview_token ? value.preview_token : undefined;
   const grammaticalGender = value.grammatical_gender === "male" || value.grammatical_gender === "female"
     ? value.grammatical_gender
     : null;
   return {
     adapterId: value.adapter_id,
+    usesSavedData: value.uses_saved_data === true,
+    // Old HH/Zarplata records predate durable resume copies. Treat them as
+    // missing so they fail closed until the user explicitly refreshes them.
+    resumeDataStatus: value.adapter_id === "hh" || value.adapter_id === "zarplata"
+      ? value.resume_data_status === "ready" || value.resume_data_status === "corrupt" || value.resume_data_status === "missing"
+        ? value.resume_data_status
+        : "missing"
+      : null,
+    resumeDataSavedAt: typeof value.resume_data_saved_at === "string" ? value.resume_data_saved_at : null,
+    resumeDataErrorMessage: typeof value.resume_data_error_message === "string" ? value.resume_data_error_message : null,
     grammaticalGender,
     status,
     // The record's presence means it was durably confirmed. Usability is
@@ -191,6 +246,7 @@ export function sourceRecordFromResponse(value: unknown): ResumeSourceRecord | n
     // either an already masked value or a legacy URL-shaped value here.
     maskedUrl: typeof value.masked_url === "string" ? safeResumeUrlLabel(value.masked_url) : undefined,
     sourceUrl,
+    importUrl,
   };
 }
 
@@ -199,6 +255,7 @@ function sanitizePreviewValue(preview: ResumePreview): ResumePreview {
     source_resume_id: _sourceResumeId,
     source_edit_url: _sourceEditUrl,
     source_url: _sourceUrl,
+    import_url: _importUrl,
     resume_url: _resumeUrl,
     url: _url,
     ...safePreview
@@ -206,6 +263,7 @@ function sanitizePreviewValue(preview: ResumePreview): ResumePreview {
   void _sourceResumeId;
   void _sourceEditUrl;
   void _sourceUrl;
+  void _importUrl;
   void _resumeUrl;
   void _url;
   if (typeof safePreview.masked_url === "string") safePreview.masked_url = safeResumeUrlLabel(safePreview.masked_url);
@@ -223,7 +281,8 @@ export function resumeSourcesFromResponse(value: unknown): Record<string, Resume
 export function previewSections(preview: ResumePreview): Array<{ label: string; status: string }> {
   const result: Array<{ label: string; status: string }> = [];
   const add = (label: string, status: string) => {
-    if (!result.some((item) => item.label === label && item.status === status)) result.push({ label, status });
+    const readableLabel = resumeSectionLabel(label);
+    if (!result.some((item) => item.label === readableLabel && item.status === status)) result.push({ label: readableLabel, status });
   };
   preview.sections?.forEach((item) => typeof item === "string"
     ? add(item, "present")
@@ -235,6 +294,63 @@ export function previewSections(preview: ResumePreview): Array<{ label: string; 
   (coverage?.unsupported ?? []).forEach((label) => add(label, "unsupported"));
   (coverage?.parse_errors ?? []).forEach((label) => add(label, "parse_error"));
   return result;
+}
+
+const RESUME_SECTION_LABELS: Record<string, string> = {
+  about: "О себе",
+  personal: "Личные данные",
+  personal_info: "Личные данные",
+  experience: "Опыт работы",
+  work_experience: "Опыт работы",
+  education: "Образование",
+  skills: "Навыки",
+  key_skills: "Ключевые навыки",
+  contacts: "Контакты",
+  contact: "Контакты",
+  languages: "Языки",
+  certificates: "Сертификаты",
+  portfolio: "Портфолио",
+  recommendations: "Рекомендации",
+  achievements: "Достижения",
+  additional_info: "Дополнительная информация",
+  citizenship: "Гражданство",
+  relocation: "Готовность к переезду",
+  schedule: "График работы",
+  salary: "Зарплатные ожидания",
+  desired_position: "Желаемая должность",
+};
+
+/** Turn known normalized source keys into labels suitable for the profile UI. */
+export function resumeSectionLabel(value: string): string {
+  const key = value.trim().toLocaleLowerCase().replace(/[\s-]+/gu, "_");
+  const known = RESUME_SECTION_LABELS[key];
+  if (known) return known;
+  // Preserve already readable source-provided labels, while keeping opaque
+  // machine keys out of the interface.
+  if (/[А-Яа-яЁё]/u.test(value) || /\s/u.test(value)) return value;
+  return "Другие сведения";
+}
+
+const RESUME_CONTACT_LABELS: Record<string, string> = {
+  email: "Электронная почта",
+  phone: "Телефон",
+  cellphone: "Телефон",
+  mobile: "Телефон",
+  telegram: "Telegram",
+  whatsapp: "WhatsApp",
+  skype: "Skype",
+  website: "Сайт",
+  site: "Сайт",
+  linkedin: "LinkedIn",
+  github: "GitHub",
+};
+
+export function resumeContactLabel(value: string): string {
+  const key = value.trim().toLocaleLowerCase().replace(/[\s-]+/gu, "_");
+  const known = RESUME_CONTACT_LABELS[key];
+  if (known) return known;
+  if (/[А-Яа-яЁё]/u.test(value) || /\s/u.test(value)) return value;
+  return "Другой контакт";
 }
 
 /** Return the user-facing questions requested by the resume preview. */

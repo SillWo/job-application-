@@ -10,10 +10,12 @@ from fastapi.staticfiles import StaticFiles
 from backend.api.router import router as api_router
 from backend.api.router import session_socket
 from backend.api.session_draft import router as session_draft_router
+from backend.api.vacancies import router as vacancies_router
 from backend.browser.sessions import close_browser, open_browsers
 from backend.config import settings
-from backend.orchestrator.workflow import recover_orphaned_sessions, workflow_manager
+from backend.intelligence.model_broker import ModelRequestBroker
 from backend.persistence.database import init_database
+from backend.runtime import runtime_supervisor
 
 
 @asynccontextmanager
@@ -29,19 +31,28 @@ async def lifespan(app: FastAPI):
         prune_expired_preview_tokens(db)
         prune_expired_session_snapshots(db)
         db.commit()
-    recover_orphaned_sessions()
+    runtime_stop = asyncio.Event()
+    runtime_monitor = asyncio.create_task(runtime_supervisor.monitor(runtime_stop))
+    # The API process is the single provider owner. Spawned workflow workers
+    # only enqueue/poll durable rows through ModelRequestClient.
+    model_broker = ModelRequestBroker()
+    model_broker_task = asyncio.create_task(model_broker.run_forever())
+    app.state.model_request_broker = model_broker
+    runtime_supervisor.recover()
     try:
         yield
     finally:
-        tasks = list(workflow_manager.tasks.values())
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        runtime_stop.set()
+        await runtime_monitor
+        runtime_supervisor.close()
+        await model_broker.stop(drain=True)
+        await model_broker_task
         await asyncio.gather(*(close_browser(key) for key in list(open_browsers)), return_exceptions=True)
 
 
 app = FastAPI(title="Job Application Orchestrator", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
+app.include_router(vacancies_router)
 app.include_router(api_router)
 app.include_router(session_draft_router)
 

@@ -15,16 +15,41 @@ def test_legacy_vacancies_receive_exact_status_time_and_blank_site(tmp_path):
     config = _config(path)
     command.upgrade(config, "0020")
     connection = sqlite3.connect(path)
-    # Migration 0001 creates current metadata on a fresh database, so remove
-    # the two model-leaked columns to reproduce a genuine pre-0021 database.
-    indexes = {row[1] for row in connection.execute("pragma index_list(vacancies)")}
-    if "ix_vacancies_status_changed_at" in indexes:
-        connection.execute("drop index ix_vacancies_status_changed_at")
     columns = {row[1] for row in connection.execute("pragma table_info(vacancies)")}
-    if "status_changed_at" in columns:
-        connection.execute("alter table vacancies drop column status_changed_at")
-    if "site" in columns:
-        connection.execute("alter table vacancies drop column site")
+    assert "status_changed_at" not in columns
+    assert "site" not in columns
+    assert not {
+        "search_text",
+        "title_sort",
+        "site_sort",
+        "error_code",
+        "error_message",
+    } & columns
+    indexes = {row[1] for row in connection.execute("pragma index_list(vacancies)")}
+    assert not {name for name in indexes if name.startswith("ix_vacancies_projection_")}
+    evaluation_columns = {
+        row[1] for row in connection.execute("pragma table_info(evaluations)")
+    }
+    assert not {
+        "total_score",
+        "tasks",
+        "skills",
+        "experience_depth",
+        "role_match",
+        "industry",
+        "special_requirements",
+        "decision",
+        "confidence",
+        "category",
+    } & evaluation_columns
+    evaluation_indexes = {
+        row[1] for row in connection.execute("pragma index_list(evaluations)")
+    }
+    assert not {
+        name
+        for name in evaluation_indexes
+        if name.startswith("ix_evaluations_projection_")
+    }
     connection.execute(
         "insert into vacancies "
         "(session_id, source, external_id, url, title, state, data, updated_at) "
@@ -44,6 +69,7 @@ def test_legacy_vacancies_receive_exact_status_time_and_blank_site(tmp_path):
     assert columns["site"][3] == 1
     indexes = {row[1] for row in connection.execute("pragma index_list(vacancies)")}
     assert "ix_vacancies_status_changed_at" in indexes
+    assert not {name for name in indexes if name.startswith("ix_vacancies_projection_")}
     connection.close()
 
     command.downgrade(config, "0020")

@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from backend.api import router as sessions_router
 from backend.api.session_draft import router
 from backend.persistence.database import Base, get_db
 from backend.persistence.models import JobSession
@@ -21,6 +22,7 @@ def client():
 
     app = FastAPI()
     app.include_router(router)
+    app.include_router(sessions_router.router)
     app.dependency_overrides[get_db] = database
     with TestClient(app) as client:
         yield client, engine
@@ -34,6 +36,7 @@ def test_round_trip_without_browser_and_stale_tab_protection(client):
     saved = browser.put('/api/session-draft', json=payload)
     assert saved.status_code == 200
     assert saved.json()['revision'] == 1
+    assert saved.json()['draft']['hirehiProEnabled'] is False
     assert browser.get('/api/session-draft').json() == saved.json()
     assert browser.put('/api/session-draft', json=payload).status_code == 409
     saved = browser.put('/api/session-draft', json={"revision": 1, "draft": {"desiredJobDescription": "Новое"}})
@@ -59,6 +62,18 @@ def test_cover_letter_settings_round_trip(client):
     assert saved.json()["draft"]["coverLetterMaxWords"] == "240"
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_hirehi_pro_enabled_round_trip(client, enabled):
+    browser, _ = client
+    saved = browser.put('/api/session-draft', json={
+        "revision": 0,
+        "draft": {"hirehiProEnabled": enabled},
+    })
+    assert saved.status_code == 200
+    assert saved.json()["draft"]["hirehiProEnabled"] is enabled
+    assert browser.get('/api/session-draft').json()["draft"]["hirehiProEnabled"] is enabled
+
+
 def test_recovers_latest_description_but_respects_saved_empty_text(client):
     browser, engine = client
     with Session(engine) as db:
@@ -67,11 +82,13 @@ def test_recovers_latest_description_but_respects_saved_empty_text(client):
             JobSession(adapter_id='hirehi', desired_job_description='Последнее', application_limit=None),
             JobSession(adapter_id='hh', desired_job_description=''),
         ])
+        db.query(JobSession).filter(JobSession.adapter_id == 'hirehi').one().hirehi_pro_enabled = True
         db.commit()
     restored = browser.get('/api/session-draft').json()
     assert restored['draft']['desiredJobDescription'] == 'Последнее'
     assert restored['draft']['adapter'] == 'hirehi'
     assert restored['draft']['unlimitedApplications'] is True
+    assert restored['draft']['hirehiProEnabled'] is True
     assert browser.put('/api/session-draft', json={"revision": 0, "draft": {"desiredJobDescription": ""}}).status_code == 200
     assert browser.get('/api/session-draft').json()['draft']['desiredJobDescription'] == ''
 
@@ -79,8 +96,26 @@ def test_recovers_latest_description_but_respects_saved_empty_text(client):
 @pytest.mark.parametrize('draft', [
     {"desiredJobDescription": "x" * 2001}, {"adapter": "unknown"},
     {"cookies": "not form data"}, {"influence": {"tasks": "invalid"}},
-    {"coverLetterMaxWords": "0"}, {"coverLetterMaxWords": "100000"},
+    {"coverLetterMaxWords": "x" * 33},
 ])
 def test_rejects_invalid_or_unrelated_data(client, draft):
     browser, _ = client
     assert browser.put('/api/session-draft', json={"revision": 0, "draft": draft}).status_code == 422
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1e", "100001"])
+def test_cover_letter_limit_keeps_unfinished_draft_text_but_cannot_launch(client, value):
+    browser, _ = client
+    saved = browser.put(
+        "/api/session-draft",
+        json={"revision": 0, "draft": {"coverLetterMaxWords": value}},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["draft"]["coverLetterMaxWords"] == value
+    assert browser.get("/api/session-draft").json()["draft"]["coverLetterMaxWords"] == value
+
+    launch = browser.post(
+        "/api/sessions",
+        json={"adapter_id": "hh", "cover_letter_max_words": value},
+    )
+    assert launch.status_code == 422

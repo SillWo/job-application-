@@ -5,7 +5,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from backend.config import settings
-from backend.persistence import models  # noqa: F401
+from backend.persistence import model_request_models, models  # noqa: F401
 from backend.persistence.database import Base
 
 config = context.config

@@ -59,8 +59,9 @@ def write_session_pdf(session_id: int, rows: list[dict]) -> str:
         parent=styles["BodyText"],
         fontName=font,
         fontSize=9.5,
-        leading=13,
-        spaceAfter=5,
+        leading=12,
+        spaceAfter=4,
+        allowWidows=0,
         splitLongWords=True,
     )
     label = ParagraphStyle("HireHiLabel", parent=body, fontName=bold_font, spaceAfter=2)
@@ -88,7 +89,7 @@ def write_session_pdf(session_id: int, rows: list[dict]) -> str:
             ("Краткое описание", "short_description"),
             ("Рекомендуемое сопроводительное письмо", "cover_letter"),
         )
-        for field_label, key in fields:
+        for field_index, (field_label, key) in enumerate(fields):
             value = row.get(key)
             if key == "route_kind":
                 value = ROUTE_LABELS.get(str(value), value)
@@ -106,7 +107,12 @@ def write_session_pdf(session_id: int, rows: list[dict]) -> str:
                 )
             story.append(Paragraph(_safe(field_label), label))
             story.append(Paragraph(_safe(value or "Не указано"), body))
-            story.append(Spacer(1, 2))
+            # A trailing spacer can overflow an otherwise full page and make
+            # ReportLab create a footer-only page.  The paragraph itself is
+            # intentionally left splittable so long cover letters continue
+            # naturally on the next page.
+            if field_index < len(fields) - 1:
+                story.append(Spacer(1, 2))
 
     def footer(canvas, document):
         canvas.saveState()
@@ -124,7 +130,7 @@ def write_session_pdf(session_id: int, rows: list[dict]) -> str:
         leftMargin=20 * mm,
         rightMargin=20 * mm,
         topMargin=18 * mm,
-        bottomMargin=18 * mm,
+        bottomMargin=20 * mm,
         title=f"Отчёт HireHi - сессия {session_id}",
         author="Job Application Orchestrator",
     ).build(story, onFirstPage=footer, onLaterPages=footer)

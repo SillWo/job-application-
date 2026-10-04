@@ -7,7 +7,9 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -54,6 +56,8 @@ class JobSession(Base):
     stop_reason: Mapped[str | None] = mapped_column(String(255))
     recovery: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
     guaranteed_application: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # HireHi-only paid discovery tools. Keep the launch choice auditable.
+    hirehi_pro_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
 
 
 class SessionResumeSnapshot(Base):
@@ -117,8 +121,9 @@ class SavedResumeSource(Base):
     """Durable, privacy-safe pointer to one confirmed site resume per adapter.
 
     The canonical public URL is intentionally stored openly: it is a public
-    resume link, not a credential.  No resume id, identity, contacts, or private snapshot is stored here; the hashes are
-    only used to detect replacement of the external document during a refresh.
+    resume link, not a credential. The full normalized snapshot for local
+    resume sites is stored only in the protected payload; hashes detect source
+    replacement and bind that payload to this row.
     """
 
     __tablename__ = "saved_resume_sources"
@@ -135,6 +140,10 @@ class SavedResumeSource(Base):
     # not needed to render or recover a saved source.
     resume_id_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Full normalized snapshot protected by DPAPI (or the explicit test envelope).
+    # Kept separate from the redacted preview and never exposed by API records.
+    resume_snapshot_payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resume_data_saved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     preview: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="valid")
     checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -253,14 +262,6 @@ def _notify_new_vacancy_states(session: Session, _flush_context) -> None:
 
 class Vacancy(Base):
     __tablename__ = "vacancies"
-    __table_args__ = (
-        UniqueConstraint(
-            "session_id",
-            "source",
-            "external_id",
-            name="uq_vacancies_session_source_external_id",
-        ),
-    )
     id: Mapped[int] = mapped_column(primary_key=True)
     # Historical HH vacancies may outlive their deleted session.
     session_id: Mapped[int | None] = mapped_column(ForeignKey("sessions.id"), nullable=True)
@@ -276,13 +277,61 @@ class Vacancy(Base):
     state: Mapped[str] = mapped_column(String(40), default="EXTRACTED")
     status_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
+    search_text: Mapped[str] = mapped_column(Text, default="", server_default="")
+    title_sort: Mapped[str] = mapped_column(Text, default="", server_default="")
+    site_sort: Mapped[str] = mapped_column(Text, default="", server_default="")
+    error_code: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "source",
+            "external_id",
+            name="uq_vacancies_session_source_external_id",
+        ),
+        Index("ix_vacancies_projection_search", "search_text"),
+        # SQLite can scan a mixed-direction index without a temp sort for the
+        # API's stable ``value DESC, id ASC`` order.  A plain ASC composite
+        # index cannot satisfy that order because reversing the scan also
+        # reverses the id tie-breaker.
+        Index("ix_vacancies_projection_title", title_sort.desc(), id.asc()),
+        Index("ix_vacancies_projection_site", site_sort.desc(), id.asc()),
+        Index("ix_vacancies_projection_state", state.desc(), id.asc()),
+        Index("ix_vacancies_projection_date", status_changed_at.desc(), id.asc()),
+        Index("ix_vacancies_projection_title_asc", title_sort.asc(), id.asc()),
+        Index("ix_vacancies_projection_site_asc", site_sort.asc(), id.asc()),
+        Index("ix_vacancies_projection_state_asc", state.asc(), id.asc()),
+        Index("ix_vacancies_projection_date_asc", status_changed_at.asc(), id.asc()),
+    )
 
 
 @event.listens_for(Vacancy, "before_insert")
 def _set_vacancy_site(mapper, connection, item: Vacancy) -> None:
     if item.site is None:
         item.site = {"hh": "HH.ru", "hirehi": "HireHi", "zarplata": "Zarplata.ru"}.get(item.source, item.source or "")
+
+
+def _sync_vacancy_projection(item: Vacancy) -> None:
+    data = item.data if isinstance(item.data, dict) else {}
+    title = item.title or ""
+    company = item.company or ""
+    site = item.site or ""
+    item.search_text = " ".join(str(value) for value in (item.external_id or "", title, company) if value).casefold()
+    item.title_sort = title.casefold()
+    item.site_sort = site.casefold()
+    item.error_code = data.get("error_code") or data.get("outcome_code")
+    item.error_message = data.get("error_message") or data.get("outcome_message")
+
+
+@event.listens_for(Vacancy, "before_insert")
+def _sync_vacancy_projection_insert(mapper, connection, item: Vacancy) -> None:
+    _sync_vacancy_projection(item)
+
+
+@event.listens_for(Vacancy, "before_update")
+def _sync_vacancy_projection_update(mapper, connection, item: Vacancy) -> None:
+    _sync_vacancy_projection(item)
 
 
 class VacancySnapshot(Base):
@@ -298,6 +347,79 @@ class Evaluation(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     vacancy_id: Mapped[int] = mapped_column(ForeignKey("vacancies.id"), unique=True)
     data: Mapped[dict] = mapped_column(JSON)
+    total_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tasks: Mapped[float | None] = mapped_column(Float, nullable=True)
+    skills: Mapped[float | None] = mapped_column(Float, nullable=True)
+    experience_depth: Mapped[float | None] = mapped_column(Float, nullable=True)
+    role_match: Mapped[float | None] = mapped_column(Float, nullable=True)
+    industry: Mapped[float | None] = mapped_column(Float, nullable=True)
+    special_requirements: Mapped[float | None] = mapped_column(Float, nullable=True)
+    decision: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    category: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    __table_args__ = (
+        Index("ix_evaluations_projection_total", total_score.desc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_tasks", tasks.desc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_skills", skills.desc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_experience_depth", experience_depth.desc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_role_match", role_match.desc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_industry", industry.desc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_special_requirements", special_requirements.desc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_total_asc", total_score.asc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_tasks_asc", tasks.asc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_skills_asc", skills.asc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_experience_depth_asc", experience_depth.asc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_role_match_asc", role_match.asc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_industry_asc", industry.asc(), vacancy_id.asc()),
+        Index("ix_evaluations_projection_special_requirements_asc", special_requirements.asc(), vacancy_id.asc()),
+    )
+
+
+def _numeric(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _sync_evaluation_projection(item: Evaluation) -> None:
+    data = item.data if isinstance(item.data, dict) else {}
+    values = {"total_score": _numeric(data.get("score"))}
+    values.update({key: None for key in ("tasks", "skills", "experience_depth", "role_match", "industry", "special_requirements")})
+    breakdown = data.get("score_breakdown")
+    if isinstance(breakdown, list):
+        rows = ((row.get("key"), row.get("points")) for row in breakdown if isinstance(row, dict))
+    elif isinstance(breakdown, dict):
+        rows = breakdown.items()
+    else:
+        rows = ()
+    aliases = {"required_years": "experience_depth", "title": "role_match", "languages": "special_requirements"}
+    canonical_values = {}
+    legacy_values = {}
+    for raw_key, raw_value in rows:
+        if not isinstance(raw_key, str):
+            continue
+        key = aliases.get(raw_key)
+        if key is not None:
+            legacy_values[key] = _numeric(raw_value)
+        elif raw_key in values and raw_key != "total_score":
+            canonical_values[raw_key] = _numeric(raw_value)
+    for key in values:
+        if key == "total_score":
+            continue
+        values[key] = canonical_values.get(key, legacy_values.get(key))
+    for key, value in values.items():
+        setattr(item, key, value)
+    item.decision = data.get("decision") if isinstance(data.get("decision"), str) else None
+    item.confidence = _numeric(data.get("confidence"))
+    item.category = data.get("category") if isinstance(data.get("category"), str) else None
+
+
+@event.listens_for(Evaluation, "before_insert")
+def _sync_evaluation_projection_insert(mapper, connection, item: Evaluation) -> None:
+    _sync_evaluation_projection(item)
+
+
+@event.listens_for(Evaluation, "before_update")
+def _sync_evaluation_projection_update(mapper, connection, item: Evaluation) -> None:
+    _sync_evaluation_projection(item)
 
 
 class ApplicationPlanRecord(Base):

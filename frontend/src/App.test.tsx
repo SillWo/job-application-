@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 import App from './App'
 import { Notifications } from './App'
+import { formatUtcTimestampLocal } from './vacancyDates'
 
 beforeEach(() => { seededAdapter = null; localStorage.clear(); sessionStorage.clear(); vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] })) })
 afterEach(() => vi.unstubAllGlobals())
@@ -14,7 +15,7 @@ function seedResumeSource(adapterId = 'hh') {
 let seededAdapter: string | null = null
 function seededResumeResponse(url: string, init?: RequestInit) {
   if (!seededAdapter) return null
-  const record = { adapter_id: seededAdapter, status: 'valid', checked_at: '2026-09-01T00:00:00.000Z', preview_token: 'test-preview-token', preview: { source_site: seededAdapter, target_title: 'Test role', questions: [] }, changed: false }
+  const record = { adapter_id: seededAdapter, status: 'valid', checked_at: '2026-09-01T00:00:00.000Z', uses_saved_data: seededAdapter === 'hh' || seededAdapter === 'zarplata', resume_data_status: seededAdapter === 'hh' || seededAdapter === 'zarplata' ? 'ready' : null, resume_data_saved_at: seededAdapter === 'hh' || seededAdapter === 'zarplata' ? '2026-09-01T00:00:00.000Z' : null, resume_data_error_message: null, preview_token: 'test-preview-token', preview: { source_site: seededAdapter, target_title: 'Test role', questions: [] }, changed: false }
   if (url.endsWith('/api/resume-sources') && !init?.method) return Promise.resolve({ ok: true, json: async () => [record] })
   if (url.endsWith(`/api/resume-sources/${seededAdapter}/refresh`) && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ ...record, preview_token: 'fresh-test-preview-token' }) })
   return null
@@ -53,16 +54,16 @@ test('persists every new-session parameter across remounts', async () => {
   expect(screen.queryByRole('spinbutton', { name: /просмотра вакансий/i })).not.toBeInTheDocument()
   expect(screen.queryByRole('checkbox', { name: /просмотр вакансий/i })).not.toBeInTheDocument()
   await chooseOption('Сайт', 'HireHi')
-  fireEvent.change(screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' }), { target: { value: '7' } })
-  fireEvent.click(screen.getByRole('checkbox', { name: /Без ограничений:/ }))
-  expect(screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' })).toBeDisabled()
+  expect(screen.queryByRole('spinbutton', { name: 'Лимит вакансий в работе' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('checkbox', { name: /Без ограничений:/ })).not.toBeInTheDocument()
+  expect(screen.getByText('Поиск работает без лимита и продолжается до ручной остановки.')).toBeInTheDocument()
   fireEvent.change(screen.getByRole('textbox', { name: 'Описание желаемой вакансии' }), { target: { value: 'Удалённо; не продажи' } })
   ;['4', '2', '1', '3', '4'].forEach((value, index) => fireEvent.change(screen.getAllByRole('slider')[index], { target: { value } }))
   first.unmount(); mount()
   expect(await screen.findByRole('combobox', { name: 'Сайт' })).toHaveTextContent('HireHi')
   fireEvent.click(screen.getByRole('button', { name: 'Влияние факторов на вакансии' }))
-  expect(screen.getByRole('spinbutton', { name: 'Лимит вакансий в работе' })).toHaveValue(7)
-  expect(screen.getByRole('checkbox', { name: /Без ограничений:/ })).toBeChecked()
+  expect(screen.queryByRole('spinbutton', { name: 'Лимит вакансий в работе' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('checkbox', { name: /Без ограничений:/ })).not.toBeInTheDocument()
   expect(screen.getByRole('textbox', { name: 'Описание желаемой вакансии' })).toHaveValue('Удалённо; не продажи')
   expect(screen.getAllByRole('slider').map((slider) => slider.getAttribute('aria-valuetext'))).toEqual(['Максимальный', 'Высокий', 'Низкий', 'Высокий', 'Максимальный'])
   const savedDraft = JSON.parse(localStorage.getItem('job-orchestrator.session-draft') || '{}')
@@ -80,7 +81,6 @@ test('configures influence sliders, accessible hints, and minimum score payload'
     if (sourceResponse) return sourceResponse
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 77, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
-    if (url.endsWith('/api/sessions/77/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
@@ -113,7 +113,9 @@ test('configures influence sliders, accessible hints, and minimum score payload'
   expect(guaranteed).not.toBeChecked();
   fireEvent.click(guaranteed);
   const launch = await screen.findByRole('button', { name: 'Создать и запустить' }); await waitFor(() => expect(launch).toBeEnabled()); fireEvent.click(launch)
-  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/77/start'))).toBe(true))
+  await waitFor(() => expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))).toBe(true))
+  expect(requests.some((request) => request.url.endsWith('/api/sessions/77/start'))).toBe(false)
+  expect(JSON.parse(requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))?.body ?? '{}')).toMatchObject({ auto_start: true })
   const payload = JSON.parse(requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))?.body ?? '{}')
   expect(payload.minimum_scores).toEqual({ tasks: 1, skills: 1, experience_depth: 3, role_match: 2, industry: 2, special_requirements: 1 })
   expect(payload.minimum_scores).not.toHaveProperty('work_conditions')
@@ -131,7 +133,6 @@ test('captures only the user job description with a 2000-character limit', async
     if (sourceResponse) return sourceResponse
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 78, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
-    if (url.endsWith('/api/sessions/78/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
@@ -145,7 +146,9 @@ test('captures only the user job description with a 2000-character limit', async
   const launch = await screen.findByRole('button', { name: 'Создать и запустить' })
   await waitFor(() => expect(launch).toBeEnabled())
   fireEvent.click(launch)
-  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/78/start'))).toBe(true))
+  await waitFor(() => expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))).toBe(true))
+  expect(requests.some((request) => request.url.endsWith('/api/sessions/78/start'))).toBe(false)
+  expect(JSON.parse(requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))?.body ?? '{}')).toMatchObject({ auto_start: true })
   const payload = JSON.parse(requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))?.body ?? '{}')
   expect(payload.desired_job_description).toBe('GameDev, удалённая работа; не продажи')
   expect(payload).not.toHaveProperty('green_flags')
@@ -175,7 +178,7 @@ test('renders vacancy site and exact status timestamp while legacy has no dangli
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).includes('/api/vacancies') ? Promise.resolve({ ok: true, json: async () => ({ items: rows, total: 2, limit: 30, offset: 0, has_more: false }) }) : Promise.resolve({ ok: true, json: async () => [] })));
   render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
   expect(await screen.findByText(/#1 · Компания · HH\.ru/)).toBeInTheDocument()
-  expect(screen.getAllByText('01.09.2026 00:00').length).toBeGreaterThan(0)
+  expect(screen.getAllByText(formatUtcTimestampLocal('2026-09-01T00:00:00Z')).length).toBeGreaterThan(0)
   expect(screen.getByText(/#2 · Старая$/)).toBeInTheDocument()
 })
 
@@ -194,7 +197,7 @@ test('status filter shows all outcome groups and preserves group values', async 
   const labels = options.map((option) => option.textContent ?? '')
   expect(new Set(labels).size).toBe(labels.length)
   expect(labels.every((label) => !/[A-Za-z]/.test(label))).toBe(true)
-  expect(labels).toEqual(['Все', 'Успех', 'В процессе', 'Отклонена', 'Не подтверждено', 'Ошибка'])
+  expect(labels).toEqual(['Все', 'Успех', 'В процессе', 'Отклонена', 'Ошибка', 'Отменена'])
   expect(within(select).getByRole('option', { name: 'Отклонена' })).toHaveValue('REJECTED')
   expect(within(select).getByRole('option', { name: 'Успех' })).toHaveValue('SUCCESS')
   fireEvent.change(select, { target: { value: 'SUCCESS' } })
@@ -298,8 +301,8 @@ test('sends server search and every vacancy filter range before pagination', asy
       search: 'global needle',
       status_group: 'REJECTED',
       site: 'HH.ru',
-      status_date_from: '2026-09-01',
-      status_date_to: '2026-09-30',
+      status_time_from: new Date(2026, 8, 1).toISOString(),
+      status_time_before: new Date(2026, 8, 31).toISOString(),
       total_score_min: '1',
       total_score_max: '80',
       tasks_min: '1',
@@ -315,8 +318,98 @@ test('sends server search and every vacancy filter range before pagination', asy
       special_requirements_min: '1',
       special_requirements_max: '7',
     })
+    expect(params.has('status_date_from')).toBe(false)
+    expect(params.has('status_date_to')).toBe(false)
+    const bounds = ['CSV', 'XLSX', 'XML'].map((name) => {
+      const href = screen.getByRole('link', { name }).getAttribute('href') ?? ''
+      const exportParams = new URL(href, 'http://local').searchParams
+      return [exportParams.get('status_time_from'), exportParams.get('status_time_before')]
+    })
+    expect(bounds).toEqual(Array(3).fill([params.get('status_time_from'), params.get('status_time_before')]))
     expect(params.has('offset')).toBe(false)
   })
+})
+
+test('blocks an invalid date range and resumes the query and exports when corrected', async () => {
+  const requests: string[] = []
+  const isVacancyListRequest = (url: string) => url === '/api/vacancies' || url.startsWith('/api/vacancies?')
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    requests.push(url)
+    return url.includes('/api/vacancies')
+      ? Promise.resolve({ ok: true, json: async () => ({ items: [], total: 0, limit: 30, offset: 0, has_more: false }) })
+      : Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  await waitFor(() => expect(requests.some(isVacancyListRequest)).toBe(true))
+  const initialRequestCount = requests.filter(isVacancyListRequest).length
+  const from = screen.getByLabelText('Дата от')
+  const to = screen.getByLabelText('Дата до')
+  fireEvent.change(from, { target: { value: '2026-09-30' } })
+  fireEvent.change(to, { target: { value: '2026-09-29' } })
+
+  expect(await screen.findByText('Дата «От» должна быть не позже даты «До».')).toBeInTheDocument()
+  expect(from).toHaveAttribute('aria-invalid', 'true')
+  expect(to).toHaveAttribute('aria-invalid', 'true')
+  expect(screen.getByText('Исправьте отмеченные фильтры: список вакансий и экспорт появятся после исправления.')).toBeInTheDocument()
+  for (const format of ['CSV', 'XLSX', 'XML']) {
+    expect(screen.getByRole('button', { name: format })).toBeDisabled()
+    expect(screen.queryByRole('link', { name: format })).not.toBeInTheDocument()
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  expect(requests.filter(isVacancyListRequest)).toHaveLength(initialRequestCount)
+  expect(requests.some((url) => url.includes('/api/vacancies/export'))).toBe(false)
+
+  fireEvent.change(to, { target: { value: '2026-09-30' } })
+  await waitFor(() => {
+    const filteredRequest = requests.filter(isVacancyListRequest).at(-1)
+    expect(filteredRequest).toBeTruthy()
+    const params = new URL(filteredRequest!, 'http://local').searchParams
+    expect(params.get('status_time_from')).toBe(new Date(2026, 8, 30).toISOString())
+    expect(params.get('status_time_before')).toBe(new Date(2026, 8, 31).toISOString())
+  })
+  expect(screen.queryByText('Дата «От» должна быть не позже даты «До».')).not.toBeInTheDocument()
+  expect(screen.getByRole('link', { name: 'CSV' })).toHaveAttribute('href', expect.stringContaining('status_time_from='))
+})
+
+test.each([
+  ['Общий балл от', '-1', '0', 'Введите число от 0 до 100.'],
+  ['Общий балл до', '101', '100', 'Введите число от 0 до 100.'],
+  ['Общий балл от', '80', '20', 'Минимум не может быть больше максимума.'],
+])('shows score validation and resumes filtering after correction (%s = %s)', async (label, invalidValue, correctedValue, message) => {
+  const requests: string[] = []
+  const isVacancyListRequest = (url: string) => url === '/api/vacancies' || url.startsWith('/api/vacancies?')
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    requests.push(url)
+    return url.includes('/api/vacancies')
+      ? Promise.resolve({ ok: true, json: async () => ({ items: [], total: 0, limit: 30, offset: 0, has_more: false }) })
+      : Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  await waitFor(() => expect(requests.some(isVacancyListRequest)).toBe(true))
+  const initialRequestCount = requests.filter(isVacancyListRequest).length
+  const field = screen.getByRole('spinbutton', { name: label })
+  if (invalidValue === '80') fireEvent.change(screen.getByRole('spinbutton', { name: 'Общий балл до' }), { target: { value: '20' } })
+  fireEvent.change(field, { target: { value: invalidValue } })
+  expect(await screen.findByText(message)).toBeInTheDocument()
+  expect(field).toHaveAttribute('aria-invalid', 'true')
+  for (const format of ['CSV', 'XLSX', 'XML']) {
+    expect(screen.getByRole('button', { name: format })).toBeDisabled()
+    expect(screen.queryByRole('link', { name: format })).not.toBeInTheDocument()
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  expect(requests.filter(isVacancyListRequest)).toHaveLength(initialRequestCount)
+
+  fireEvent.change(field, { target: { value: correctedValue } })
+  await waitFor(() => {
+    const latest = requests.filter(isVacancyListRequest).at(-1)
+    expect(latest).toBeTruthy()
+    const params = new URL(latest!, 'http://local').searchParams
+    expect(params.get('total_score_min')).toBe(label === 'Общий балл от' ? correctedValue : null)
+    expect(params.get('total_score_max')).toBe(label === 'Общий балл до' ? correctedValue : invalidValue === '80' ? '20' : null)
+  })
+  expect(screen.getByRole('link', { name: 'CSV' })).toHaveAttribute('href')
 })
 
 test('sorts vacancies by a criterion and resets loaded pagination', async () => {
@@ -352,9 +445,9 @@ test.each([
   ['http failure', null],
 ] as const)('starts a recoverable session when model is %s', async (_name, status) => {
   seedResumeSource()
-  const requests: Array<{ url: string; method?: string }> = []
+  const requests: Array<{ url: string; method?: string; body?: string }> = []
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input); requests.push({ url, method: init?.method })
+    const url = String(input); requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
     const sourceResponse = seededResumeResponse(url, init)
     if (sourceResponse) return sourceResponse
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 99, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
@@ -365,8 +458,10 @@ test.each([
   const launch = await screen.findByRole('button', { name: 'Создать и запустить' })
   await waitFor(() => expect(launch).toBeEnabled())
   fireEvent.click(launch)
-  await waitFor(() => expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/sessions/99/start'))).toBe(true))
-  expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))).toBe(true)
+  await waitFor(() => expect(requests.some((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))).toBe(true))
+  expect(requests.some((request) => request.url.endsWith('/sessions/99/start'))).toBe(false)
+  const createRequest = requests.find((request) => request.method === 'POST' && request.url.endsWith('/api/sessions'))
+  expect(JSON.parse(createRequest?.body ?? '{}')).toMatchObject({ auto_start: true })
 })
 
 test('creates and starts a session without a blocking model preflight', async () => {
@@ -378,13 +473,12 @@ test('creates and starts a session without a blocking model preflight', async ()
     if (sourceResponse) return sourceResponse
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true }) })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 99, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
-    if (url.endsWith('/api/sessions/99/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
   const launch = await screen.findByRole('button', { name: 'Создать и запустить' }); await waitFor(() => expect(launch).toBeEnabled()); fireEvent.click(launch)
-  await waitFor(() => expect(requests).toContain('POST /api/sessions/99/start'))
-  expect(requests.indexOf('POST /api/sessions')).toBeLessThan(requests.indexOf('POST /api/sessions/99/start'))
+  await waitFor(() => expect(requests).toContain('POST /api/sessions'))
+  expect(requests).not.toContain('POST /api/sessions/99/start')
 })
 
 test('configures a new cloud model key and clears it after saving', async () => {
@@ -467,23 +561,31 @@ test('renders the Russian dashboard', async () => {
   expect(screen.getAllByRole('link', { name: 'Добавить API модели' })[0]).toHaveAttribute('href', '/model')
   const statusStrip = screen.getByLabelText('Готовность к поиску')
   const statusTexts = Array.from(statusStrip.querySelectorAll('span')).map((node) => node.textContent)
-  expect(statusTexts[0]).toMatch(/API модели (добавлен|не добавлен)/)
-  expect(statusTexts[1]).toMatch(/Источники/)
-  expect(screen.getAllByText(/API модели/).length).toBeGreaterThanOrEqual(1)
+  expect(statusTexts[0]).toMatch(/каталог/i)
+  expect(statusTexts[1]).toMatch(/генерац/i)
+  expect(statusTexts[2]).toMatch(/Источники/)
   expect(screen.queryByText(/Сначала фильтры/)).not.toBeInTheDocument()
 })
 
-test('overview shows an unconfigured model as the first readiness status', async () => {
+test('overview shows catalog availability and generation health separately', async () => {
   vi.stubGlobal('fetch', vi.fn().mockImplementation((input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: false, model_available: false }) })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({
+      connected: true,
+      model_available: true,
+      model: 'catalog-model',
+      provider: 'fixture',
+      generation_health: { healthy: null, success_count: 0, failure_count: 0, running: 0, queued: 2, last_success: null, last_failure: null },
+    }) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/']}><App /></MemoryRouter></QueryClientProvider>)
   const strip = await screen.findByLabelText('Готовность к поиску')
+  await waitFor(() => expect(strip).toHaveTextContent('Модель доступна в каталоге'))
   const cells = Array.from(strip.querySelectorAll('span')).map((node) => node.textContent)
-  expect(cells[0]).toContain('API модели не добавлен')
-  expect(cells[1]).toContain('Источники')
+  expect(cells[0]).toContain('Модель доступна в каталоге')
+  expect(cells[1]).toContain('Генерация ожидает очереди')
+  expect(cells[2]).toContain('Источники')
 })
 
 test('renders only the hero workflow on overview', async () => {
@@ -532,6 +634,16 @@ test('shows notifications, marks one read, navigates, and reads all', async () =
   await waitFor(() => expect(requests).toContainEqual({ url: '/api/notifications/read-all', method: 'POST' }))
 })
 
+test('localizes legacy persisted session status notifications', async () => {
+  const statuses = ['FAILED', 'CANCELLED', 'STOPPING', 'RUNNING', 'COMPLETED']
+  const notifications = statuses.map((status, index) => ({ id: index + 1, kind: 'session', title: 'Сессия: состояние изменено', message: `Сессия ${89 + index}: статус изменён на ${status}`, source_type: 'session', source_id: String(89 + index), target_path: '/session', read_at: null, created_at: '2026-08-22T10:00:00Z' }))
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/api/notifications') ? Promise.resolve({ ok: true, json: async () => notifications }) : Promise.resolve({ ok: true, json: async () => [] })))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter><Notifications /></MemoryRouter></QueryClientProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Уведомления' }))
+  for (const label of ['ошибка.', 'отменена.', 'остановка.', 'в работе.', 'завершена.']) expect(await screen.findByText(new RegExp(`состояние изменилось — ${label}`))).toBeInTheDocument()
+  expect(screen.queryByText(/статус изменён на (FAILED|CANCELLED|STOPPING|RUNNING|COMPLETED)/)).not.toBeInTheDocument()
+})
+
 test('shows a vacancy notification, marks it read, and navigates to vacancies', async () => {
   const requests: Array<{ url: string; method: string }> = []
   const notification = {
@@ -558,10 +670,24 @@ test('shows a vacancy notification, marks it read, and navigates to vacancies', 
   const bell = await screen.findByRole('button', { name: 'Уведомления' })
   fireEvent.click(bell)
   expect(await screen.findByText(notification.title)).toBeInTheDocument()
-  expect(screen.getByText(notification.message)).toBeInTheDocument()
+  expect(screen.getByText('Вакансия «Backend-разработчик» — Example: статус ошибка')).toBeInTheDocument()
   fireEvent.click(screen.getByRole('button', { name: new RegExp(notification.title) }))
   await waitFor(() => expect(requests).toContainEqual({ url: '/api/notifications/21/read', method: 'PATCH' }))
   await waitFor(() => expect(screen.getByRole('link', { name: 'Вакансии' })).toHaveClass('active'))
+})
+
+test('localizes vacancy status codes in persisted notification text without changing vacancy names', async () => {
+  const notifications = [
+    { id: 31, kind: 'vacancy_error', title: 'Вакансия: ERROR Backend-разработчик', message: 'Вакансия «Backend-разработчик» — Example: статус ERROR', source_type: 'vacancy', source_id: '91', target_path: '/vacancies', read_at: null, created_at: '2026-08-24T10:00:00Z' },
+    { id: 32, kind: 'vacancy_status', title: 'Вакансия: SUBMITTED Backend-разработчик', message: 'Вакансия «Backend-разработчик» — Example: статус SUBMITTED', source_type: 'vacancy', source_id: '92', target_path: '/vacancies', read_at: null, created_at: '2026-08-24T10:01:00Z' },
+  ]
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/api/notifications') ? Promise.resolve({ ok: true, json: async () => notifications }) : Promise.resolve({ ok: true, json: async () => [] })))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter><Notifications /></MemoryRouter></QueryClientProvider>)
+  fireEvent.click(await screen.findByRole('button', { name: 'Уведомления' }))
+  expect(await screen.findByText('Вакансия: ERROR Backend-разработчик')).toBeInTheDocument()
+  expect(screen.getByText('Вакансия: SUBMITTED Backend-разработчик')).toBeInTheDocument()
+  expect(screen.getByText('Вакансия «Backend-разработчик» — Example: статус ошибка')).toBeInTheDocument()
+  expect(screen.getByText('Вакансия «Backend-разработчик» — Example: статус отправлено')).toBeInTheDocument()
 })
 
 test('signals only for newly arrived notification IDs', async () => {
@@ -597,7 +723,6 @@ test('RUNNING HH does not block launching HireHi', async () => {
     if (url.endsWith('/api/adapters')) return Promise.resolve({ ok: true, json: async () => [{ site_id: 'hh', display_name: 'HH.ru' }, { site_id: 'hirehi', display_name: 'HireHi' }] })
     if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 22, adapter_id: 'hirehi', status: 'CREATED', counters: {} }) })
-    if (url.endsWith('/api/sessions/22/start')) return Promise.resolve({ ok: true, json: async () => ({ ok: true }) })
     if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [{ id: 11, adapter_id: 'hh', status: 'RUNNING', counters: {} }] })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
@@ -606,9 +731,62 @@ test('RUNNING HH does not block launching HireHi', async () => {
   const launch = screen.getByRole('button', { name: 'Создать и запустить' })
   await waitFor(() => expect(launch).toBeEnabled())
   fireEvent.click(launch)
-  await waitFor(() => expect(requests.some((r) => r.url.endsWith('/api/sessions/22/start'))).toBe(true))
+  await waitFor(() => expect(requests.some((r) => r.url.endsWith('/api/sessions') && r.method === 'POST')).toBe(true))
+  expect(requests.some((r) => r.url.endsWith('/api/sessions/22/start'))).toBe(false)
   const create = requests.find((r) => r.url.endsWith('/api/sessions') && r.method === 'POST')
   expect(JSON.parse(create?.body ?? '{}')).toMatchObject({ adapter_id: 'hirehi' })
+})
+
+test('HireHi exposes the PRO checkbox and submits an open-ended session', async () => {
+  seedResumeSource('hirehi')
+  const requests: Array<{ url: string; method?: string; body?: string }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
+    const sourceResponse = seededResumeResponse(url, init)
+    if (sourceResponse) return sourceResponse
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
+    if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 23, adapter_id: 'hirehi', status: 'CREATED', counters: {} }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  await chooseOption('Сайт', 'HireHi')
+  const pro = await screen.findByRole('checkbox', { name: 'У меня есть подписка PRO' })
+  expect(pro).not.toBeChecked()
+  fireEvent.click(pro)
+  expect(pro).toBeChecked()
+  expect(screen.getByText('Поиск работает без лимита и продолжается до ручной остановки.')).toBeInTheDocument()
+  expect(screen.queryByRole('spinbutton', { name: 'Лимит вакансий в работе' })).not.toBeInTheDocument()
+  const launch = screen.getByRole('button', { name: 'Создать и запустить' })
+  await waitFor(() => expect(launch).toBeEnabled())
+  fireEvent.click(launch)
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions') && request.method === 'POST')).toBe(true))
+  expect(requests.some((request) => request.url.endsWith('/api/sessions/23/start'))).toBe(false)
+  const payload = JSON.parse(requests.find((request) => request.url.endsWith('/api/sessions') && request.method === 'POST')?.body ?? '{}')
+  expect(payload).toMatchObject({ adapter_id: 'hirehi', hirehi_pro_enabled: true, application_limit: null })
+})
+
+test('non-HireHi sessions hide PRO and keep the configured application limit', async () => {
+  seedResumeSource('hh')
+  const requests: Array<{ url: string; method?: string; body?: string }> = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
+    const sourceResponse = seededResumeResponse(url, init)
+    if (sourceResponse) return sourceResponse
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
+    if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 24, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(screen.queryByRole('checkbox', { name: 'У меня есть подписка PRO' })).not.toBeInTheDocument()
+  const limit = await screen.findByRole('spinbutton', { name: 'Лимит вакансий в работе' })
+  fireEvent.change(limit, { target: { value: '9' } })
+  const launch = screen.getByRole('button', { name: 'Создать и запустить' })
+  await waitFor(() => expect(launch).toBeEnabled())
+  fireEvent.click(launch)
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions') && request.method === 'POST')).toBe(true))
+  expect(requests.some((request) => request.url.endsWith('/api/sessions/24/start'))).toBe(false)
+  const payload = JSON.parse(requests.find((request) => request.url.endsWith('/api/sessions') && request.method === 'POST')?.body ?? '{}')
+  expect(payload).toMatchObject({ adapter_id: 'hh', hirehi_pro_enabled: false, application_limit: 9 })
 })
 
 test('stops only the selected session card', async () => {
@@ -649,7 +827,7 @@ test('HH launch has no per-session resume controls', async () => {
   expect(screen.queryByLabelText('Загрузить резюме при запуске')).not.toBeInTheDocument()
   await waitFor(() => expect(launch).toBeEnabled())
   fireEvent.click(launch)
-  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/2/start'))).toBe(true))
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions') && request.body)).toBe(true))
   const payload = requests.find((request) => request.url.endsWith('/api/sessions') && request.body)
   expect(JSON.parse(payload?.body ?? '{}')).not.toHaveProperty('resume_url')
   expect(requests.some((request) => request.url.endsWith('/resume-file'))).toBe(false)
@@ -680,7 +858,8 @@ test('exposes every primary route through keyboard-accessible navigation', () =>
 test('session keeps the four session counters visible', async () => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [{ id: 9, adapter_id: 'hh', status: 'COMPLETED', counters: { viewed: 30, filtered: 12, submitted: 5, errors: 2, matched: 18, already_applied: 3 }, started_at: null, finished_at: null, stop_reason: null }] })
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: [{ id: 9, adapter_id: 'hh', status: 'COMPLETED', counters: { viewed: 30, filtered: 12, submitted: 5, errors: 2, matched: 18, already_applied: 3 }, started_at: null, finished_at: null, stop_reason: null }], total: 1, limit: 10, offset: 0, has_more: false }) })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
     return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
@@ -688,7 +867,7 @@ test('session keeps the four session counters visible', async () => {
   const container = stats.closest('.stats')
   expect(container).not.toBeNull()
   expect(within(container as HTMLElement).getAllByRole('article')).toHaveLength(4)
-  for (const label of ['Просмотрено', 'Отфильтровано', 'Отклики', 'Ошибка']) expect(within(container as HTMLElement).getByText(label)).toBeInTheDocument()
+  for (const label of ['Просмотрено', 'Отфильтровано', 'Отправлено', 'Ошибка']) expect(within(container as HTMLElement).getByText(label)).toBeInTheDocument()
   for (const label of ['Релевантные', 'Релевантность', 'Не подтверждено']) expect(within(container as HTMLElement).queryByText(label)).not.toBeInTheDocument()
   for (const label of ['Уже откликались', 'Тестовые', 'Проверка', 'Совпадения', 'Ошибки']) expect(within(container as HTMLElement).queryByText(label)).not.toBeInTheDocument()
 })
@@ -698,7 +877,8 @@ test('groups terminal sessions behind a collapsed history block', async () => {
     id: index + 1, adapter_id: 'hh', status, counters: {}, started_at: null, finished_at: null, stop_reason: null,
   }))
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
-    if (String(input).endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => sessions })
+    if (String(input).includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: sessions.slice(3), total: 3, limit: 10, offset: 0, has_more: false }) })
+    if (String(input).endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => sessions.slice(0, 3) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
@@ -719,6 +899,213 @@ test('does not show terminal history when there are no terminal sessions', async
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
   await screen.findByTestId('session-1')
   expect(screen.queryByText(/Завершённые сессии/)).not.toBeInTheDocument()
+})
+
+test('history requests terminal sessions only and defensively hides active or duplicate rows', async () => {
+  const requests: string[] = []
+  const active = { id: 51, adapter_id: 'hh', status: 'RUNNING', counters: {} }
+  const failed = { id: 52, adapter_id: 'hirehi', status: 'FAILED', counters: {}, stop_reason: 'Не удалось открыть страницу' }
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input); requests.push(url)
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: [active, failed], total: 1, limit: 10, offset: 0, has_more: false }) })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [active, active] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByTestId('session-51')).toBeVisible()
+  expect(screen.getAllByTestId('session-51')).toHaveLength(1)
+  await waitFor(() => expect(screen.getAllByRole('alert').some((alert) => alert.textContent?.includes('Сессия #52 завершилась с ошибкой'))).toBe(true))
+  expect(requests.some((url) => url.includes('/sessions/history?terminal_only=true&limit=10&offset=0'))).toBe(true)
+  expect(screen.getByTestId('session-52')).not.toBeVisible()
+  fireEvent.click(screen.getByText('Открыть историю сессий'))
+  expect(await screen.findByTestId('session-52')).toBeVisible()
+  expect(screen.queryByTestId('session-51')).toBeInTheDocument()
+  expect(screen.getByText('Завершённые сессии (1)')).toBeInTheDocument()
+})
+
+test('keeps a created session failure visible after polling reports FAILED', async () => {
+  seedResumeSource('hh')
+  const requests: string[] = []
+  let polledSession: Record<string, unknown> | null = null
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); requests.push(`${init?.method ?? 'GET'} ${url}`)
+    const sourceResponse = seededResumeResponse(url, init)
+    if (sourceResponse) return sourceResponse
+    if (url.endsWith('/api/sessions') && init?.method === 'POST') {
+      polledSession = { id: 89, adapter_id: 'hh', status: 'FAILED', counters: {}, stop_reason: 'Не удалось загрузить сохранённое резюме' }
+      return Promise.resolve({ ok: true, json: async () => ({ id: 89, adapter_id: 'hh', status: 'PREPARING', counters: {} }) })
+    }
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => polledSession ? [polledSession] : [] })
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: polledSession ? [polledSession] : [], total: polledSession ? 1 : 0, limit: 10, offset: 0, has_more: false }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  const createButton = await screen.findByRole('button', { name: 'Создать и запустить' })
+  await waitFor(() => expect(createButton).toBeEnabled())
+  fireEvent.click(createButton)
+  await waitFor(() => expect(screen.getAllByRole('alert').some((alert) => alert.textContent?.includes('Сессия #89 завершилась с ошибкой'))).toBe(true))
+  const alert = screen.getAllByRole('alert').find((item) => item.textContent?.includes('Сессия #89 завершилась с ошибкой')) as HTMLElement
+  expect(alert).toHaveTextContent('Сессия #89 завершилась с ошибкой')
+  expect(alert).toHaveTextContent('Не удалось загрузить сохранённое резюме')
+  expect(screen.queryByText(/Сессия #89 принята и готовится/)).not.toBeInTheDocument()
+  expect(requests.some((request) => request === 'GET /api/sessions')).toBe(true)
+})
+
+test('translates the user stop sentinel while a session is stopping', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [{ id: 88, adapter_id: 'hh', status: 'STOPPING', stop_reason: 'user', counters: {} }] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  const card = await screen.findByTestId('session-88')
+  expect(card).toHaveTextContent('Остановлено пользователем.')
+  expect(card).not.toHaveTextContent('user')
+})
+
+test('translates the worker exit reason in the failure banner and history while preserving unknown reasons', async () => {
+  const failures = [
+    { id: 91, adapter_id: 'hh', status: 'FAILED', counters: {}, stop_reason: 'Worker process exited unexpectedly' },
+    { id: 92, adapter_id: 'hirehi', status: 'FAILED', counters: {}, stop_reason: 'Custom legacy failure explanation' },
+    { id: 93, adapter_id: 'zarplata', status: 'FAILED', counters: {}, stop_reason: 'worker process containment could not be established' },
+  ]
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: failures, total: 2, limit: 10, offset: 0, has_more: false }) })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+
+  const translatedReason = 'Рабочий процесс аварийно завершился.'
+  await waitFor(() => expect(screen.getAllByRole('alert').some((alert) => alert.textContent?.includes('Сессия #91 завершилась с ошибкой на площадке HH.ru'))).toBe(true))
+  const banner = screen.getAllByRole('alert').find((alert) => alert.textContent?.includes('Сессия #91 завершилась с ошибкой')) as HTMLElement
+  expect(banner).toHaveTextContent(translatedReason)
+  expect(banner).not.toHaveTextContent('Worker process exited unexpectedly')
+  expect(screen.getAllByRole('alert').some((alert) => alert.textContent?.includes('Custom legacy failure explanation'))).toBe(true)
+  expect(screen.getAllByRole('alert').some((alert) => alert.textContent?.includes('Не удалось изолировать рабочий процесс.'))).toBe(true)
+
+  fireEvent.click(within(banner).getByRole('button', { name: 'Открыть историю сессий' }))
+  const historySession = await screen.findByTestId('session-91')
+  expect(historySession).toHaveTextContent(translatedReason)
+  expect(historySession).not.toHaveTextContent('Worker process exited unexpectedly')
+  expect(screen.getByTestId('session-92')).toHaveTextContent('Custom legacy failure explanation')
+  expect(screen.getByTestId('session-93')).toHaveTextContent('Не удалось изолировать рабочий процесс.')
+})
+
+test.each(['0', '-1', '100001'])(
+  'keeps invalid letter limit %s as a draft without warning that autosave failed',
+  async (rawValue) => {
+    seedResumeSource('hh')
+    const requests: Array<{ url: string; method?: string; body?: string }> = []
+    let serverDraft: { revision: number; draft: unknown } = { revision: 0, draft: null }
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input); requests.push({ url, method: init?.method, body: init?.body ? String(init.body) : undefined })
+      const sourceResponse = seededResumeResponse(url, init)
+      if (sourceResponse) return sourceResponse
+      if (url.endsWith('/api/session-draft')) {
+        if (init?.method === 'PUT') {
+          const body = JSON.parse(String(init.body)) as { revision: number; draft: unknown }
+          serverDraft = { revision: body.revision + 1, draft: body.draft }
+        }
+        return Promise.resolve({ ok: true, json: async () => serverDraft })
+      }
+      if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }))
+    const mount = () => render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+    const first = mount()
+    const letterHeading = await screen.findByRole('button', { name: 'Сопроводительное письмо' })
+    fireEvent.click(letterHeading)
+    const automatic = screen.getByRole('checkbox', { name: 'ИИ самостоятельно определяет структуру сопроводительного письма' }) as HTMLInputElement
+    if (automatic.checked) fireEvent.click(automatic)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Своя структура сопроводительного письма' }), { target: { value: 'Короткая структура письма' } })
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Максимальная длина сопроводительного письма в словах' }), { target: { value: rawValue } })
+    expect(screen.getByRole('button', { name: 'Создать и запустить' })).toBeDisabled()
+    expect(await screen.findByText('Укажите целое число от 1 до 10000 слов или оставьте поле пустым.')).toBeInTheDocument()
+    await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/session-draft') && request.method === 'PUT')).toBe(true))
+    await waitFor(() => expect(screen.getByText('Форма сохранена на этом компьютере')).toBeInTheDocument())
+    expect(screen.queryByText('Не удалось сохранить форму на компьютере. Повторим автоматически; текст остаётся в браузере.')).not.toBeInTheDocument()
+    expect((JSON.parse(requests.find((request) => request.url.endsWith('/api/session-draft') && request.method === 'PUT')?.body ?? '{}') as { draft: { coverLetterMaxWords: string } }).draft.coverLetterMaxWords).toBe(rawValue)
+    first.unmount()
+
+    mount()
+    fireEvent.click(await screen.findByRole('button', { name: 'Сопроводительное письмо' }))
+    expect(await screen.findByRole('spinbutton', { name: 'Максимальная длина сопроводительного письма в словах' })).toHaveValue(Number(rawValue))
+    expect(screen.getByRole('button', { name: 'Создать и запустить' })).toBeDisabled()
+  },
+)
+
+test('surfaces the latest stored failure after remount and remembers dismissal', async () => {
+  const failed = { id: 73, adapter_id: 'hirehi', status: 'FAILED', counters: {}, stop_reason: 'Сайт временно недоступен' }
+  const install = () => vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: [failed], total: 1, limit: 10, offset: 0, has_more: false }) })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  install()
+  const first = render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByRole('alert')).toHaveTextContent('Сессия #73 завершилась с ошибкой')
+  fireEvent.click(screen.getByText('Скрыть сообщение'))
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  first.unmount()
+  install()
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+})
+
+test('shows concurrent failures from separate sites and dismisses each independently', async () => {
+  const failures = [
+    { id: 75, adapter_id: 'hh', status: 'FAILED', counters: {}, stop_reason: 'Ошибка HH' },
+    { id: 76, adapter_id: 'hirehi', status: 'FAILED', counters: {}, stop_reason: 'Ошибка HireHi' },
+  ]
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: failures, total: 2, limit: 10, offset: 0, has_more: false }) })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  await waitFor(() => expect(screen.getAllByRole('alert').filter((item) => item.textContent?.includes('завершилась с ошибкой'))).toHaveLength(2))
+  const hhAlert = screen.getAllByRole('alert').find((item) => item.textContent?.includes('Ошибка HH')) as HTMLElement
+  fireEvent.click(within(hhAlert).getByRole('button', { name: 'Скрыть сообщение' }))
+  await waitFor(() => expect(screen.getAllByRole('alert').filter((item) => item.textContent?.includes('завершилась с ошибкой'))).toHaveLength(1))
+  expect(screen.getByRole('alert')).toHaveTextContent('Ошибка HireHi')
+})
+
+test.each(['COMPLETED', 'CANCELLED'])(
+  'a newer %s terminal session on a site suppresses that site’s older failure',
+  async (newerStatus) => {
+    const history = [
+      { id: 77, adapter_id: 'hh', status: 'FAILED', counters: {}, stop_reason: 'Старый сбой' },
+      { id: 78, adapter_id: 'hh', status: newerStatus, counters: {}, stop_reason: null },
+    ]
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: history, total: 2, limit: 10, offset: 0, has_more: false }) })
+      if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }))
+    render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+    await screen.findByText(`Завершённые сессии (2)`)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  },
+)
+
+test.each([
+  ['STOPPED', 'остановлена'],
+  ['COMPLETED', 'завершена'],
+])('reports a persisted %s session truthfully after reload', async (status, expected) => {
+  localStorage.setItem('job-orchestrator.last-created-session', '74')
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: [{ id: 74, adapter_id: 'hh', status, counters: {} }], total: 1, limit: 10, offset: 0, has_more: false }) })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  expect(await screen.findByText(`Сессия #74 ${expected}.`)).toBeInTheDocument()
 })
 
 test('HireHi launch hides per-session resume controls', async () => {
@@ -749,13 +1136,14 @@ test('HireHi launch hides per-session resume controls', async () => {
   expect(requests.some((request) => request.url.endsWith('/resume-file'))).toBe(false)
   const payload = requests.find((request) => request.url.endsWith('/api/sessions') && request.body)
   expect(JSON.parse(payload?.body ?? '{}')).not.toHaveProperty('resume_url')
-  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/3/start'))).toBe(true))
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions') && request.body)).toBe(true))
 })
 
 test('shows deterministic ready HireHi PDF link', async () => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [{ id: 7, adapter_id: 'hirehi', status: 'COMPLETED', counters: {}, started_at: null, finished_at: null, stop_reason: null }] })
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: [{ id: 7, adapter_id: 'hirehi', status: 'COMPLETED', counters: {}, started_at: null, finished_at: null, stop_reason: null }], total: 1, limit: 10, offset: 0, has_more: false }) })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
     if (url.endsWith('/api/sessions/7/report')) return Promise.resolve({ ok: true, json: async () => ({ ready: true, pdf_url: '/api/sessions/7/report/pdf' }) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
@@ -771,9 +1159,11 @@ test('shows deterministic ready HireHi PDF link', async () => {
 test('shows the latest completed HireHi report while a newer HH session is running', async () => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: [
+      { id: 9, adapter_id: 'hirehi', status: 'STOPPED', counters: {}, started_at: null, finished_at: null, stop_reason: null },
+    ], total: 1, limit: 10, offset: 0, has_more: false }) })
     if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [
       { id: 12, adapter_id: 'hh', status: 'RUNNING', counters: {}, started_at: null, finished_at: null, stop_reason: null },
-      { id: 9, adapter_id: 'hirehi', status: 'STOPPED', counters: {}, started_at: null, finished_at: null, stop_reason: null },
     ] })
     if (url.endsWith('/api/sessions/9/report')) return Promise.resolve({ ok: true, json: async () => ({ ready: true, pdf_url: '/api/sessions/9/report/pdf' }) })
     return Promise.resolve({ ok: true, json: async () => [] })
@@ -821,11 +1211,7 @@ test('allows creating an HH session after a stopped session', async () => {
   fireEvent.click(screen.getByRole('checkbox', { name: /Без ограничений:/ }))
   fireEvent.click(createButton)
 
-  expect(await screen.findByText(/Сессия #2 запущена/)).toBeInTheDocument()
-  expect(fetchMock).toHaveBeenCalledWith(
-    '/api/sessions/2/start',
-    expect.objectContaining({ method: 'POST' }),
-  )
+  expect(await screen.findByText(/Сессия #2 принята/)).toBeInTheDocument()
   const createCall = fetchMock.mock.calls.find(([url, init]) => String(url).endsWith('/api/sessions') && init?.method === 'POST')
   expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({ adapter_id: 'hh' })
   expect(JSON.parse(String(createCall?.[1]?.body))).not.toHaveProperty('resume_preview_token')
@@ -1170,7 +1556,7 @@ test('renders a concrete API error below the model summary', async () => {
   expect(screen.queryByText('Отклик не отправлен из-за ошибки обработки вакансии.')).not.toBeInTheDocument()
 })
 
-test.each(['hh', 'hirehi', 'zarplata'] as const)('shows a platform-neutral unconfirmed outcome for %s', async (site) => {
+test.each(['hh', 'hirehi', 'zarplata'] as const)('normalizes a legacy unconfirmed outcome to an error for %s', async (site) => {
   const vacancy = {
     id: 507, title: 'Отклик без подтверждения', company: 'Компания', url: 'https://example.test/vacancy/507',
     site, state: 'UNCONFIRMED', status_group: 'UNCONFIRMED' as const,
@@ -1181,12 +1567,12 @@ test.each(['hh', 'hirehi', 'zarplata'] as const)('shows a platform-neutral uncon
     : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
   fireEvent.click((await screen.findByText('Отклик без подтверждения')).closest('summary') as HTMLElement)
-  expect(await screen.findByText('Площадка не подтвердила результат отправки; отклик мог быть отправлен.')).toBeInTheDocument()
+  expect(screen.getByText('После повторных попыток не удалось подтвердить отправку.')).toBeInTheDocument()
   expect(screen.queryByText(/Отклик не отправлен/)).not.toBeInTheDocument()
-  expect(screen.getByText('Не подтверждено', { selector: '.status' })).toHaveClass('status-warning')
+  expect(screen.getByText('Ошибка', { selector: '.status' })).toHaveClass('status-danger')
 })
 
-test('classifies legacy submission uncertainty as UNCONFIRMED even when state is ERROR', async () => {
+test('classifies legacy submission uncertainty as ERROR and shows its concrete code', async () => {
   const vacancy = {
     id: 508, title: 'Legacy uncertain submission', company: 'Company', url: 'https://example.test/vacancy/508',
     state: 'ERROR', error_code: 'SUBMISSION_UNCONFIRMED', data: {}, evaluation: null,
@@ -1196,10 +1582,11 @@ test('classifies legacy submission uncertainty as UNCONFIRMED even when state is
     : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
   const summary = (await screen.findByText('Legacy uncertain submission')).closest('summary') as HTMLElement
-  expect(within(summary).getByText('Не подтверждено', { selector: '.status' })).toBeInTheDocument()
-  expect(within(summary).queryByText('Ошибка', { selector: '.status' })).not.toBeInTheDocument()
+  expect(within(summary).getByText('Ошибка', { selector: '.status' })).toBeInTheDocument()
+  expect(within(summary).queryByText('Не подтверждено', { selector: '.status' })).not.toBeInTheDocument()
   fireEvent.click(summary)
-  expect(await screen.findByText('Площадка не подтвердила результат отправки; отклик мог быть отправлен.')).toBeInTheDocument()
+  expect(await screen.findByText('После повторных попыток не удалось подтвердить отправку.')).toBeInTheDocument()
+  expect(screen.getByText('Код ошибки: SUBMISSION_UNCONFIRMED')).toBeInTheDocument()
 })
 
 test('SingleSelect opens, selects an option, and closes on Escape', async () => {
@@ -1236,12 +1623,12 @@ test('site filter labels legacy vacancies simply as без сайта', async ()
 })
 
 test.each([
-  ['connected', true, 'Соединение есть', 'success', 'CONNECTED'],
-  ['disconnected', false, 'Нет соединения', 'danger', 'DISCONNECTED'],
-] as const)('model status exposes %s semantic tone and data status', async (_name, connected, label, tone, dataStatus) => {
+  ['connected', true, 'Модель доступна в каталоге', 'success', 'AVAILABLE'],
+  ['disconnected', false, 'Каталог недоступен', 'danger', 'UNAVAILABLE'],
+] as const)('catalog status exposes %s semantic tone without claiming generation health', async (_name, connected, label, tone, dataStatus) => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected, model_available: connected, model: connected ? 'cloud-a' : '', provider: 'test' }) })
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({ connected, model_available: connected, model: connected ? 'cloud-a' : '', provider: 'test', generation_health: { healthy: null, success_count: 0, failure_count: 0, running: 0, queued: 0, last_success: null, last_failure: null } }) })
     if (url.endsWith('/api/model/settings')) return Promise.resolve({ ok: true, json: async () => ({ base_url: '', model: '', has_api_key: false, masked_key: '' }) })
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
@@ -1249,6 +1636,58 @@ test.each([
   const status = await screen.findByText(label)
   expect(status).toHaveClass(`status-${tone}`)
   expect(status).toHaveAttribute('data-status', dataStatus)
+  expect(screen.getByText('Генерация ещё не проверена')).toHaveAttribute('data-status', 'UNKNOWN')
+})
+
+test('model page reports a catalog success and a real generation failure independently', async () => {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/model/status')) return Promise.resolve({ ok: true, json: async () => ({
+      connected: true,
+      model_available: true,
+      model: 'cloud-a',
+      provider: 'test',
+      message: 'Каталог доступен',
+      generation_health: {
+        healthy: false,
+        success_count: 4,
+        failure_count: 1,
+        running: 0,
+        queued: 3,
+        last_success: { diagnostic_id: 'safe-success-id', at: '2026-09-23T09:00:00+00:00' },
+        last_failure: { diagnostic_id: 'safe-failure-id', at: '2026-09-23T09:05:00+00:00' },
+      },
+    }) })
+    if (url.endsWith('/api/model/settings')) return Promise.resolve({ ok: true, json: async () => ({ base_url: '', model: '', has_api_key: false, masked_key: '' }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/model']}><App /></MemoryRouter></QueryClientProvider>)
+
+  expect(await screen.findByText('Модель доступна в каталоге')).toHaveAttribute('data-status', 'AVAILABLE')
+  expect(screen.getByText('Генерация требует проверки')).toHaveAttribute('data-status', 'UNHEALTHY')
+  expect(screen.getByText(/После ошибки запросы ожидают свободный рабочий слот: 3/)).toBeInTheDocument()
+  expect(screen.getByText(/Успешно: 4 · Ошибок: 1 · В работе: 0 · В очереди: 3/)).toBeInTheDocument()
+  expect(screen.getByText(/диагностика safe-failure-id/)).toBeInTheDocument()
+  expect(screen.queryByText(/provider|secret|internal error/i)).not.toBeInTheDocument()
+})
+
+test('model page distinguishes loading and status request failure', async () => {
+  let rejectStatus: ((reason?: unknown) => void) | undefined
+  const pendingStatus = new Promise((_resolve, reject) => { rejectStatus = reject })
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/model/status')) return pendingStatus
+    if (url.endsWith('/api/model/settings')) return Promise.resolve({ ok: true, json: async () => ({ base_url: '', model: '', has_api_key: false, masked_key: '' }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/model']}><App /></MemoryRouter></QueryClientProvider>)
+
+  expect(await screen.findByText('Проверяем каталог')).toHaveAttribute('data-status', 'LOADING')
+  expect(screen.getByText('Проверяем историю генерации')).toHaveAttribute('data-status', 'LOADING')
+  rejectStatus?.(new Error('private provider failure'))
+  expect(await screen.findByText('Статус каталога недоступен')).toHaveAttribute('data-status', 'STATUS_ERROR')
+  expect(screen.getByText('Статус генерации недоступен')).toHaveAttribute('data-status', 'STATUS_ERROR')
+  expect(screen.queryByText(/private provider failure/)).not.toBeInTheDocument()
 })
 
 test('custom cover letter structure survives toggling and is sent on launch', async () => {
@@ -1262,7 +1701,6 @@ test('custom cover letter structure survives toggling and is sent on launch', as
     if (url.endsWith('/api/session-draft')) return Promise.resolve({ ok: true, json: async () => ({ revision: 1, draft: null }) })
     if (url.endsWith('/api/sessions') && !init?.method) return Promise.resolve({ ok: true, json: async () => [] })
     if (url.endsWith('/api/sessions') && init?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({ id: 81, adapter_id: 'hh', status: 'CREATED', counters: {} }) })
-    if (url.endsWith('/api/sessions/81/start')) return Promise.resolve({ ok: true, json: async () => ({}) })
     return Promise.resolve({ ok: true, json: async () => ({}) })
   }))
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -1295,7 +1733,7 @@ test('custom cover letter structure survives toggling and is sent on launch', as
   expect(await screen.findByRole('textbox', { name: 'Своя структура сопроводительного письма' })).toHaveValue('Здравствуйте, я [ФИО].')
   const launch = screen.getByRole('button', { name: 'Создать и запустить' })
   fireEvent.click(launch)
-  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions/81/start'))).toBe(true))
+  await waitFor(() => expect(requests.some((request) => request.url.endsWith('/api/sessions') && request.method === 'POST')).toBe(true))
   const payload = JSON.parse(requests.find((request) => request.url.endsWith('/api/sessions') && request.method === 'POST')?.body ?? '{}')
   expect(payload.cover_letter_auto).toBe(false)
   expect(payload.cover_letter_template).toBe('Здравствуйте, я [ФИО].')

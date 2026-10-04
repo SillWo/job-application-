@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react'
 import { useSessionDraft } from './useSessionDraft'
 
 const key = 'job-orchestrator.session-draft'
-const draft = { adapter: 'hirehi', applicationLimit: '7', desiredJobDescription: 'Исследования; не продажи', coverLetterAuto: true, coverLetterTemplate: '', unlimitedApplications: true, influence: { tasks: 'high', skills: 'low', experience_depth: 'medium', role_match: 'maximum', industry: 'low' } }
+const draft = { adapter: 'hirehi', applicationLimit: '7', desiredJobDescription: 'Исследования; не продажи', coverLetterAuto: true, coverLetterTemplate: '', unlimitedApplications: true, hirehiProEnabled: false, influence: { tasks: 'high', skills: 'low', experience_depth: 'medium', role_match: 'maximum', industry: 'low' } }
 const response = (value: unknown, status = 200) => ({ ok: status === 200, status, json: async () => value })
 
 beforeEach(() => localStorage.clear())
@@ -117,3 +117,49 @@ test('server saves still work when browser storage is unavailable', async () => 
   await waitFor(() => expect(view.result.current.status).toContain('сохранена'))
   storage.mockRestore()
 })
+
+test('migrates old drafts without the HireHi PRO flag and persists a new choice', async () => {
+  const oldDraft = Object.fromEntries(Object.entries(draft).filter(([key]) => key !== 'hirehiProEnabled')) as Partial<typeof draft>
+  let saved: { revision: number; draft: Partial<typeof draft> } = { revision: 3, draft: oldDraft }
+  const fetcher = vi.fn(async (_: unknown, options?: RequestInit) => {
+    if (options?.method === 'PUT') {
+      const body = JSON.parse(String(options.body))
+      saved = { revision: body.revision + 1, draft: body.draft }
+    }
+    return response(saved)
+  })
+  vi.stubGlobal('fetch', fetcher)
+  const view = renderHook(useSessionDraft)
+  await waitFor(() => expect(view.result.current.draft.hirehiProEnabled).toBe(false))
+  act(() => view.result.current.updateDraft({ hirehiProEnabled: true }))
+  await waitFor(() => expect(saved.draft.hirehiProEnabled).toBe(true))
+  expect(JSON.parse(localStorage.getItem(key)!).hirehiProEnabled).toBe(true)
+})
+
+test.each(['0', '-1', '100001'])(
+  'preserves the invalid launch limit %s through local restore and server autosave',
+  async (rawValue) => {
+    localStorage.setItem(key, JSON.stringify({ ...draft, coverLetterAuto: false, coverLetterMaxWords: rawValue, revision: 1, pending: true }))
+    let server = { revision: 1, draft: { ...draft, coverLetterAuto: false, coverLetterMaxWords: rawValue } }
+    const fetcher = vi.fn(async (_: unknown, options?: RequestInit) => {
+      if (options?.method === 'PUT') {
+        const body = JSON.parse(String(options.body)) as { revision: number; draft: typeof server.draft }
+        server = { revision: body.revision + 1, draft: body.draft }
+      }
+      return response(server)
+    })
+    vi.stubGlobal('fetch', fetcher)
+    const first = renderHook(useSessionDraft)
+    await waitFor(() => expect(fetcher.mock.calls.some(([, options]) => options?.method === 'PUT')).toBe(true))
+    await waitFor(() => expect(first.result.current.status).toContain('Форма сохранена'))
+    expect(first.result.current.draft.coverLetterMaxWords).toBe(rawValue)
+    expect(server.draft.coverLetterMaxWords).toBe(rawValue)
+    expect(JSON.parse(localStorage.getItem(key)!).coverLetterMaxWords).toBe(rawValue)
+    first.unmount()
+
+    const restored = renderHook(useSessionDraft)
+    await waitFor(() => expect(restored.result.current.status).toContain('сохранена'))
+    expect(restored.result.current.draft.coverLetterMaxWords).toBe(rawValue)
+    restored.unmount()
+  },
+)

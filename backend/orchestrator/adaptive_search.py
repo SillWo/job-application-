@@ -1,15 +1,16 @@
 """Durable HH portfolio; site operations stay in the adapter.
 
-A session covers a finite epoch of observed sources. Refreshes require new
-activity and back off when stale; exhaustion never means all of HH was searched.
+The scheduler traverses bounded source epochs and periodically refreshes an
+exhausted epoch. Exhaustion never means all of HH was searched or ends a session.
 """
-import asyncio
+import time
 from time import perf_counter
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from backend.adapters.base.protocol import JobRef
 from backend.intelligence.adaptive_search_planner import plan_portfolio
 from backend.intelligence.gateway import ModelUnavailable
+from backend.orchestrator.recovery import AuthenticationPending, CaptchaRequired, RecoverableFailure
 from backend.orchestrator.search_scheduler import Scheduler, Source
 from backend.services.search_metrics import fingerprint, record
 
@@ -28,6 +29,9 @@ class AdaptiveSearch:
         self.activity = 0
         self.next_expansion = 50
         self.search_exhausted = False
+        self.epoch_refresh_attempt = 0
+        self.next_epoch_refresh_at = None
+        self.next_source_retry_at = None
         self.last_discovery_batch = None
 
     def __getattr__(self, name):
@@ -41,6 +45,9 @@ class AdaptiveSearch:
         url = urlunparse(parsed._replace(query=urlencode(sorted(params.items())), fragment=""))
         key = fingerprint(url)[:20]
         self.scheduler.add(Source(key=key, kind=spec["kind"], spec={**spec, "url": url}, cluster=spec.get("cluster", "")))
+        if self.search_exhausted and key in self.scheduler.sources and not self.scheduler.sources[key].exhausted:
+            self.search_exhausted = False
+            self.next_epoch_refresh_at = None
         return self.scheduler.sources[key]
 
     async def open_search(self, page, filters):
@@ -81,6 +88,14 @@ class AdaptiveSearch:
         return self.accept(home, refs, perf_counter() - started)
 
     async def collect_more_job_refs(self, page):
+        if self.search_exhausted:
+            if self.next_epoch_refresh_at is None:
+                self._schedule_epoch_refresh()
+            if time.time() < self.next_epoch_refresh_at:
+                return []
+            self._refresh_epoch()
+        elif self.next_source_retry_at is not None and time.time() >= self.next_source_retry_at:
+            self.next_source_retry_at = None
         if self.related:
             source = self.scheduler.sources.setdefault("related", Source("related", "related", {}))
             source.exhausted = False
@@ -92,7 +107,15 @@ class AdaptiveSearch:
         await self.expand()
         source = self.scheduler.choose()
         if source is None:
+            waiting = [s.retry_at for s in self.scheduler.sources.values()
+                       if not s.exhausted and s.retry_at > time.time()]
+            if waiting:
+                self.search_exhausted = False
+                self.next_source_retry_at = min(waiting)
+                self.last_discovery_batch = {"source": "source_retry_wait", "ids": []}
+                return []
             self.search_exhausted = True
+            self._schedule_epoch_refresh()
             self.last_discovery_batch = {"source": "epoch_complete", "ids": []}
             return []
         if source.key == "related":
@@ -101,20 +124,22 @@ class AdaptiveSearch:
             return self.accept(source, refs, 0)
         started = perf_counter()
         try:
-            if source.failures:
-                await asyncio.sleep(min(30, 2 ** min(source.failures, 5)))
             result = await self.adapter.read_discovery_page(page, source.spec, source.page)
             refs = result["refs"]
             signature = fingerprint([ref.external_id for ref in refs]) if refs else None
             if signature and signature in source.signatures:
                 raise RuntimeError("HH повторил страницу источника")
+        except (AuthenticationPending, CaptchaRequired, RecoverableFailure):
+            raise
         except Exception as exc:
             source.failures += 1
             source.retry_after = self.scheduler.turn + 10
+            source.retry_at = time.time() + min(300, 5 * 2 ** min(source.failures - 1, 6))
             self.last_discovery_batch = {"source": f"{source.kind}:{source.key}", "ids": [], "failed": True}
             record("search_source_error", {"source": source.key, "page": source.page, "error": type(exc).__name__})
             return []
         source.failures = 0
+        source.retry_at = 0
         new = self.accept(source, refs, perf_counter() - started)
         if signature:
             source.signatures = [*source.signatures[-2:], signature]
@@ -128,6 +153,33 @@ class AdaptiveSearch:
         record("search_choice", {"source": source.key, "kind": source.kind, "new": len(new),
                                   "raw": len(refs), "turn": self.scheduler.turn})
         return new
+
+    def _schedule_epoch_refresh(self):
+        if self.next_epoch_refresh_at is not None:
+            return
+        self.epoch_refresh_attempt += 1
+        delay = min(300, 5 * 2 ** min(self.epoch_refresh_attempt - 1, 6))
+        self.next_epoch_refresh_at = time.time() + delay
+
+    def _refresh_epoch(self):
+        for source in self.scheduler.sources.values():
+            if source.key == "related":
+                continue
+            source.exhausted = False
+            source.page = 0
+            source.signatures = []
+        self.search_exhausted = False
+        self.next_epoch_refresh_at = None
+        self.next_source_retry_at = None
+
+    def next_retry_delay(self):
+        if self.next_epoch_refresh_at is not None:
+            return max(0.0, self.next_epoch_refresh_at - time.time())
+        if self.next_source_retry_at is not None:
+            return max(0.0, self.next_source_retry_at - time.time())
+        return min((max(0.0, source.retry_at - time.time())
+                    for source in self.scheduler.sources.values()
+                    if not source.exhausted and source.retry_at > time.time()), default=0.0)
 
     def observe_overlap(self, external_id):
         if external_id not in self.overlaps:
@@ -180,7 +232,10 @@ class AdaptiveSearch:
                 "seen": sorted(self.seen), "origins": self.origins, "observed": sorted(self.observed),
                 "overlaps": sorted(self.overlaps), "related": [r.model_dump() for r in self.related],
                 "examples": self.examples, "activity": self.activity, "next_expansion": self.next_expansion,
-                "home": self.home, "exhausted": self.search_exhausted}
+                "home": self.home, "exhausted": self.search_exhausted,
+                "epoch_refresh_attempt": self.epoch_refresh_attempt,
+                "next_epoch_refresh_at": self.next_epoch_refresh_at,
+                "next_source_retry_at": self.next_source_retry_at}
 
     def restore_search_checkpoint(self, data):
         if data.get("algorithm") != "adaptive_v1":
@@ -196,3 +251,10 @@ class AdaptiveSearch:
         self.examples, self.activity = data["examples"], data["activity"]
         self.next_expansion, self.home = data["next_expansion"], data["home"]
         self.search_exhausted = data["exhausted"]
+        self.epoch_refresh_attempt = int(data.get("epoch_refresh_attempt", 0))
+        self.next_epoch_refresh_at = data.get("next_epoch_refresh_at")
+        self.next_source_retry_at = data.get("next_source_retry_at")
+
+    def reset_epoch_backoff_after_durable_work(self):
+        self.epoch_refresh_attempt = 0
+        self.next_epoch_refresh_at = None

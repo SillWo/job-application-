@@ -185,3 +185,81 @@ async def test_english_start_and_end_requirements_are_extracted_by_structured_co
     assert special_call[1]["vacancy_description"] == description
     assert [item["id"] for item in writer_call[1]["special_conditions"]] == ["start", "end"]  # type: ignore[index]
     assert writer_call[2] is CoverLetterGenerationDraft
+
+
+@pytest.mark.asyncio
+async def test_auto_one_line_default_anchors_are_formatted_without_splitting_exact_span() -> None:
+    source = "В письмо добавьте точную фразу «ORBITA Мои контакты:»."
+    exact_span = "ORBITA Мои контакты:"
+    one_line = (
+        "Здравствуйте! {{full_name}}, мой опыт соответствует задачам. " + exact_span
+        + " Мессенджеры: {{messengers}} Телефон: {{phone}} Почта: {{email}} "
+        + "С уважением, {{full_name}}"
+    )
+    gateway = RecordingGateway(
+        [{"id": "literal", "source_quote": source, "requirement": "Сохранить точную фразу", "literal": exact_span, "position": "any"}],
+        one_line,
+        [{"id": "literal", "span": exact_span, "position": "any"}],
+    )
+
+    result = await _write(gateway, source)
+
+    assert "Здравствуйте!\n\n{{full_name}}, мой опыт соответствует задачам." in result
+    assert "\n- Мессенджеры: {{messengers}}\n- Телефон: {{phone}}\n- Почта: {{email}}" in result
+    assert "\n\nС уважением, {{full_name}}" in result
+    assert exact_span in result
+    assert "ORBITA\nМои контакты:" not in result
+
+
+@pytest.mark.asyncio
+async def test_auto_one_line_default_body_gets_paragraph_and_bullet_breaks() -> None:
+    text = (
+        "Здравствуйте! Я {{full_name}}, кратко обо мне: - Я увеличил выручку проекта на 25%. "
+        "- В работе использую Python и SQL. - Высшее образование, МГУ, аналитика. "
+        "Уверен, что стану сильным кандидатом. Буду рад продолжить общение. "
+        "Мои контакты: Мессенджеры: {{messengers}} Телефон: {{phone}} Почта: {{email}} "
+        "С уважением, {{full_name}}"
+    )
+    result = await _write(RecordingGateway([], text, []), "Описание вакансии")
+
+    assert "Здравствуйте!\n\nЯ {{full_name}}, кратко обо мне:\n- Я увеличил выручку проекта на 25%." in result
+    assert "\n- В работе использую Python и SQL." in result
+    assert "\n- Высшее образование, МГУ, аналитика." in result
+    assert "\n\nУверен, что стану сильным кандидатом." in result
+    assert "\n\nБуду рад продолжить общение." in result
+    assert "\n- Мессенджеры: {{messengers}}\n- Телефон: {{phone}}\n- Почта: {{email}}" in result
+
+
+@pytest.mark.asyncio
+async def test_auto_normalization_preserves_reversed_and_whitespace_literal_spans() -> None:
+    first = "FIRST-CODE"
+    whitespace_literal = "\n  SECOND-CODE\n  "
+    description = "Include FIRST-CODE. Include exact block:" + whitespace_literal
+    text = "Здравствуйте! " + first + " exact block:" + whitespace_literal + " End of letter."
+    gateway = RecordingGateway(
+        [
+            {"id": "first", "source_quote": "Include FIRST-CODE.", "requirement": "Include code", "literal": first, "position": "any"},
+            {"id": "whitespace", "source_quote": "Include exact block:" + whitespace_literal, "requirement": "Include exact block", "literal": whitespace_literal, "position": "any"},
+        ],
+        text,
+        [
+            {"id": "whitespace", "span": whitespace_literal, "position": "any"},
+            {"id": "first", "span": first, "position": "any"},
+        ],
+    )
+
+    result = await _write(gateway, description)
+
+    assert first in result
+    assert whitespace_literal in result
+    assert result.index(first) < result.index(whitespace_literal)
+
+
+@pytest.mark.asyncio
+async def test_custom_template_does_not_receive_auto_anchor_formatting() -> None:
+    text = "Здравствуйте! текст Мои контакты: Телефон: {{phone}} С уважением, {{full_name}}"
+    gateway = RecordingGateway([], text, [])
+
+    result = await _write(gateway, "Описание вакансии", auto=False, template="Пользовательский шаблон")
+
+    assert result == text

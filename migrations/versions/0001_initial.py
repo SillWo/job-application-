@@ -56,6 +56,45 @@ def upgrade() -> None:
     # remove them, but 0001 must still bootstrap the old schema independently
     # of the current runtime ORM models.
     vacancies = legacy_metadata.tables["vacancies"]
+    evaluations = legacy_metadata.tables["evaluations"]
+
+    # Columns and indexes introduced by later migrations must not leak from
+    # today's ORM metadata into the historical 0001 snapshot.  In
+    # particular, an index owned by 0039 which refers to status_changed_at
+    # makes a genuine 0020 -> 0021 round-trip impossible on SQLite.
+    for table, index_prefixes in (
+        (vacancies, ("ix_vacancies_projection_", "ix_vacancies_status_changed_at")),
+        (evaluations, ("ix_evaluations_projection_",)),
+    ):
+        for index in tuple(table.indexes):
+            if index.name and any(index.name.startswith(prefix) for prefix in index_prefixes):
+                table.indexes.remove(index)
+
+    for column_name in (
+        "status_changed_at",
+        "site",
+        "search_text",
+        "title_sort",
+        "site_sort",
+        "error_code",
+        "error_message",
+    ):
+        if column_name in vacancies.c:
+            vacancies._columns.remove(vacancies.c[column_name])
+    for column_name in (
+        "total_score",
+        "tasks",
+        "skills",
+        "experience_depth",
+        "role_match",
+        "industry",
+        "special_requirements",
+        "decision",
+        "confidence",
+        "category",
+    ):
+        if column_name in evaluations.c:
+            evaluations._columns.remove(evaluations.c[column_name])
     for constraint in list(vacancies.constraints):
         if isinstance(constraint, sa.UniqueConstraint):
             vacancies.constraints.remove(constraint)
@@ -87,7 +126,7 @@ def upgrade() -> None:
         sa.Column("csv_path", sa.String(500), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
-    for column in ("viewed_limit", "application_limit", "minimum_scores", "resume_url", "resume_path", "desired_job_description", "preference_policy", "recovery"):
+    for column in ("viewed_limit", "application_limit", "minimum_scores", "resume_url", "resume_path", "desired_job_description", "preference_policy", "recovery", "hirehi_pro_enabled"):
         if column in sessions.c:
             sessions._columns.remove(sessions.c[column])
     if "employer_contacts" in legacy_metadata.tables:
@@ -106,6 +145,11 @@ def upgrade() -> None:
     # the exact schema for each intermediate revision (not today's ORM
     # columns, such as the 0033 gender preference).
     for table_name in ("session_resume_snapshots", "resume_preview_tokens", "saved_resume_sources"):
+        if table_name in legacy_metadata.tables:
+            legacy_metadata.remove(legacy_metadata.tables[table_name])
+    # The durable model broker is introduced by 0041.  Its current ORM
+    # metadata must not leak into the historical bootstrap schema.
+    for table_name in ("model_response_cache", "model_requests", "model_generation_health"):
         if table_name in legacy_metadata.tables:
             legacy_metadata.remove(legacy_metadata.tables[table_name])
     legacy_metadata.create_all(bind)

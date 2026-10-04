@@ -7,6 +7,7 @@ normalization, persistence, and the boundary between model and private data.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import html
@@ -15,7 +16,6 @@ import json
 import re
 import secrets
 import sys
-import unicodedata
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -25,7 +25,13 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from backend.adapters import adapter_registry
-from backend.persistence.crypto import decrypt_secret, encrypt_secret
+from backend.adapters.base.resume_import import (
+    open_resume_page,
+)
+from backend.adapters.base.resume_import import (
+    snapshot_hash as semantic_snapshot_hash,
+)
+from backend.persistence.crypto import encrypt_secret
 from backend.persistence.models import (
     JobSession,
     ResumePreviewToken,
@@ -42,37 +48,39 @@ from backend.schemas.domain import (
     SourceField,
     utcnow,
 )
+from backend.services.private_text import (
+    _CONTROL,
+    _DIRECT_URL,
+    _EMAIL,
+    _PHONE,
+    ResumeImportError,
+    _unseal_private,
+)
+from backend.services.private_text import (
+    _flat_private as _flat_private,
+)
+from backend.services.private_text import (
+    redact_private_text as redact_private_text,
+)
+from backend.services.private_text import (
+    render_local_private as render_local_private,
+)
+from backend.services.private_text import (
+    render_private_placeholders as render_private_placeholders,
+)
 
 PREVIEW_TTL = timedelta(minutes=10)
 SNAPSHOT_TTL = timedelta(hours=24)
 SAVED_SOURCE_VALID = "valid"
 SAVED_SOURCE_CHANGED = "changed"
 SAVED_SOURCE_UNAVAILABLE = "unavailable"
-_MARKER = re.compile(
-    r"(?:\{\{.*?\}\}|\{%.*?%\}|<%.*?%>|\$\{.*?\}|\[[^\]\r\n]{1,160}\])",
-    re.DOTALL,
-)
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+RESUME_EXTRACT_DEADLINE_SECONDS = 180
+RESUME_CLOSE_DEADLINE_SECONDS = 15
 _HTML_BLOCK = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1\s*>")
 _HTML_TAG = re.compile(r"(?is)</?[a-z][^>]*>")
-_EMAIL = re.compile(r"(?i)(?<![\w.+-])[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])")
-_PHONE = re.compile(
-    r"(?<!\w)(?:\+?7|8)[\s().-]*(?:\d[\s().-]*){9,10}(?!\w)"
-)
 _MESSENGER_URL = re.compile(
     r"(?i)https?://(?:t\.me|telegram\.me|wa\.me|whatsapp\.com|vk\.com)/[^\s<>]+"
 )
-_DIRECT_URL = re.compile(
-    r'(?i)(?:https?://|ftp://|mailto:|tel:|www\.)[^\s<>"\']+'
-    r"|(?<![\w@])(?:github\.com|gitlab\.com|linkedin\.com|facebook\.com|"
-    r'instagram\.com|behance\.net|dribbble\.com)(?:/[^\s<>"\']*)?'
-)
-
-
-class ResumeImportError(ValueError):
-    """Safe user-facing import/validation error (never contains page text)."""
-
-
 class ResumeImportUnavailable(ResumeImportError):
     pass
 
@@ -93,22 +101,6 @@ def _seal_private(value: dict) -> str:
         # Non-Windows test/development hosts get an explicit test-only
         # envelope; deployments using real candidate data must run on Windows.
         return "sealed-test:" + base64.urlsafe_b64encode(payload.encode()).decode()
-
-
-def _unseal_private(value: str) -> dict:
-    try:
-        if value.startswith("dpapi:"):
-            payload = decrypt_secret(value[6:])
-        elif value.startswith("sealed-test:"):
-            payload = base64.urlsafe_b64decode(value[11:]).decode("utf-8")
-        else:
-            raise ValueError
-        data = json.loads(payload)
-    except Exception as exc:
-        raise ResumeImportError("Повреждён защищённый снимок резюме") from exc
-    if not isinstance(data, dict):
-        raise ResumeImportError("Повреждён защищённый снимок резюме")
-    return data
 
 
 def _utc(value: datetime) -> datetime:
@@ -160,6 +152,16 @@ def canonical_resume_url(adapter_id: str, url: str) -> str:
     authoritative validation is performed by :func:`validate_adapter_resume_url`.
     """
     value = str(url or "").strip()
+    # The site policy is the single source of truth for accepted tracking and
+    # print parameters. It returns the queryless identity URL while retaining
+    # the import URL on the ResumeRef.
+    module = _site_resume_module(adapter_id)
+    policy = getattr(module, "POLICY", None) if module is not None else None
+    if policy is not None:
+        try:
+            return policy.validate(value).url
+        except ValueError as exc:
+            raise ResumeImportError("Ссылка не прошла проверку выбранного сайта") from exc
     parsed = urlparse(value)
     try:
         port = parsed.port
@@ -174,9 +176,15 @@ def canonical_resume_url(adapter_id: str, url: str) -> str:
         raise ResumeImportError("Ссылка содержит недопустимые символы")
     # Fragments and well-known tracking parameters never reach the browser;
     # unknown query keys are rejected rather than treated as redirect state.
-    query_keys = {key.casefold() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
-    if any(not key.startswith("utm_") and key not in {"from", "hhtmfrom"} for key in query_keys):
+    if re.search(r"%(?![0-9A-Fa-f]{2})", parsed.query):
+        raise ResumeImportError("Ссылка содержит некорректное URL-кодирование")
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    query_keys = {key.casefold() for key, _ in query_pairs}
+    if any(not key.startswith("utm_") and key not in {"from", "hhtmfrom", "print"} for key in query_keys):
         raise ResumeImportError("Ссылка содержит недопустимые параметры")
+    print_values = [value for key, value in query_pairs if key == "print"]
+    if len(print_values) > 1 or (print_values and print_values[0] != "true"):
+        raise ResumeImportError("Параметр print в ссылке на резюме недействителен")
     return urlunparse(("https", host, parsed.path.rstrip("/"), "", "", ""))
 
 
@@ -251,17 +259,17 @@ def _normalize_extracted(
         if key not in target and key in raw:
             target[key] = raw[key]
     location = mapping("location")
-    for key in ("residence", "relocation", "business_trips", "citizenship", "work_permit"):
+    for key in ("residence", "relocation", "business_trips", "citizenship", "work_permit", "commute_time"):
         if key not in location and key in raw:
             location[key] = raw[key]
     identity = mapping("identity")
     contacts = mapping("contacts")
     if "full_name" in raw and "full_name" not in identity:
         identity["full_name"] = raw["full_name"]
-    for key in ("gender", "age", "birth_date", "has_photo"):
+    for key in ("gender", "age", "birth_date", "has_photo", "photo_url"):
         if key in raw and key not in identity:
             identity[key] = raw[key]
-    for key in ("phone", "email", "messengers", "links"):
+    for key in ("phone", "email", "messengers", "links", "preferred_contact", "contact_comment"):
         if key in raw and key not in contacts:
             contacts[key] = raw[key]
 
@@ -269,18 +277,23 @@ def _normalize_extracted(
         for key, value in list(group.items()):
             group[key] = _source_field(value)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "extractor_version": str(raw.get("extractor_version") or "site-resume-v1"),
         "source_site": adapter_id,
         "source_resume_id": ref_id,
         "source_url_hash": expected_url_hash,
         "content_hash": "0" * 64,
         "source_updated_at": raw.get("source_updated_at"),
+        "source_updated_text": _source_field(raw.get("source_updated_text"), section="metadata"),
         "imported_at": raw.get("imported_at") or utcnow(),
         "identity": identity,
         "contacts": contacts,
+        "self_employment": _source_field(raw.get("self_employment"), section="additional_info"),
+        "job_search_status": _source_field(raw.get("job_search_status"), section="metadata"),
+        "source_badges": _source_field(raw.get("source_badges"), section="metadata"),
         "target": target,
         "location": location,
+        "total_experience": _source_field(raw.get("total_experience"), section="experience"),
         "experience": _as_list(raw.get("experience", raw.get("experiences"))),
         "projects": _as_list(raw.get("projects")),
         "skills": _as_list(raw.get("skills")),
@@ -310,6 +323,25 @@ def _normalize_extracted(
     )
     if not meaningful:
         raise ResumeImportError("Сайт не вернул профессиональные разделы резюме")
+    # A parser error is never a successful normalized import. Unsupported
+    # fields are acceptable only when they are genuinely absent (no value was
+    # captured); owner-layout fallbacks with data are rejected by the print DOM
+    # gate and cannot be counted as complete imports.
+    for field in _iter_source_fields(snapshot):
+        if field.availability is FieldAvailability.PARSE_ERROR:
+            raise ResumeImportError("Сайт вернул ошибку разбора данных резюме")
+        if field.availability is FieldAvailability.UNSUPPORTED and field.value not in (None, "", []):
+            raise ResumeImportError("Сайт вернул неподдержанные данные резюме")
+    if snapshot.coverage.parse_errors:
+        raise ResumeImportError("Сайт вернул ошибку разбора данных резюме")
+    for path in snapshot.coverage.unsupported_fields:
+        field = _source_field_at_path(snapshot, path)
+        if field is not None and field.value not in (None, "", []):
+            raise ResumeImportError("Сайт вернул неподдержанные данные резюме")
+    if snapshot.coverage.hidden_fields:
+        # Hidden DOM content is not a complete normalized snapshot. Reject it
+        # before it can be persisted or used by the workflow.
+        raise ResumeImportError("РЎРЅРёРјРѕРє СЂРµР·СЋРјРµ СЃРѕРґРµСЂР¶РёС‚ hidden_fields")
     # Import timestamps describe when this copy was read, not its contents.
     # Excluding them makes a revalidation of an unchanged page deterministic.
     digest = _snapshot_hash(snapshot)
@@ -317,20 +349,57 @@ def _normalize_extracted(
 
 
 def _snapshot_hash(snapshot: SiteResumeSnapshot) -> str:
-    content = snapshot.model_dump(
-        mode="json", exclude={"content_hash", "imported_at", "source_updated_at"}
-    )
-    return _sha256(json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return semantic_snapshot_hash(snapshot)
+
+
+def _iter_source_fields(value: Any):
+    if isinstance(value, SourceField):
+        yield value
+        return
+    if hasattr(value, "model_dump"):
+        yield from _iter_source_fields(value.model_dump(mode="python"))
+        return
+    if isinstance(value, dict):
+        if "availability" in value and "value" in value:
+            try:
+                yield SourceField.model_validate(value)
+            except Exception:
+                return
+            return
+        for child in value.values():
+            yield from _iter_source_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_source_fields(child)
+
+
+def _source_field_at_path(snapshot: SiteResumeSnapshot, path: str) -> SourceField | None:
+    """Resolve coverage paths such as ``experience[0].company`` safely."""
+    node: Any = snapshot
+    for name, index in re.findall(r"([A-Za-z_]\w*)(?:\[(\d+)\])?", path):
+        if hasattr(node, name):
+            node = getattr(node, name)
+        elif isinstance(node, dict):
+            node = node.get(name)
+        else:
+            return None
+        if index:
+            if not isinstance(node, list) or int(index) >= len(node):
+                return None
+            node = node[int(index)]
+    return node if isinstance(node, SourceField) else None
 
 
 def professional_view(snapshot: SiteResumeSnapshot | dict) -> ResumeProfessionalView:
     item = snapshot if isinstance(snapshot, SiteResumeSnapshot) else SiteResumeSnapshot.model_validate(snapshot)
     view = ResumeProfessionalView(
-        target=item.target, location=item.location, experience=item.experience,
+        target=item.target, self_employment=item.self_employment,
+        job_search_status=item.job_search_status, source_badges=item.source_badges,
+        location=item.location, experience=item.experience,
         projects=item.projects, skills=item.skills, education=item.education,
         languages=item.languages, courses=item.courses, certifications=item.certifications,
         awards=item.awards, portfolio=item.portfolio, about=item.about,
-        additional_sections=item.additional_sections,
+        additional_sections=item.additional_sections, total_experience=item.total_experience,
     )
     # Availability is useful to the model, while CSS/semantic extraction
     # provenance is an implementation detail and must not cross the boundary.
@@ -399,6 +468,9 @@ def _redacted_snapshot(snapshot: SiteResumeSnapshot) -> tuple[SiteResumeSnapshot
         update={
             "identity": ResumeIdentity(),
             "contacts": ResumeContacts(),
+            "self_employment": view.self_employment,
+            "job_search_status": view.job_search_status,
+            "source_badges": view.source_badges,
             "target": view.target,
             "location": view.location,
             "experience": view.experience,
@@ -412,6 +484,7 @@ def _redacted_snapshot(snapshot: SiteResumeSnapshot) -> tuple[SiteResumeSnapshot
             "portfolio": view.portfolio,
             "about": view.about,
             "additional_sections": view.additional_sections,
+            "total_experience": view.total_experience,
             "content_hash": "0" * 64,
         }
     )
@@ -473,9 +546,10 @@ def full_resume_model_payload(value: SiteResumeSnapshot | dict) -> dict:
         item = SiteResumeSnapshot.model_validate(raw)
 
     fields = (
-        "identity", "contacts", "target", "location", "experience", "skills",
+        "identity", "contacts", "self_employment", "job_search_status", "source_badges",
+        "target", "location", "experience", "skills",
         "education", "projects", "languages", "courses", "certifications",
-        "awards", "portfolio", "about", "additional_sections", "coverage",
+        "awards", "portfolio", "about", "additional_sections", "coverage", "total_experience",
     )
     data = item.model_dump(mode="json", include=set(fields))
 
@@ -500,7 +574,7 @@ def full_resume_model_payload(value: SiteResumeSnapshot | dict) -> dict:
     return flatten(data)
 
 
-def public_preview(snapshot: SiteResumeSnapshot) -> dict[str, Any]:
+def public_preview(snapshot: SiteResumeSnapshot, *, source_url: str | None = None) -> dict[str, Any]:
     """Return safe preview metadata; values of identity/contact fields stay local."""
     questions: list[dict[str, Any]] = []
     gender = snapshot.identity.gender
@@ -512,7 +586,7 @@ def public_preview(snapshot: SiteResumeSnapshot) -> dict[str, Any]:
             "required": True,
             "session_only": True,
         })
-    return {
+    result = {
         "source_site": snapshot.source_site,
         "target_title": snapshot.target.desired_title.value,
         "source_updated_at": snapshot.source_updated_at.isoformat() if snapshot.source_updated_at else None,
@@ -529,11 +603,28 @@ def public_preview(snapshot: SiteResumeSnapshot) -> dict[str, Any]:
         },
         "questions": questions,
     }
+    if source_url is not None:
+        result["import_url"] = _safe_import_url(snapshot.source_site, source_url)
+    return result
+
+
+def _safe_import_url(adapter_id: str, source_url: str | None) -> str | None:
+    if not source_url:
+        return None
+    module = _site_resume_module(adapter_id)
+    policy = getattr(module, "POLICY", None) if module is not None else None
+    if policy is None:
+        return None
+    try:
+        return policy.validate(source_url).import_url
+    except (TypeError, ValueError):
+        return None
 
 
 def _saved_source_preview(
     snapshot: SiteResumeSnapshot, *, gender_known: bool | None = None,
     private_fields_found: dict[str, bool] | None = None,
+    source_url: str | None = None,
 ) -> dict[str, Any]:
     """Return metadata safe for durable storage and saved-source responses.
 
@@ -543,7 +634,8 @@ def _saved_source_preview(
     values at this separate persistence boundary.  Generic question metadata
     remains useful for asking the user again after a restart.
     """
-    result = dict(public_preview(snapshot))
+    result = dict(public_preview(snapshot, source_url=source_url))
+    result["import_url"] = _safe_import_url(snapshot.source_site, source_url)
 
     # Extractors are untrusted.  A malformed title/section can repeat the
     # external resume id even though the normal preview shape does not expose
@@ -626,6 +718,98 @@ def _apply_saved_gender(
     return SiteResumeSnapshot.model_validate(data)
 
 
+_SAVED_RESUME_DATA_ERROR = "Обновите данные резюме во вкладке «Профиль»"
+
+
+def uses_saved_resume_data(adapter_id: str) -> bool:
+    """Whether this site uses an explicitly saved local resume snapshot."""
+    return adapter_id in {"hh", "zarplata"}
+
+
+def _validated_saved_snapshot(row: SavedResumeSource) -> SiteResumeSnapshot:
+    """Validate a locally protected snapshot and all durable row bindings."""
+    payload = getattr(row, "resume_snapshot_payload", None)
+    if not payload:
+        raise ResumeImportError(_SAVED_RESUME_DATA_ERROR)
+    try:
+        raw = _unseal_private(payload)
+        snapshot = SiteResumeSnapshot.model_validate(raw)
+        if snapshot.content_hash != _snapshot_hash(snapshot):
+            raise ValueError("snapshot hash mismatch")
+        if snapshot.source_site != row.adapter_id:
+            raise ValueError("snapshot site mismatch")
+        if row.grammatical_gender in {"male", "female"}:
+            saved_gender = snapshot.identity.gender
+            if (
+                saved_gender.availability is not FieldAvailability.PRESENT
+                or saved_gender.value != row.grammatical_gender
+            ):
+                raise ValueError("snapshot gender does not match saved preference")
+        source_url = _saved_source_url(row)
+        if not source_url or _sha256(source_url) != row.source_url_hash:
+            raise ValueError("saved URL hash mismatch")
+        if snapshot.source_url_hash != row.source_url_hash:
+            raise ValueError("snapshot URL binding mismatch")
+        if _sha256(snapshot.source_resume_id) != row.resume_id_hash:
+            raise ValueError("snapshot resume binding mismatch")
+        if snapshot.coverage.parse_errors or snapshot.coverage.hidden_fields:
+            raise ValueError("snapshot coverage is incomplete")
+        for field in _iter_source_fields(snapshot):
+            if field.availability in {FieldAvailability.HIDDEN, FieldAvailability.PARSE_ERROR}:
+                raise ValueError("snapshot field is hidden or failed to parse")
+            if field.availability is FieldAvailability.UNSUPPORTED and field.value not in (None, "", []):
+                raise ValueError("snapshot has unsupported data")
+        for path in snapshot.coverage.unsupported_fields:
+            field = _source_field_at_path(snapshot, path)
+            if field is not None and field.value not in (None, "", []):
+                raise ValueError("snapshot coverage has unsupported data")
+        title = snapshot.target.desired_title
+        if title.availability is not FieldAvailability.PRESENT or not str(title.value or "").strip():
+            raise ValueError("snapshot target role is missing")
+        meaningful = bool(
+            snapshot.experience or snapshot.skills or snapshot.projects or snapshot.education
+            or snapshot.languages or snapshot.courses or snapshot.certifications
+            or snapshot.awards or snapshot.portfolio or snapshot.additional_sections
+        ) or snapshot.about.availability is FieldAvailability.PRESENT
+        if not meaningful:
+            raise ValueError("snapshot professional sections are missing")
+        public_snapshot, _ = _redacted_snapshot(snapshot)
+        if public_snapshot.content_hash != row.content_hash:
+            raise ValueError("saved projection hash mismatch")
+        return snapshot
+    except ResumeImportError as exc:
+        # Preserve the actionable contract without exposing decryption/schema
+        # details or any value from the resume.
+        if _SAVED_RESUME_DATA_ERROR in str(exc):
+            raise
+        raise ResumeImportError(_SAVED_RESUME_DATA_ERROR) from exc
+    except Exception as exc:
+        raise ResumeImportError(_SAVED_RESUME_DATA_ERROR) from exc
+
+
+def load_saved_resume_data(row: SavedResumeSource) -> SiteResumeSnapshot:
+    """Load a complete saved HH/Zarplata snapshot using local data only."""
+    if not uses_saved_resume_data(row.adapter_id):
+        raise ResumeImportError(_SAVED_RESUME_DATA_ERROR)
+    return _validated_saved_snapshot(row)
+
+
+def _store_saved_snapshot(
+    row: SavedResumeSource,
+    snapshot: SiteResumeSnapshot,
+    *,
+    update_saved_at: bool = True,
+) -> None:
+    """Atomically prepare the full sealed copy and its redacted projection."""
+    snapshot = _apply_saved_gender(snapshot, row.grammatical_gender)
+    snapshot = snapshot.model_copy(update={"content_hash": _snapshot_hash(snapshot)})
+    public_snapshot, _ = _redacted_snapshot(snapshot)
+    row.resume_snapshot_payload = _seal_private(snapshot.model_dump(mode="json"))
+    if update_saved_at:
+        row.resume_data_saved_at = datetime.now(timezone.utc)
+    row.content_hash = public_snapshot.content_hash
+
+
 def _snapshot_fields_found(snapshot: SiteResumeSnapshot) -> dict[str, bool]:
     return {
         "full_name": snapshot.identity.full_name.availability == FieldAvailability.PRESENT,
@@ -702,7 +886,8 @@ async def extract_resume(
             extractor = module_extractor
         else:
             raise ResumeImportUnavailable("Для выбранного сайта импорт резюме пока недоступен")
-    try:
+    async def _read() -> Any:
+        nonlocal page, executor
         # Site extractors may use a browser page (preferred) or implement a
         # complete URL-based flow for tests/controlled browser adapters.
         if page is None:
@@ -710,9 +895,16 @@ async def extract_resume(
             # client or hidden site endpoint is used for resume extraction.
             from backend.browser.executor import BrowserExecutor
 
+            allowed_domains = set(getattr(adapter, "allowed_domains", ()))
+            canonical_host = urlparse(canonical).hostname
+            if canonical_host:
+                # The host was already validated by the site policy. Include
+                # that exact regional host for the browser route guard without
+                # broadening navigation to arbitrary subdomains.
+                allowed_domains.add(canonical_host)
             executor = BrowserExecutor(
                 adapter_id,
-                tuple(getattr(adapter, "allowed_domains", ())),
+                tuple(sorted(allowed_domains)),
                 headless=True,
                 navigation_hop_limit=8,
             )
@@ -722,11 +914,7 @@ async def extract_resume(
             policy = getattr(module, "POLICY", None)
             if policy is not None:
                 async def module_opener(browser_page, resume_ref):
-                    await browser_page.goto(resume_ref.url, wait_until="domcontentloaded", timeout=60_000)
-                    final_url = getattr(browser_page, "url", resume_ref.url)
-                    if callable(final_url):
-                        final_url = final_url()
-                    policy.validate_final(final_url or resume_ref.url, resume_ref.external_id)
+                    await open_resume_page(browser_page, resume_ref, policy)
                 opener = module_opener
         if opener is not None:
             result = opener(page, ref)
@@ -739,6 +927,12 @@ async def extract_resume(
             result = extractor(canonical)
         if hasattr(result, "__await__"):
             result = await result
+        return result
+
+    try:
+        result = await asyncio.wait_for(_read(), timeout=RESUME_EXTRACT_DEADLINE_SECONDS)
+    except TimeoutError as exc:
+        raise ResumeImportError("Импорт резюме превысил общий лимит времени") from exc
     except ResumeImportError:
         raise
     except Exception as exc:
@@ -746,7 +940,7 @@ async def extract_resume(
     finally:
         if executor is not None:
             with suppress(Exception):
-                await executor.close()
+                await asyncio.wait_for(executor.close(), timeout=RESUME_CLOSE_DEADLINE_SECONDS)
     return _normalize_extracted(result, adapter_id=adapter_id, source_url=canonical, source_ref=ref)
 
 
@@ -842,7 +1036,7 @@ def confirm_saved_resume_source(
     if grammatical_gender is not None and grammatical_gender not in {"male", "female"}:
         raise ResumeImportError("Выберите мужской или женский род")
     try:
-        item, snapshot, source_url = _saved_source_token(db, preview_token, adapter_id)
+        item, public_preview_snapshot, source_url = _saved_source_token(db, preview_token, adapter_id)
         # Preview state may hold the URL directly (legacy rows use the sealed
         # fallback); durable profile rows use the canonical public URL.
         resume_gender = _private_gender_value(item.private_view)
@@ -851,6 +1045,24 @@ def confirm_saved_resume_source(
                 "Выберите мужской или женский род для сохраненного резюме"
             )
         selected_gender = grammatical_gender or resume_gender
+        if uses_saved_resume_data(adapter_id):
+            if not isinstance(item.full_snapshot, dict):
+                raise ResumeImportError("Предпросмотр резюме требует повторного импорта")
+            snapshot = SiteResumeSnapshot.model_validate(item.full_snapshot)
+            if snapshot.content_hash != _snapshot_hash(snapshot):
+                raise ResumeImportError("Предпросмотр резюме требует повторного импорта")
+            if (
+                snapshot.source_site != adapter_id
+                or snapshot.source_url_hash != _sha256(source_url)
+                or _sha256(snapshot.source_resume_id) != _sha256(public_preview_snapshot.source_resume_id)
+            ):
+                raise ResumeImportError("Предпросмотр резюме требует повторного импорта")
+            snapshot = _apply_saved_gender(snapshot, selected_gender)
+            snapshot = snapshot.model_copy(update={"content_hash": _snapshot_hash(snapshot)})
+        else:
+            # Keep the existing HireHi flow: it persists only the redacted
+            # profile projection and relies on a live import when starting.
+            snapshot = public_preview_snapshot
         public_snapshot, _ = _redacted_snapshot(snapshot)
         # ``public_snapshot`` redacts identity/contact values and their
         # repetitions from professional prose.  Reconstruct only the
@@ -861,6 +1073,7 @@ def confirm_saved_resume_source(
             public_snapshot,
             gender_known=selected_gender is not None,
             private_fields_found=_private_fields_found(item.private_view),
+            source_url=source_url,
         )
         row = db.scalar(
             select(SavedResumeSource).where(SavedResumeSource.adapter_id == adapter_id)
@@ -872,6 +1085,11 @@ def confirm_saved_resume_source(
             "source_url_hash": _sha256(source_url),
             "resume_id_hash": _sha256(snapshot.source_resume_id),
             "content_hash": public_snapshot.content_hash,
+            "resume_snapshot_payload": (
+                _seal_private(snapshot.model_dump(mode="json"))
+                if uses_saved_resume_data(adapter_id) else None
+            ),
+            "resume_data_saved_at": datetime.now(timezone.utc) if uses_saved_resume_data(adapter_id) else None,
             "preview": safe_preview,
             "status": SAVED_SOURCE_VALID,
             "checked_at": datetime.now(timezone.utc),
@@ -946,9 +1164,34 @@ def saved_resume_source_record(
         "checked_at": row.checked_at.isoformat() if row.checked_at else None,
         "masked_url": masked_url(),
         "source_url": source_url,
+        "import_url": _safe_import_url(row.adapter_id, source_url),
         "preview": safe_preview(dict(row.preview or {})),
         "changed": bool(row.changed),
     }
+    if uses_saved_resume_data(row.adapter_id):
+        try:
+            _validated_saved_snapshot(row)
+            result.update({
+                "uses_saved_data": True,
+                "resume_data_status": "ready",
+                "resume_data_saved_at": row.resume_data_saved_at.isoformat() if row.resume_data_saved_at else None,
+                "resume_data_error_message": None,
+            })
+        except ResumeImportError:
+            state = "missing" if not getattr(row, "resume_snapshot_payload", None) else "corrupt"
+            result.update({
+                "uses_saved_data": True,
+                "resume_data_status": state,
+                "resume_data_saved_at": row.resume_data_saved_at.isoformat() if row.resume_data_saved_at else None,
+                "resume_data_error_message": _SAVED_RESUME_DATA_ERROR,
+            })
+    else:
+        result.update({
+            "uses_saved_data": False,
+            "resume_data_status": None,
+            "resume_data_saved_at": None,
+            "resume_data_error_message": None,
+        })
     if row.error_code:
         result["error_code"] = row.error_code
         if row.error_code == "unavailable":
@@ -994,6 +1237,7 @@ async def revalidate_saved_resume_source(
         # The user's explicit source preference wins over a missing or changed
         # extractor value and is embedded before all snapshots are persisted.
         fresh = _apply_saved_gender(fresh, row.grammatical_gender)
+        fresh = fresh.model_copy(update={"content_hash": _snapshot_hash(fresh)})
         public_snapshot, _ = _redacted_snapshot(fresh)
         changed = row.content_hash != public_snapshot.content_hash
         row.preview = _saved_source_preview(
@@ -1003,14 +1247,20 @@ async def revalidate_saved_resume_source(
                 or row.grammatical_gender in {"male", "female"}
             ),
             private_fields_found=_snapshot_fields_found(fresh),
+            source_url=_canonical,
         )
         row.content_hash = public_snapshot.content_hash
         row.resume_id_hash = _sha256(fresh.source_resume_id)
+        if uses_saved_resume_data(adapter_id):
+            _store_saved_snapshot(row, fresh)
         row.status = SAVED_SOURCE_CHANGED if changed else SAVED_SOURCE_VALID
         row.changed = changed
         row.checked_at = checked_at
         row.error_code = None
-        db.flush()
+        if uses_saved_resume_data(adapter_id):
+            db.commit()
+        else:
+            db.flush()
         return row, fresh
     except SavedResumeSourceNotFound:
         raise
@@ -1103,7 +1353,21 @@ def update_saved_resume_gender(
     if row is None:
         raise SavedResumeSourceNotFound("Сохраненный источник не найден")
     _saved_source_url(row)
-    row.grammatical_gender = grammatical_gender
+    if uses_saved_resume_data(adapter_id) and row.resume_snapshot_payload:
+        snapshot = _validated_saved_snapshot(row)
+        row.grammatical_gender = grammatical_gender
+        _store_saved_snapshot(row, snapshot, update_saved_at=False)
+        # Keep the privacy-safe preview and its hash aligned with the newly
+        # selected local preference without replacing any resume content.
+        public_snapshot, _ = _redacted_snapshot(_apply_saved_gender(snapshot, grammatical_gender))
+        row.preview = _saved_source_preview(
+            public_snapshot,
+            gender_known=True,
+            private_fields_found=_snapshot_fields_found(snapshot),
+            source_url=_saved_source_url(row),
+        )
+    else:
+        row.grammatical_gender = grammatical_gender
     preview = dict(row.preview or {})
     preview.pop("questions", None)
     preview.pop("grammatical_gender", None)
@@ -1164,107 +1428,3 @@ def delete_snapshot(db: Session, session_id: int) -> bool:
         return False
     db.delete(item)
     return True
-
-
-def _flat_private(private: ResumePrivateView | dict) -> dict[str, str]:
-    if isinstance(private, str):
-        private = _unseal_private(private)
-    data = private.model_dump(mode="json") if isinstance(private, ResumePrivateView) else dict(private or {})
-    identity = data.get("identity", {}) if isinstance(data.get("identity"), dict) else {}
-    contacts = data.get("contacts", {}) if isinstance(data.get("contacts"), dict) else {}
-    result: dict[str, str] = {}
-    for _name, group in (("", identity), ("", contacts)):
-        for key, value in group.items():
-            if isinstance(value, dict) and "value" in value:
-                value = value.get("value")
-            if isinstance(value, list):
-                value = ", ".join(str(item).strip() for item in value if str(item).strip())
-            if value is not None and str(value).strip():
-                result[key.casefold()] = str(value).strip()
-    result.update({"fio": result.get("full_name", ""), "name": result.get("full_name", "")})
-    return result
-
-
-def redact_private_text(text: str, private: ResumePrivateView | dict | None = None) -> str:
-    """Remove private literals before arbitrary text enters a model payload."""
-    values: list[str] = []
-    if private is not None:
-        values.extend(value for value in _flat_private(private).values() if len(value) >= 2)
-    result = str(text or "")
-    for value in sorted({item.casefold() for item in values}, key=len, reverse=True):
-        result = re.sub(re.escape(value), "[private value omitted]", result, flags=re.I)
-    result = _EMAIL.sub("[email omitted]", result)
-    result = _PHONE.sub("[phone omitted]", result)
-    return _DIRECT_URL.sub("[link omitted]", result)
-
-
-def render_local_private(text: str, private: ResumePrivateView | dict) -> str:
-    """Replace private placeholders locally and reject all leftovers.
-
-    Missing values remove the marker and adjacent list punctuation.  Control
-    and zero-width format characters are removed before the final invariant,
-    so neither template syntax nor service markers can reach a form or letter.
-    """
-    values = _flat_private(private)
-    aliases = {
-        "full_name": "full_name", "фио": "full_name", "имя": "full_name",
-        "phone": "phone", "телефон": "phone", "email": "email", "почта": "email",
-        "messengers": "messengers", "мессенджеры": "messengers",
-    }
-    pattern = re.compile(r"\{\{\s*([\wа-яё.-]+)\s*\}\}|\[\s*([^\]\r\n]{1,100})\s*\]")
-
-    def marker_key(match: re.Match[str]) -> str:
-        key = (match.group(1) or match.group(2) or "").casefold().strip()
-        return aliases.get(key, key)
-
-    def is_contact_line(line: str) -> bool:
-        """Identify a whole contact/signature line, without touching prose."""
-        plain = pattern.sub("", line).casefold()
-        return bool(re.search(
-            r"(?:\b(?:телефон|phone|мобильн\w*|email|e[- ]?mail|почт\w*|"
-            r"мессенджер\w*|messenger\w*|telegram|whatsapp|телеграм)\b|"
-            r"(?:^|\s)(?:фио|full\s+name|с\s+уважением)(?:\s|:|,|$))",
-            plain,
-        ))
-
-    # Drop an entire contact/signature line when its value is unavailable.
-    # A generic prose line keeps its surrounding text (for example,
-    # ``Здравствуйте, {{full_name}}`` becomes ``Здравствуйте,``).
-    prepared_lines: list[str] = []
-    for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        markers = list(pattern.finditer(line))
-        if markers and is_contact_line(line) and any(marker_key(marker) not in values for marker in markers):
-            continue
-        prepared_lines.append(line)
-
-    def replace(match: re.Match[str]) -> str:
-        return values.get(marker_key(match), "")
-
-    rendered = pattern.sub(replace, "\n".join(prepared_lines))
-    # Collapse malformed/nested bracket markers as well (e.g. ``[[email]]``)
-    # before the generic marker scrubber can leave one delimiter behind.
-    rendered = re.sub(r"\[+[^\]\r\n]*\]+", "", rendered)
-    rendered = re.sub(r"\{+[^}\r\n]*\}+", "", rendered)
-    # Fail closed for unmatched service-marker openers too.  The normal
-    # marker regex intentionally requires a closing delimiter, so malformed
-    # input must be scrubbed separately rather than reaching a form/report.
-    rendered = re.sub(r"\{\{[^{}\r\n]*(?:\}\}|$)", "", rendered, flags=re.MULTILINE)
-    rendered = re.sub(r"\[\[[^\[\]\r\n]*(?:\]\]|$)", "", rendered, flags=re.MULTILINE)
-    rendered = re.sub(r"<%[^<>\r\n]*(?:%>|$)", "", rendered, flags=re.MULTILINE)
-    rendered = re.sub(r"\$\{[^{}\r\n]*(?:\}|$)", "", rendered, flags=re.MULTILINE)
-    rendered = _MARKER.sub("", rendered)
-    rendered = _CONTROL.sub("", rendered)
-    rendered = "".join(char for char in rendered if unicodedata.category(char) != "Cf" or char in "\n\t")
-    # A missing placeholder must not leave an empty bullet or dangling colon.
-    rendered = re.sub(r"(?m)^\s*[-*•]\s*$\n?", "", rendered)
-    rendered = re.sub(r"[ \t]{2,}", " ", rendered)
-    rendered = re.sub(r"[ \t]+([,:;])", r"\1", rendered)
-    rendered = rendered.replace("[", "").replace("]", "")
-    rendered = "\n".join(line.rstrip() for line in rendered.splitlines()).strip()
-    if _MARKER.search(rendered) or any(token in rendered for token in ("{{", "}}", "[[", "]]")):
-        raise ResumeImportError("Не удалось безопасно собрать текст письма или анкеты")
-    return rendered
-
-
-# Explicit aliases make the security boundary discoverable to callers.
-render_private_placeholders = render_local_private

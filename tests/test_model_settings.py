@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -15,9 +16,12 @@ from sqlalchemy.pool import StaticPool
 
 from backend.api import router as api
 from backend.intelligence import gateway, model_config
+from backend.intelligence.hirehi_category import JobSummary
+from backend.intelligence.model_broker import ModelRequestClient, ModelVersions, SubmitRequest
 from backend.persistence import crypto
 from backend.persistence.database import Base
-from backend.persistence.models import AIModelSettings
+from backend.persistence.model_request_models import ModelGenerationHealth, ModelRequest
+from backend.persistence.models import AIModelSettings, JobSession
 
 
 @pytest.mark.parametrize("steps", [
@@ -94,7 +98,7 @@ def test_probe_rejects_invalid_json_after_fallback(monkeypatch):
 
     transport = httpx.AsyncClient(transport=httpx.MockTransport(handle))
     monkeypatch.setattr(gateway, "model_http_client", lambda *args: transport)
-    with pytest.raises(gateway.ModelUnavailable):
+    with pytest.raises(gateway.ModelPermanentError):
         asyncio.run(REAL_CHECK_CONNECTION(
             gateway.ModelGateway(provider="openai_compat"), "http://127.0.0.1:8045/v1", "", "model",
         ))
@@ -173,6 +177,136 @@ def test_get_settings_defaults_never_exposes_secret(app_db, monkeypatch):
     assert body["model"] == "default-model"
     assert "encrypted_api_key" not in body and "secret-value" not in response.text
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_model_status_keeps_catalog_and_real_generation_health_separate(
+    app_db, monkeypatch
+):
+    app, sessions = app_db
+    now = datetime.now(timezone.utc)
+    with sessions() as db:
+        session = JobSession(adapter_id="hh", status="RUNNING", counters={})
+        db.add(session)
+        db.commit()
+        session_id = session.id
+
+    client = ModelRequestClient(sessions)
+    versions = ModelVersions(
+        model_id="fixture-model",
+        model_version="1",
+        prompt_version="1",
+        schema_version="1",
+        parser_version="1",
+    )
+    success = client.submit(
+        SubmitRequest(
+            session_id=session_id,
+            site_id="hh",
+            stage="summary",
+            role="job_summary",
+            payload={"job": {"title": "safe"}},
+            schema=JobSummary,
+            versions=versions,
+        )
+    )
+    failure = client.submit(
+        SubmitRequest(
+            session_id=session_id,
+            site_id="hh",
+            stage="evaluation",
+            role="job_summary",
+            payload={"job": {"title": "safe-2"}},
+            schema=JobSummary,
+            versions=versions,
+        )
+    )
+    with sessions() as db:
+        success_row = db.get(ModelRequest, success.request_id)
+        success_row.status = "completed"
+        success_row.canonical_output = '{"summary":"ok"}'
+        success_row.completed_at = now - timedelta(seconds=5)
+        failure_row = db.get(ModelRequest, failure.request_id)
+        failure_row.status = "failed"
+        failure_row.completed_at = now
+        failure_row.error_code = "provider-secret-must-not-be-returned"
+        db.add(
+            ModelGenerationHealth(
+                id=1,
+                success_count=3,
+                failure_count=2,
+                last_success_request_id=success.request_id,
+                last_success_at=now - timedelta(seconds=5),
+                last_failure_request_id=failure.request_id,
+                last_failure_at=now,
+                last_error_code="provider-secret-must-not-be-returned",
+            )
+        )
+        db.commit()
+
+    async def catalog(_self):
+        return {
+            "connected": True,
+            "model_available": True,
+            "provider": "fixture",
+            "model": "fixture-model",
+            "message": "Каталог доступен",
+        }
+
+    monkeypatch.setattr(api.ModelGateway, "status", catalog)
+    response = TestClient(app).get("/api/model/status")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert body["connected"] is True
+    assert body["model_available"] is True
+    assert body["message"] == "Каталог доступен"
+    assert body["generation_health"] == {
+        "healthy": False,
+        "success_count": 3,
+        "failure_count": 2,
+        "running": 0,
+        "queued": 0,
+        "last_success": {
+            "diagnostic_id": success.diagnostic_id,
+            "at": (now - timedelta(seconds=5)).isoformat(),
+        },
+        "last_failure": {
+            "diagnostic_id": failure.diagnostic_id,
+            "at": now.isoformat(),
+        },
+    }
+    assert "provider-secret" not in response.text
+    assert success.request_id not in response.text
+    assert failure.request_id not in response.text
+
+
+def test_model_status_reports_unknown_generation_without_inferring_from_catalog(
+    app_db, monkeypatch
+):
+    app, _ = app_db
+
+    async def catalog(_self):
+        return {
+            "connected": True,
+            "model_available": True,
+            "provider": "fixture",
+            "model": "fixture-model",
+        }
+
+    monkeypatch.setattr(api.ModelGateway, "status", catalog)
+    response = TestClient(app).get("/api/model/status")
+
+    assert response.status_code == 200
+    assert response.json()["generation_health"] == {
+        "healthy": None,
+        "success_count": 0,
+        "failure_count": 0,
+        "running": 0,
+        "queued": 0,
+        "last_success": None,
+        "last_failure": None,
+    }
 
 
 def test_list_models_uses_supplied_bearer_and_hides_key(app_db, monkeypatch):

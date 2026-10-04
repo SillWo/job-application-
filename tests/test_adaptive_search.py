@@ -120,7 +120,7 @@ async def test_failing_source_does_not_advance_or_block_healthy_source():
 
 
 @pytest.mark.asyncio
-async def test_repeated_page_is_not_exhaustion_and_static_epoch_terminates():
+async def test_repeated_page_is_not_exhaustion_and_static_epoch_schedules_refresh():
     search, adapter, page = await controller()
     broad = next(s for s in search.scheduler.sources.values() if s.kind == "coverage")
     adapter.batches[(broad.spec["url"], 0)] = {"refs": refs(3), "terminal": False}
@@ -129,11 +129,100 @@ async def test_repeated_page_is_not_exhaustion_and_static_epoch_terminates():
     await search.collect_more_job_refs(page)
     assert broad.page == 1 and not broad.exhausted
     assert not search.search_exhausted
-    # A separate finite epoch confirms empty sources, without polling forever.
+    # An empty epoch is a source boundary, not a completed HH session.
     search, _, page = await controller()
     for _ in range(4):
         await search.collect_more_job_refs(page)
     assert search.search_exhausted
+    assert search.next_epoch_refresh_at is not None
+    assert search.next_retry_delay() > 0
+
+
+@pytest.mark.asyncio
+async def test_historical_duplicate_page_advances_to_later_novel_page():
+    search, adapter, page = await controller()
+    broad = next(s for s in search.scheduler.sources.values() if s.kind == "coverage")
+    for source in search.scheduler.sources.values():
+        if source is not broad:
+            source.exhausted = True
+    adapter.batches[(broad.spec["url"], 0)] = {"refs": refs(1), "terminal": False}
+    adapter.batches[(broad.spec["url"], 1)] = {"refs": refs(3), "terminal": True}
+    assert await search.collect_more_job_refs(page) == []
+    assert broad.page == 1 and not search.search_exhausted
+    assert [r.external_id for r in await search.collect_more_job_refs(page)] == ["3"]
+
+
+@pytest.mark.asyncio
+async def test_empty_nonterminal_page_keeps_source_cursor_open():
+    search, adapter, page = await controller()
+    broad = next(s for s in search.scheduler.sources.values() if s.kind == "coverage")
+    for source in search.scheduler.sources.values():
+        if source is not broad:
+            source.exhausted = True
+    adapter.batches[(broad.spec["url"], 0)] = {"refs": [], "terminal": False}
+    adapter.batches[(broad.spec["url"], 1)] = {"refs": refs(9), "terminal": True}
+    assert await search.collect_more_job_refs(page) == []
+    assert broad.page == 1 and not broad.exhausted and not search.search_exhausted
+    assert [r.external_id for r in await search.collect_more_job_refs(page)] == ["9"]
+
+
+@pytest.mark.asyncio
+async def test_epoch_refresh_is_paced_and_checkpointed(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr("backend.orchestrator.adaptive_search.time.time", lambda: now[0])
+    search, adapter, page = await controller()
+    for _ in range(4):
+        await search.collect_more_job_refs(page)
+    target = search.next_epoch_refresh_at
+    checkpoint = json.loads(json.dumps(search.search_checkpoint()))
+    restored = AdaptiveSearch(adapter)
+    restored.restore_search_checkpoint(checkpoint)
+    assert restored.search_exhausted
+    assert restored.seen == search.seen
+    assert restored.next_epoch_refresh_at == target
+    assert restored.next_retry_delay() == target - now[0]
+    assert await restored.collect_more_job_refs(page) == []
+    now[0] = target
+    for source in restored.scheduler.sources.values():
+        adapter.batches[(source.spec["url"], 0)] = {"refs": refs(12), "terminal": False}
+    assert [r.external_id for r in await restored.collect_more_job_refs(page)] == ["12"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_control_exceptions_propagate_from_page_reads():
+    from backend.orchestrator.recovery import AuthenticationPending, CaptchaRequired
+
+    search, adapter, page = await controller()
+    broad = next(s for s in search.scheduler.sources.values() if s.kind == "coverage")
+    adapter.batches[(broad.spec["url"], 0)] = CaptchaRequired("captcha")
+    with pytest.raises(CaptchaRequired):
+        await search.collect_more_job_refs(page)
+    adapter.batches[(broad.spec["url"], 0)] = AuthenticationPending("login")
+    with pytest.raises(AuthenticationPending):
+        await search.collect_more_job_refs(page)
+
+
+@pytest.mark.asyncio
+async def test_source_cooldown_does_not_consume_epoch_refresh_backoff(monkeypatch):
+    now = [2000.0]
+    monkeypatch.setattr("backend.orchestrator.adaptive_search.time.time", lambda: now[0])
+    search, adapter, page = await controller()
+    broad = next(s for s in search.scheduler.sources.values() if s.kind == "coverage")
+    for source in search.scheduler.sources.values():
+        if source is not broad:
+            source.exhausted = True
+    adapter.batches[(broad.spec["url"], 0)] = TimeoutError("fixture")
+    assert await search.collect_more_job_refs(page) == []
+    assert await search.collect_more_job_refs(page) == []
+    assert search.next_source_retry_at == now[0] + 5
+    assert search.next_epoch_refresh_at is None
+    now[0] += 5
+    adapter.batches[(broad.spec["url"], 0)] = {"refs": [], "terminal": True}
+    assert await search.collect_more_job_refs(page) == []
+    assert broad.exhausted and not search.search_exhausted
+    assert await search.collect_more_job_refs(page) == []
+    assert search.search_exhausted
+    assert search.next_epoch_refresh_at == now[0] + 5
 
 
 @pytest.mark.asyncio

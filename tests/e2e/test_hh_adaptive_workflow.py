@@ -21,7 +21,7 @@ from backend.services.resume_session import _normalize_extracted, persist_sessio
 @pytest.mark.e2e
 @pytest.mark.asyncio
 async def test_adaptive_workflow_discovers_ui_channels_without_duplicate_submissions(tmp_path, monkeypatch):
-    requests, submitted = [], []
+    requests, submitted, cover_letters = [], [], []
     account = '<a data-qa="mainmenu_applicantProfile">Account</a><a href="/applicant/resumes">Resumes</a>'
 
     def link(ident):
@@ -76,9 +76,25 @@ async def test_adaptive_workflow_discovers_ui_channels_without_duplicate_submiss
             self.wfile.write(data)
 
         def do_POST(self):
-            ident = self.path.rsplit("/", 1)[1]
-            submitted.append(ident)
-            data = (account + '<a data-qa="vacancy-response-link-view-topic">Отклик отправлен</a>').encode("utf-8")
+            route, ident = self.path.rsplit("/", 1)
+            values = parse_qs(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode("utf-8"))
+            if route == "/apply":
+                submitted.append(ident)
+                body = (account + '<a data-qa="vacancy-response-link-view-topic">Отклик отправлен</a>'
+                        '<button data-qa="responded-success-attach-cover-letter">Приложить сопроводительное письмо</button>'
+                        '<script>document.querySelector("[data-qa=responded-success-attach-cover-letter]").onclick=()=>{'
+                        'document.body.insertAdjacentHTML("beforeend",'
+                        '`<div role="dialog"><form method="post" action="/letter/' + ident + '">'
+                        '<textarea data-qa="vacancy-response-popup-form-letter-input" name="text"></textarea>'
+                        '<button data-qa="vacancy-response-letter-submit">Отправить</button>'
+                        '</form></div>`);}</script>')
+            elif route == "/letter":
+                cover_letters.append((ident, values.get("text", [""])[0]))
+                body = account + '<div data-qa="vacancy-response-popup-success">Сопроводительное письмо отправлено</div>'
+            else:
+                self.send_error(404)
+                return
+            data = body.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -102,7 +118,9 @@ async def test_adaptive_workflow_discovers_ui_channels_without_duplicate_submiss
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        item = JobSession(adapter_id="hh", application_limit=None)
+        # HH search now continues through paced refreshes until an explicit
+        # application limit or user Stop ends the session.
+        item = JobSession(adapter_id="hh", application_limit=8)
         db.add(item)
         db.flush()
         persist_session_snapshot(
@@ -153,6 +171,9 @@ async def test_adaptive_workflow_discovers_ui_channels_without_duplicate_submiss
             assert len(list(db.scalars(select(Application)))) == 8
             assert item.counters["submitted"] == 8
         assert len(submitted) == len(set(submitted)) == 8
+        assert len(cover_letters) == 8
+        assert {ident for ident, _ in cover_letters} == set(submitted)
+        assert all(text == "Fixture letter" for _, text in cover_letters)
         assert any("area=1" in url for url in requests)
         assert any("resume=second" in url for url in requests)
         assert "/employer/55" in requests

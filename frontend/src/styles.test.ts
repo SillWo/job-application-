@@ -177,6 +177,9 @@ test('model settings fields use the shared platform field treatment', () => {
   expect(css).toContain('.model-settingsinput,.model-settingsselect{width:100%;box-sizing:border-box;min-height:var(--field-height);border:1pxsolidtransparent;border-radius:var(--radius-control);')
   expect(css).toContain('.model-settingsinput::placeholder{color:var(--muted);opacity:1;}')
   expect(css).toContain('.model-settingsinput:focus,.model-settingsselect:focus{border-color:var(--ink);background:var(--paper);box-shadow:var(--focus-ring);}')
+  expect(css).toContain('.model-health-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));')
+  expect(css).toContain('.model-health-item+.model-health-item{padding-right:0;padding-left:24px;border-left:1pxsolidvar(--line);}')
+  expect(css).toContain('.model-health-actions{display:flex;align-items:center;justify-content:space-between;')
 })
 
 test('legacy profile save bar is removed from the source flow', () => {
@@ -213,7 +216,7 @@ test('sonner close control is integrated into the toast', () => {
 
 test('overview status strip reserves the first block for model readiness', () => {
   expect(css).toContain('.overview-status-strip')
-  expect(css).toContain('grid-template-columns:repeat(4,minmax(0,1fr))')
+  expect(css).toContain('grid-template-columns:repeat(5,minmax(0,1fr))')
   expect(css).not.toContain('.preview-model-link')
   expect(css).not.toContain('--surface-2')
   expect(css).not.toContain('--text-muted')

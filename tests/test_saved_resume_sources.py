@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 import backend.services.resume_session as resume_service
 from backend.main import app
 from backend.persistence.database import Base, get_db
+from backend.persistence.execution_models import SessionExecution
 from backend.persistence.models import (
     JobSession,
     ResumePreviewToken,
@@ -190,6 +191,26 @@ def api_client():
         client.close()
 
 
+def _fake_supervisor(monkeypatch):
+    starts = []
+    supervisor = type(
+        "Supervisor", (),
+        {"start": lambda _self, **kwargs: starts.append(kwargs) or object()},
+    )()
+    monkeypatch.setattr("backend.api.router.runtime_supervisor", supervisor)
+    return starts
+
+
+async def _worker_import_once(engine, session_id):
+    """Return the immutable launch copy that the worker consumes."""
+    with Session(engine) as db:
+        snapshot = db.scalar(
+            select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == session_id)
+        )
+        assert snapshot is not None
+        return resume_service.SiteResumeSnapshot.model_validate(snapshot.full_snapshot)
+
+
 def test_api_confirm_validates_consent_and_token_without_consuming(api_client):
     client, engine = api_client
     with Session(engine) as db:
@@ -295,7 +316,7 @@ def test_api_refresh_get_delete_contract_and_fresh_token(monkeypatch, api_client
     response = client.post("/api/resume-sources/hh/refresh")
     assert response.status_code == 200
     assert response.json()["status"] == "changed"
-    assert response.json().get("preview_token")
+    assert response.json().get("preview_token") is None
 
     async def unavailable_read(*args, **kwargs):
         raise RuntimeError("untrusted page content")
@@ -316,8 +337,9 @@ def test_api_refresh_get_delete_contract_and_fresh_token(monkeypatch, api_client
     assert client.post("/api/resume-sources/hh/refresh").status_code == 404
 
 
-def test_session_create_revalidates_saved_source_without_consuming_preview_token(monkeypatch, api_client):
+def test_session_create_uses_saved_snapshot_without_revalidating_or_consuming_token(monkeypatch, api_client):
     client, engine = api_client
+    starts = _fake_supervisor(monkeypatch)
     with Session(engine) as db:
         token = issue_preview_token(
             db, "hh", _snapshot(), source_url="https://hh.ru/resume/abc123"
@@ -329,29 +351,27 @@ def test_session_create_revalidates_saved_source_without_consuming_preview_token
         "validate_adapter_resume_url",
         lambda adapter_id, url: (url, {"external_id": "abc123"}),
     )
-    reads = 0
-
-    async def read_current(*args, **kwargs):
-        nonlocal reads
-        reads += 1
-        return _snapshot()
-
-    monkeypatch.setattr(resume_service, "extract_resume", read_current)
+    monkeypatch.setattr(resume_service, "extract_resume", lambda *_a, **_k: pytest.fail("launch opened site"))
     response = client.post(
         "/api/sessions",
         json={
             "adapter_id": "hh",
+            "auto_start": True,
         },
     )
-    assert response.status_code == 200, response.text
-    assert reads == 1
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "PREPARING"
     session_id = response.json()["id"]
-    monkeypatch.setattr("backend.api.router.workflow_manager.launch", lambda _id: True)
-    started = client.post(f"/api/sessions/{session_id}/start")
-    assert started.status_code == 200, started.text
-    assert reads == 1
-    stopped = client.post(f"/api/sessions/{session_id}/stop")
-    assert stopped.status_code == 200, stopped.text
+    assert starts == [{"site_id": "hh", "session_id": session_id}]
+    with Session(engine) as db:
+        execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
+        assert execution is not None and execution.start_requested is True
+        launch_snapshot = db.scalar(select(SessionResumeSnapshot).where(
+            SessionResumeSnapshot.session_id == session_id
+        ))
+        assert launch_snapshot is not None
+        assert launch_snapshot.full_snapshot["target"]["desired_title"]["value"] == "Python engineer"
+    asyncio.run(_worker_import_once(engine, session_id))
     with Session(engine) as db:
         item = db.scalar(select(JobSession).order_by(JobSession.id.desc()))
         assert item is not None
@@ -361,8 +381,9 @@ def test_session_create_revalidates_saved_source_without_consuming_preview_token
         ).consumed_at is None
 
 
-def test_session_create_uses_saved_gender_when_fresh_resume_has_none(monkeypatch, api_client):
+def test_session_snapshot_uses_saved_gender_when_source_has_none(monkeypatch, api_client):
     client, engine = api_client
+    _fake_supervisor(monkeypatch)
     with Session(engine) as db:
         token = issue_preview_token(
             db, "hh", _snapshot_without_gender(), source_url="https://hh.ru/resume/abc123"
@@ -374,18 +395,11 @@ def test_session_create_uses_saved_gender_when_fresh_resume_has_none(monkeypatch
             consent=True,
             grammatical_gender="male",
         )
-    monkeypatch.setattr(
-        resume_service,
-        "validate_adapter_resume_url",
-        lambda adapter_id, url: (url, {"external_id": "abc123"}),
-    )
-
-    async def read_current(*args, **kwargs):
-        return _snapshot_without_gender()
-
-    monkeypatch.setattr(resume_service, "extract_resume", read_current)
+    monkeypatch.setattr(resume_service, "extract_resume", lambda *_a, **_k: pytest.fail("launch opened site"))
     response = client.post("/api/sessions", json={"adapter_id": "hh"})
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "PREPARING"
+    assert asyncio.run(_worker_import_once(engine, response.json()["id"])).identity.gender.value == "male"
     with Session(engine) as db:
         item = db.get(JobSession, response.json()["id"])
         assert item is not None
@@ -393,8 +407,9 @@ def test_session_create_uses_saved_gender_when_fresh_resume_has_none(monkeypatch
         assert snapshot.full_snapshot["identity"]["gender"]["value"] == "male"
 
 
-def test_session_create_prefers_saved_gender_over_fresh_resume(monkeypatch, api_client):
+def test_session_snapshot_is_stable_when_source_gender_changes(monkeypatch, api_client):
     client, engine = api_client
+    _fake_supervisor(monkeypatch)
     with Session(engine) as db:
         token = issue_preview_token(
             db, "hh", _snapshot_without_gender(), source_url="https://hh.ru/resume/abc123"
@@ -406,18 +421,11 @@ def test_session_create_prefers_saved_gender_over_fresh_resume(monkeypatch, api_
             consent=True,
             grammatical_gender="male",
         )
-    monkeypatch.setattr(
-        resume_service,
-        "validate_adapter_resume_url",
-        lambda adapter_id, url: (url, {"external_id": "abc123"}),
-    )
-
-    async def read_current(*args, **kwargs):
-        return _snapshot()  # The site now publishes a conflicting female value.
-
-    monkeypatch.setattr(resume_service, "extract_resume", read_current)
+    monkeypatch.setattr(resume_service, "extract_resume", lambda *_a, **_k: pytest.fail("launch opened site"))
     response = client.post("/api/sessions", json={"adapter_id": "hh"})
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "PREPARING"
+    assert asyncio.run(_worker_import_once(engine, response.json()["id"])).identity.gender.value == "male"
     with Session(engine) as db:
         item = db.get(JobSession, response.json()["id"])
         assert item is not None

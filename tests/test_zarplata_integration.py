@@ -22,7 +22,7 @@ class _DB:
 
 @pytest.mark.asyncio
 async def test_open_browser_uses_zarplata_target_and_message(monkeypatch):
-    item = SimpleNamespace(id=1, adapter_id="zarplata")
+    item = SimpleNamespace(id=1, adapter_id="zarplata", status="STOPPED")
     adapter = SimpleNamespace(site_id="zarplata", allowed_domains=("zarplata.ru",), display_name="Zarplata.ru")
     calls = []
 
@@ -43,13 +43,14 @@ async def test_open_browser_uses_zarplata_target_and_message(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_login_status_is_read_only_and_sanitizes_url(monkeypatch):
-    item = SimpleNamespace(id=1, adapter_id="zarplata")
+    item = SimpleNamespace(id=1, adapter_id="zarplata", status="STOPPED")
     page = SimpleNamespace(
         url="https://krasnoyarsk.zarplata.ru/applicant/resumes?token=secret#section"
     )
     executor = SimpleNamespace(page=page, validate_navigation_url=lambda url: url)
 
     class Adapter:
+        site_id = "zarplata"
         display_name = "Zarplata.ru"
         allowed_domains = ("zarplata.ru", "krasnoyarsk.zarplata.ru")
 
@@ -59,10 +60,10 @@ async def test_login_status_is_read_only_and_sanitizes_url(monkeypatch):
 
     monkeypatch.setattr(router, "get_browser", lambda _session_id: executor)
     monkeypatch.setattr(router.adapter_registry, "get", lambda _adapter_id: Adapter())
-    monkeypatch.setattr(
-        router.workflow_manager,
-        "launch",
-        lambda _session_id: pytest.fail("read-only login status launched workflow"),
+    monkeypatch.setitem(
+        router.__dict__,
+        "workflow_manager",
+        SimpleNamespace(launch=lambda _session_id: pytest.fail("read-only login status launched workflow")),
     )
 
     result = await router.session_browser_login_status(1, _DB(item))
@@ -76,9 +77,10 @@ async def test_login_status_is_read_only_and_sanitizes_url(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_login_status_hides_external_page_url(monkeypatch):
-    item = SimpleNamespace(id=1, adapter_id="zarplata")
+    item = SimpleNamespace(id=1, adapter_id="zarplata", status="STOPPED")
     executor = SimpleNamespace(page=SimpleNamespace(url="https://evil.example/path?x=1"))
     adapter = SimpleNamespace(
+        site_id="zarplata",
         display_name="Zarplata.ru",
         allowed_domains=("zarplata.ru",),
         get_login_state=lambda _page: _async_login(False),
@@ -94,8 +96,8 @@ async def test_login_status_hides_external_page_url(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_login_status_requires_open_browser(monkeypatch):
-    item = SimpleNamespace(id=1, adapter_id="zarplata")
-    adapter = SimpleNamespace(display_name="Zarplata.ru")
+    item = SimpleNamespace(id=1, adapter_id="zarplata", status="STOPPED")
+    adapter = SimpleNamespace(site_id="zarplata", display_name="Zarplata.ru")
     monkeypatch.setattr(router, "get_browser", lambda _session_id: None)
     monkeypatch.setattr(router.adapter_registry, "get", lambda _adapter_id: adapter)
 

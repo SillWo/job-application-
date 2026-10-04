@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from backend.intelligence import gateway as gateway_module
 from backend.intelligence.gateway import (
     ModelGateway,
+    ModelPermanentError,
     ModelUnavailable,
     _resume_analysis_missing_fields,
     _safe_api_error_text,
@@ -148,7 +149,7 @@ async def test_resume_analyst_repairs_wrappers_and_returns_valid_analysis(monkey
 
 
 @pytest.mark.asyncio
-async def test_resume_analyst_four_invalid_responses_raise_model_unavailable(monkeypatch):
+async def test_resume_analyst_four_invalid_responses_are_terminal(monkeypatch):
     completions = _FakeCompletions([_response({"analysis": {}})] * 4)
     monkeypatch.setattr(gateway_module, "AsyncOpenAI", lambda **_: _FakeClient(completions))
     saved = SimpleNamespace(
@@ -159,7 +160,7 @@ async def test_resume_analyst_four_invalid_responses_raise_model_unavailable(mon
     monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
     monkeypatch.setattr(gateway_module, "decrypt_secret", lambda _: "test-key")
 
-    with pytest.raises(ModelUnavailable, match="некорректный JSON"):
+    with pytest.raises(ModelPermanentError, match="некорректный JSON"):
         await ModelGateway(provider="openai_compat").structured(
             "resume_analyst", {"job": {}, "resumes": []}, ResumeAnalysis
         )
@@ -222,7 +223,7 @@ async def test_resume_analyst_repairs_truncated_preference_flags(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resume_analyst_preference_flag_repair_exhaustion_is_unavailable(monkeypatch):
+async def test_resume_analyst_preference_flag_repair_exhaustion_is_terminal(monkeypatch):
     payload = _preference_payload()
     invalid = _analysis_with_flags([{"flag_id": "red-1", "matched": True}])
     completions = _FakeCompletions([_response(invalid)] * 4)
@@ -233,7 +234,7 @@ async def test_resume_analyst_preference_flag_repair_exhaustion_is_unavailable(m
     monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
     monkeypatch.setattr(gateway_module, "decrypt_secret", lambda _: "test-key")
 
-    with pytest.raises(ModelUnavailable, match="некорректный JSON"):
+    with pytest.raises(ModelPermanentError, match="некорректный JSON"):
         await ModelGateway(provider="openai_compat").structured(
             "resume_analyst", payload, ResumeAnalysis,
         )
@@ -296,7 +297,7 @@ async def test_structured_empty_choices_becomes_model_unavailable(monkeypatch):
     monkeypatch.setattr(ModelGateway, "_saved_config", staticmethod(lambda: saved))
     monkeypatch.setattr(gateway_module, "decrypt_secret", lambda _: "test-key")
 
-    with pytest.raises(ModelUnavailable, match="неожиданной структуры"):
+    with pytest.raises(ModelPermanentError, match="неожиданной структуры"):
         await ModelGateway(provider="openai_compat").structured(
             "job_summary", {"job": {"title": "Test"}}, JobSummary
         )

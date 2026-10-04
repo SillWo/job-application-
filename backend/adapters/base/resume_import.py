@@ -10,10 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import unquote, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
 
 from backend.adapters.base.protocol import (
     FieldAvailability,
@@ -27,12 +26,60 @@ class ResumeURLPolicy:
     """Strict URL policy shared by the three public resume pages."""
 
     def __init__(self, site_id: str, base_domain: str, path_pattern: str, id_pattern: str,
-                 host_pattern: str | None = None) -> None:
+                 host_pattern: str | None = None, *, requires_print: bool | None = None,
+                 redirect_host_group: set[str] | frozenset[str] | tuple[str, ...] | None = None) -> None:
         self.site_id = site_id
         self.base_domain = base_domain
         self.path_re = re.compile(path_pattern)
         self.id_re = re.compile(id_pattern)
         self.host_re = re.compile(host_pattern or rf"^(?:www\.)?{re.escape(base_domain)}$", re.I)
+        self.redirect_host_group = frozenset(
+            host.casefold().rstrip(".") for host in (redirect_host_group or ())
+        )
+        # HH and Zarplata expose a distinct public print layout.  HireHi's
+        # public page is already the canonical layout and rejects ``print``.
+        self.requires_print = site_id in {"hh", "zarplata"} if requires_print is None else requires_print
+
+    def _validate_query(self, parsed) -> tuple[bool, list[tuple[str, str]]]:
+        if re.search(r"%(?![0-9A-Fa-f]{2})", parsed.query):
+            raise ValueError("Ссылка на резюме содержит некорректное URL-кодирование")
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        print_values: list[str] = []
+        for key, value in pairs:
+            if key == "print":
+                print_values.append(value)
+                continue
+            folded = key.casefold()
+            if folded.startswith("utm_") or folded in {"from", "hhtmfrom"}:
+                continue
+            raise ValueError("Ссылка на резюме содержит недопустимые параметры")
+        if len(print_values) > 1:
+            raise ValueError("Параметр print в ссылке на резюме не должен дублироваться")
+        if print_values and print_values[0] != "true":
+            raise ValueError("Параметр print в ссылке на резюме должен быть true")
+        if print_values and not self.requires_print:
+            raise ValueError("Параметр print не поддерживается этим сайтом")
+        return bool(print_values), pairs
+
+    def import_url(self, canonical_url: str) -> str:
+        """Return the browser URL for the site-specific public layout."""
+        if not self.requires_print:
+            return canonical_url
+        parsed = urlparse(canonical_url)
+        return urlunparse(parsed._replace(query="print=true", fragment=""))
+
+    def _same_final_host(self, actual: str | None, expected: str) -> bool:
+        actual = (actual or "").casefold().rstrip(".")
+        expected = expected.casefold().rstrip(".")
+        if actual == expected:
+            return True
+        # Trust only configured aliases; a shared domain suffix would also
+        # accept attacker-controlled hosts such as evil.example.com.
+        return bool(
+            self.redirect_host_group
+            and actual in self.redirect_host_group
+            and expected in self.redirect_host_group
+        )
 
     def validate(self, url: str) -> ResumeRef:
         if not isinstance(url, str) or len(url) > 2048:
@@ -45,7 +92,8 @@ class ResumeURLPolicy:
             raise ValueError("Ссылка на резюме должна вести на разрешённый HTTPS-домен")
         if parsed.username or parsed.password or parsed.port not in (None, 443):
             raise ValueError("Ссылка на резюме не должна содержать учётные данные или порт")
-        if parsed.query or parsed.fragment or parsed.params:
+        _has_print, _pairs = self._validate_query(parsed)
+        if parsed.fragment or parsed.params:
             raise ValueError("Ссылка на резюме не должна содержать параметры")
         if not parsed.path or "%2f" in parsed.path.lower() or "%5c" in parsed.path.lower():
             raise ValueError("Ссылка на резюме имеет недопустимый путь")
@@ -63,13 +111,20 @@ class ResumeURLPolicy:
         external_id = match.group("id")
         if not self.id_re.fullmatch(external_id):
             raise ValueError("Идентификатор резюме имеет недопустимый формат")
-        canonical = urlunparse(("https", host, path, "", "", ""))
-        return ResumeRef(source_site=self.site_id, external_id=external_id, url=canonical)
+        canonical = urlunparse(("https", host, path.rstrip("/"), "", "", ""))
+        return ResumeRef(
+            source_site=self.site_id,
+            external_id=external_id,
+            url=canonical,
+            import_url=self.import_url(canonical),
+        )
 
-    def validate_final(self, url: str, expected_id: str) -> ResumeRef:
+    def validate_final(self, url: str, expected_id: str, expected_host: str | None = None) -> ResumeRef:
         ref = self.validate(url)
         if ref.external_id != expected_id:
             raise ValueError("Переход изменил идентификатор резюме")
+        if expected_host and not self._same_final_host(urlparse(ref.url).hostname, expected_host):
+            raise ValueError("Переход изменил домен резюме")
         return ref
 
 
@@ -182,6 +237,22 @@ def empty_field(section: str, label: str, *, unsupported: bool = False) -> Sourc
 
 def snapshot_hash(snapshot: SiteResumeSnapshot) -> str:
     data = snapshot.model_dump(mode="json", exclude={"content_hash", "imported_at", "source_updated_at"})
+
+    def semantic(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: semantic(child)
+                for key, child in value.items()
+                if key not in {
+                    "schema_version", "extractor_version", "source_site", "source_resume_id",
+                    "source_url_hash", "source_updated_text", "coverage", "source_section", "source_locator",
+                }
+            }
+        if isinstance(value, list):
+            return [semantic(child) for child in value]
+        return value
+
+    data = semantic(data)
     payload = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -200,9 +271,13 @@ def coverage_for(snapshot: SiteResumeSnapshot) -> None:
     scalar_sections: dict[str, Any] = {
         "identity": snapshot.identity,
         "contacts": snapshot.contacts,
+        "self_employment": snapshot.self_employment,
+        "job_search_status": snapshot.job_search_status,
+        "source_badges": snapshot.source_badges,
         "target": snapshot.target,
         "location": snapshot.location,
         "about": snapshot.about,
+        "total_experience": snapshot.total_experience,
     }
     list_sections = (
         "experience", "projects", "skills", "education", "languages", "courses",
@@ -273,6 +348,110 @@ def coverage_for(snapshot: SiteResumeSnapshot) -> None:
     snapshot.coverage.parse_errors = sorted(errors)
 
 
+def _page_url(page: Any, fallback: str) -> str:
+    value = getattr(page, "url", fallback)
+    if callable(value):
+        value = value()
+    return str(value or fallback)
+
+
+async def _goto_checked(page: Any, url: str, *, max_bytes: int) -> Any:
+    response = await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    headers = getattr(response, "headers", {}) if response is not None else {}
+    raw_length = headers.get("content-length") if isinstance(headers, dict) else None
+    if raw_length and str(raw_length).isdigit() and int(raw_length) > max_bytes:
+        raise ValueError("Страница резюме слишком большая")
+    return response
+
+
+async def open_resume_page(page: Any, ref: ResumeRef, policy: ResumeURLPolicy) -> None:
+    """Navigate to a validated import URL and verify redirects before retrying."""
+    checked = policy.validate(ref.url)
+    if checked.external_id != ref.external_id or checked.source_site != ref.source_site:
+        raise ValueError("Ссылка и идентификатор резюме не совпадают")
+    import_url = checked.import_url or policy.import_url(checked.url)
+    await _goto_checked(page, import_url, max_bytes=8 * 1024 * 1024)
+    final_url = _page_url(page, import_url)
+    # Always validate the first redirect before deciding whether a retry is
+    # safe. A hostile host or resume ID can never be retried.
+    expected_host = urlparse(checked.url).hostname
+    final_ref = policy.validate_final(final_url, checked.external_id, expected_host)
+    if policy.requires_print:
+        final_pairs = parse_qsl(urlparse(final_url).query, keep_blank_values=True)
+        has_print = len([value for key, value in final_pairs if key == "print" and value == "true"]) == 1
+        if not has_print:
+            # The only permitted retry is the same validated resource after a
+            # redirect that dropped the print query. The second result must
+            # retain print=true; otherwise extraction fails closed.
+            if final_ref.url != checked.url:
+                raise ValueError("Переход со страницы резюме изменил ресурс")
+            await _goto_checked(page, import_url, max_bytes=8 * 1024 * 1024)
+            final_url = _page_url(page, import_url)
+            policy.validate_final(final_url, checked.external_id, expected_host)
+            final_pairs = parse_qsl(urlparse(final_url).query, keep_blank_values=True)
+            has_print = len([value for key, value in final_pairs if key == "print" and value == "true"]) == 1
+            if not has_print:
+                raise ValueError("Страница резюме не сохранила print=true")
+        await _wait_for_print_root(page)
+
+
+async def _wait_for_print_root(page: Any) -> None:
+    locator_factory = getattr(page, "locator", None)
+    if locator_factory is None:
+        return
+    for selector in (
+        "body.bloko-print",
+        "[data-qa='resume-main-info__content-wrapper'], "
+        "[data-testid='resume-main-info__content-wrapper'], .resume-main-info__content-wrapper",
+    ):
+        locator = locator_factory(selector)
+        wait_for = getattr(locator, "wait_for", None)
+        if callable(wait_for):
+            try:
+                await wait_for(state="visible", timeout=10_000)
+            except Exception as exc:
+                raise ValueError("Страница резюме не готова к извлечению print-данных") from exc
+
+
+async def _visible_selector(page: Any, selector: str) -> bool:
+    locator = page.locator(selector)
+    count = await locator.count()
+    for index in range(count):
+        item = locator.nth(index) if hasattr(locator, "nth") else locator
+        visible = getattr(item, "is_visible", None)
+        if visible is None or await visible():
+            return True
+    return False
+
+
+async def _require_print_layout(page: Any, ref: ResumeRef) -> None:
+    """Require the public print DOM; owner/account cards are never a fallback."""
+    if not await _visible_selector(page, "body.bloko-print"):
+        raise ValueError("Страница резюме не содержит print-разметку")
+    if not await _visible_selector(
+        page,
+        "[data-qa='resume-main-info__content-wrapper'], "
+        "[data-testid='resume-main-info__content-wrapper'], .resume-main-info__content-wrapper",
+    ):
+        raise ValueError("Страница резюме не содержит публичный print-контейнер")
+    if await _visible_selector(
+        page,
+        "[data-qa='profile-experience-company-card'], .profile-experience-company-card",
+    ):
+        raise ValueError("Обнаружена regular owner-разметка резюме")
+    section_found = False
+    for selector in (
+        "[data-qa='resume-position'], [data-testid='resume-position'], .resume-position",
+        "[data-qa='resume-experience-block'], [data-testid='resume-experience-block'], .resume-experience-block",
+        "[data-qa='resume-specializations'], [data-testid='resume-specializations'], .resume-specializations",
+    ):
+        if await _visible_selector(page, selector):
+            section_found = True
+            break
+    if not section_found:
+        raise ValueError("Страница резюме не содержит print-разделов")
+
+
 class ResumeImportMixin:
     """Opt-in methods delegated to each site's independent extractor."""
 
@@ -287,31 +466,17 @@ class ResumeImportMixin:
         return await self.resume_extractor.list_resume_refs(page, self.resume_policy)
 
     async def open_resume(self, page: Any, ref: ResumeRef) -> None:
-        if ref.source_site != self.site_id:
-            raise ValueError("Резюме принадлежит другому сайту")
-        checked = self.resume_policy.validate(ref.url)
-        if checked.external_id != ref.external_id:
-            raise ValueError("Ссылка и идентификатор резюме не совпадают")
-        response = await page.goto(checked.url, wait_until="domcontentloaded", timeout=60_000)
-        headers = getattr(response, "headers", {}) if response is not None else {}
-        raw_length = headers.get("content-length") if isinstance(headers, dict) else None
-        if raw_length and str(raw_length).isdigit() and int(raw_length) > self.max_resume_response_bytes:
-            raise ValueError("Страница резюме слишком большая")
-        # Public resume sections are client-rendered on some sites.  Give the
-        # approved page a bounded opportunity to finish rendering before the
-        # extractor samples DOM locators; timeout keeps a stalled site bounded.
-        wait_for_state = getattr(page, "wait_for_load_state", None)
-        if callable(wait_for_state):
-            with suppress(Exception):
-                await wait_for_state("networkidle", timeout=10_000)
-        final_url = getattr(page, "url", checked.url)
-        if callable(final_url):
-            final_url = final_url()
-        self.resume_policy.validate_final(final_url or checked.url, checked.external_id)
+        await open_resume_page(page, ref, self.resume_policy)
+
+    async def _require_print_layout(self, page: Any, ref: ResumeRef) -> None:
+        if not self.resume_policy.requires_print:
+            return
+        await _require_print_layout(page, ref)
 
     async def extract_resume(self, page: Any, ref: ResumeRef) -> SiteResumeSnapshot:
         if ref.source_site != self.site_id:
             raise ValueError("Резюме принадлежит другому сайту")
+        await self._require_print_layout(page, ref)
         # A public URL may resolve with HTTP 200 while rendering a removed or
         # not-found page. Use exact error UI hooks and critical resume roots;
         # never scan arbitrary resume prose for words such as "недоступно".

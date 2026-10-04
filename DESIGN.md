@@ -3,7 +3,7 @@
 
 **Theme:** light
 
-shadcn/ui is a monochromatic design-system workshop: pure white canvas, soft warm-gray surfaces, and large-radius cards floating on hairline borders. The interface is almost entirely achromatic — black text, white surfaces, gray secondary tones — with a single destructive red reserved for error states and nothing else. Typography leans on Geist's geometric neutrality with tight letter-spacing on display sizes, creating a quiet, code-adjacent feel that reads as developer infrastructure rather than consumer product.
+shadcn/ui is a monochromatic design-system workshop: pure white canvas, soft warm-gray surfaces, and large-radius cards floating on hairline borders. The interface is almost entirely achromatic — black text, white surfaces, gray secondary tones — with a single destructive red reserved for error states and nothing else. Typography uses Inter with restrained tracking, creating a quiet, code-adjacent feel that reads as developer infrastructure rather than consumer product.
 
 ## Tokens — Colors
 
@@ -16,18 +16,18 @@ shadcn/ui is a monochromatic design-system workshop: pure white canvas, soft war
 | Ink Soft | `#171717` | `--color-ink-soft` | Filled button backgrounds, secondary text on light surfaces |
 | Mid Gray | `#737373` | `--color-mid-gray` | Muted body text, placeholder text, helper labels, icon fills at rest |
 | Hairline | `#e5e5e5` | `--color-hairline` | Borders, input outlines, card edges, badge outlines |
-| Ember | `#e7000b` | `--color-ember` | Red decorative accent for icons, marks, and small graphic details. Use as a supporting accent, not as a status color |
+| Ember | `#e7000b` | `--color-ember` | Red reserved for errors and destructive actions |
 
 ## Tokens — Typography
 
-### Geist — All interface text — body at 14px/400, headings ranging 24–48px/600, buttons at 13–14px/500. Geist's geometric letterforms and uniform stroke width create a developer-tool neutrality; weight 600 at 48px with -0.05em tracking produces tight, confident display headlines that feel engineered rather than editorial. · `--font-geist`
-- **Substitute:** Inter
+### Inter — All interface text — body at 14px/400, headings ranging 24–48px/600, buttons at 13–14px/500. Inter's neutral letterforms keep dense workflow screens legible; weight 600 at 48px with -0.05em tracking produces compact display headlines. · `--font-inter`
+- **Substitute:** system-ui
 - **Weights:** 400, 500, 600
 - **Sizes:** 12, 13, 14, 16, 18, 24, 30, 36, 48
 - **Line height:** 1.10, 1.11, 1.20, 1.33, 1.43, 1.50, 1.56, 1.63, 2.00
 - **Letter spacing:** -0.0500em at display (48px), -0.0250em at subheading (24–30px), 0.0500em at caption (12px uppercase). Tracking tightens aggressively at large sizes and loosens slightly at small uppercase labels.
 - **OpenType features:** `"ss01" on, "cv11" on`
-- **Role:** All interface text — body at 14px/400, headings ranging 24–48px/600, buttons at 13–14px/500. Geist's geometric letterforms and uniform stroke width create a developer-tool neutrality; weight 600 at 48px with -0.05em tracking produces tight, confident display headlines that feel engineered rather than editorial.
+- **Role:** All interface text — body at 14px/400, headings ranging 24–48px/600, buttons at 13–14px/500.
 
 ### Type Scale
 
@@ -65,10 +65,10 @@ shadcn/ui is a monochromatic design-system workshop: pure white canvas, soft war
 | Element | Value |
 |---------|-------|
 | cards | 24px |
-| small | 6px |
+| small controls | 18px |
 | badges | 18px |
 | inputs | 18px |
-| nested | 10px |
+| nested surfaces | 18px |
 | buttons | 18px |
 
 ### Shadows
@@ -110,7 +110,7 @@ becomes width 100% so controls remain within the viewport.
 ### Primary Filled Button
 **Role:** High-emphasis action (Submit, Save, Create)
 
-Background #0a0a0a, text #fafafa, border none, radius 18px, padding 0px 12px (compact) or 8px 16px (comfortable), font 14px Geist weight 500. Height ≈ 36–40px. The dark-on-light inversion is the only chromatic interaction in the system; the fully rounded radius (18px on a ~36px height) produces perfect pill geometry.
+Background #0a0a0a, text #fafafa, border none, radius 18px, padding 0px 12px (compact) or 8px 16px (comfortable), font 14px Inter weight 500. Height ≈ 36–40px. The dark-on-light inversion is the only chromatic interaction in the system; the fully rounded radius (18px on a ~36px height) produces perfect pill geometry.
 
 ### Secondary Ghost Button
 **Role:** Low-emphasis action (Cancel, Back)
@@ -145,7 +145,7 @@ The collapsed trigger is a paper surface with a 1px hairline, a muted label, sel
 ### Resume Experience Card
 **Role:** Repeated work-experience entry
 
-Use a paper surface with a 1px hairline, 10px nested radius, and a separated header row. Individual controls retain their own persistent boundaries so adjacent fields cannot visually merge.
+Use a paper surface with a 1px hairline, 18px nested radius, and a separated header row. Individual controls retain their own persistent boundaries so adjacent fields cannot visually merge.
 
 ### Badge — Solid
 **Role:** Tag, status pill, counter
@@ -192,7 +192,7 @@ Text or icon in #e7000b against the monochromatic palette. The red is the only c
 ### Do
 - Use #0a0a0a on #ffffff for filled buttons — the dark inversion is the only primary action treatment.
 - Maintain 18px radius on all buttons, inputs, and badges for perfect pill geometry; use 24px radius only on cards.
-- Set display headlines at 48px/600 with -0.0500em tracking — Geist's geometric weight at this size with aggressive tightening produces the engineered headline voice.
+- Set display headlines at 48px/600 with -0.0500em tracking — Inter's neutral weight at this size with aggressive tightening produces the engineered headline voice.
 - Reserve #e7000b exclusively for destructive states; never use it for decoration, branding, or non-error emphasis.
 - Stack card shadows as 1px hairline + 1px + 2px offset — the combined effect is a barely-perceptible elevation that reads as 'card' without drama.
 - Use #f5f5f5 for secondary surfaces and inputs; use #fafafa for subtle navigation and card variants — the three-tone surface stack (canvas → soft → paper) creates layering without borders.
@@ -237,15 +237,15 @@ Minimal imagery — the system is almost entirely UI. No hero photography, no il
 - Destructive: #e7000b
 
 **Example Component Prompts**
-1. Create a dashboard stat card: white (#ffffff) background, 24px radius, 1px solid #e5e5e5 border, shadow 0 0 0 1px rgba(23,23,23,0.05) + 0 1px 3px rgba(0,0,0,0.1) + 0 1px 2px -1px rgba(0,0,0,0.1), 20px padding. Label in 12px uppercase #737373, value in 36px Geist weight 600 #0a0a0a with -0.025em tracking.
+1. Create a dashboard stat card: white (#ffffff) background, 24px radius, 1px solid #e5e5e5 border, shadow 0 0 0 1px rgba(23,23,23,0.05) + 0 1px 3px rgba(0,0,0,0.1) + 0 1px 2px -1px rgba(0,0,0,0.1), 20px padding. Label in 12px uppercase #737373, value in 36px Inter weight 600 #0a0a0a with -0.025em tracking.
 
-2. Create a filled dark button: background #0a0a0a, text #fafafa, no border, 18px radius, padding 0px 12px, font 14px Geist weight 500. Height 36px. No shadow — tonal contrast only.
+2. Create a filled dark button: background #0a0a0a, text #fafafa, no border, 18px radius, padding 0px 12px, font 14px Inter weight 500. Height 36px. No shadow — tonal contrast only.
 
 3. Create a ghost secondary button: background #f5f5f5, text #0a0a0a, no border, 18px radius, padding 0px 12px, font 14px weight 500. Same dimensions as the filled button for visual parity.
 
 4. Create an input field: background #f5f5f5, text #0a0a0a, placeholder #737373, no border at rest, 18px radius, padding 8px 10px, font 14px weight 400. On focus: 1px solid #e5e5e5 ring with no offset.
 
-5. Create a badge tag: background #171717, text #fafafa, 18px radius (full pill), padding 2px 8px, font 12px Geist weight 500.
+5. Create a badge tag: background #171717, text #fafafa, 18px radius (full pill), padding 2px 8px, font 12px Inter weight 500.
 
 ## Design Philosophy
 
@@ -253,7 +253,7 @@ shadcn/ui is built on three principles visible in every token: (1) achromatic by
 
 ## Similar Brands
 
-- **Vercel** — Same monochromatic palette, same Geist/geometric sans pairing, same pill-shaped buttons with tight letter-spacing on display text
+- **Vercel** — Same monochromatic palette, same Inter sans pairing, same pill-shaped buttons with tight letter-spacing on display text
 - **Linear** — Identical approach to monochromatic UI with single accent for destructive states, tight typographic tracking, and hairline-bordered cards
 - **Radix UI** — Same developer-tool visual language — neutral surfaces, geometric type, and component-first documentation layout
 - **Tailwind UI** — Matching restrained palette, identical border-radius scale (large radii on containers), and code-adjacent minimal chrome
@@ -276,7 +276,7 @@ shadcn/ui is built on three principles visible in every token: (1) achromatic by
   --color-ember: #e7000b;
 
   /* Typography — Font Families */
-  --font-geist: 'Geist', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-inter: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 
   /* Typography — Scale */
   --text-caption: 12px;
@@ -328,18 +328,18 @@ shadcn/ui is built on three principles visible in every token: (1) achromatic by
   --field-prose: 760px;
 
   /* Border Radius */
-  --radius-md: 6px;
-  --radius-lg: 10px;
-  --radius-xl: 14px;
+  --radius-md: 18px;
+  --radius-lg: 18px;
+  --radius-xl: 18px;
   --radius-2xl: 18px;
   --radius-3xl: 24px;
 
   /* Named Radii */
   --radius-cards: 24px;
-  --radius-small: 6px;
+  --radius-small: 18px;
   --radius-badges: 18px;
   --radius-inputs: 18px;
-  --radius-nested: 10px;
+  --radius-nested: 18px;
   --radius-buttons: 18px;
 
   /* Shadows */
@@ -369,7 +369,7 @@ shadcn/ui is built on three principles visible in every token: (1) achromatic by
   --color-ember: #e7000b;
 
   /* Typography */
-  --font-geist: 'Geist', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-inter: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 
   /* Typography — Scale */
   --text-caption: 12px;
@@ -404,9 +404,9 @@ shadcn/ui is built on three principles visible in every token: (1) achromatic by
   --spacing-48: 48px;
 
   /* Border Radius */
-  --radius-md: 6px;
-  --radius-lg: 10px;
-  --radius-xl: 14px;
+  --radius-md: 18px;
+  --radius-lg: 18px;
+  --radius-xl: 18px;
   --radius-2xl: 18px;
   --radius-3xl: 24px;
 

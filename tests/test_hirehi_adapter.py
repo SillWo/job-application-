@@ -1,6 +1,7 @@
 import pytest
 
 from backend.adapters.base.protocol import JobRef
+from backend.adapters.hirehi import discovery, locators
 from backend.adapters.hirehi.adapter import HireHiAdapter
 
 
@@ -457,6 +458,98 @@ async def test_public_page_is_not_login_blocker():
     assert await HireHiAdapter().detect_blockers(_Page("Войти на сайт")) == []
 
 
+class _InvisibleNode(_Node):
+    async def is_visible(self):
+        return False
+
+
+class _BlockerPage(_Page):
+    def __init__(self, body: str, challenge_visible: bool):
+        super().__init__(body)
+        self.challenge_visible = challenge_visible
+
+    def locator(self, selector):
+        if selector == locators.CAPTCHA_CHALLENGE_MARKERS:
+            return _Node("challenge") if self.challenge_visible else _InvisibleNode()
+        return super().locator(selector)
+
+
+@pytest.mark.asyncio
+async def test_vacancy_text_mentions_captcha_without_blocking():
+    page = _BlockerPage(
+        "Работать с Cloudflare, JavaScript challenge и CAPTCHA",
+        challenge_visible=False,
+    )
+    assert await HireHiAdapter().detect_blockers(page) == []
+
+
+@pytest.mark.asyncio
+async def test_visible_structural_captcha_challenge_blocks():
+    blockers = await HireHiAdapter().detect_blockers(
+        _BlockerPage("Вакансия доступна", challenge_visible=True)
+    )
+    assert [blocker.kind for blocker in blockers] == ["captcha"]
+
+
+@pytest.mark.asyncio
+async def test_hidden_structural_captcha_challenge_does_not_block():
+    blockers = await HireHiAdapter().detect_blockers(
+        _BlockerPage("Вакансия доступна", challenge_visible=False)
+    )
+    assert not any(blocker.kind == "captcha" for blocker in blockers)
+
+
+@pytest.mark.asyncio
+async def test_profile_auth_waits_for_delayed_marker_and_ignores_login_label():
+    class DelayedProfilePage:
+        url = "https://hirehi.ru/"
+
+        def __init__(self):
+            self.profile_polls = 0
+
+        async def goto(self, url, **kwargs):
+            self.url = url
+
+        async def wait_for_timeout(self, _value):
+            return None
+
+        def locator(self, selector):
+            if selector == locators.AUTH_PROFILE_MARKERS:
+                self.profile_polls += 1
+                return _Node("Профиль") if self.profile_polls >= 3 else _InvisibleNode()
+            return _NodeEmpty()
+
+    state = await HireHiAdapter().get_login_state(DelayedProfilePage())
+    assert state.authenticated is True
+
+
+@pytest.mark.asyncio
+async def test_visible_login_form_and_public_profile_are_not_authenticated():
+    class LoginPage:
+        url = "https://hirehi.ru/profile"
+
+        async def goto(self, url, **kwargs):
+            self.url = "https://hirehi.ru/profile"
+
+        async def wait_for_timeout(self, _value):
+            return None
+
+        def locator(self, selector):
+            if selector in {
+                locators.AUTH_LOGIN_FIELDS,
+                "input[type='password'], form[action*='login'], [data-testid='login-form']",
+            }:
+                return _Node("login form")
+            return _NodeEmpty()
+
+    class PublicPage(LoginPage):
+        async def goto(self, url, **kwargs):
+            self.url = "https://hirehi.ru/"
+
+    assert (await HireHiAdapter().get_login_state(LoginPage())).authenticated is False
+    assert (await HireHiAdapter().get_login_state(PublicPage())).authenticated is False
+
+
 @pytest.mark.asyncio
 async def test_search_exhausted_property_defaults_false():
     assert HireHiAdapter().search_exhausted is False
@@ -828,3 +921,391 @@ async def test_open_search_tracks_page_reached_by_ui(monkeypatch):
     monkeypatch.setattr(adapter, "_apply_grade_filters", grades)
     await adapter.open_search(page, {"category": "менеджмент"})
     assert adapter.search_checkpoint()["listing_page"] == 3
+
+
+class _AdaptiveCollection:
+    def __init__(self, items=()):
+        self.items = list(items)
+
+    async def count(self):
+        return len(self.items)
+
+    def nth(self, index):
+        return self.items[index]
+
+    @property
+    def first(self):
+        return self.items[0] if self.items else _NodeEmpty()
+
+
+class _AdaptiveCard:
+    def __init__(self, ident, *, title="", company="", grade="", work_format="", location="", salary="", aria=""):
+        self.href = f"/management/{ident}-92172"
+        self.fields = {
+            "title": title, "company": company, "grade": grade,
+            "work_format": work_format, "location": location, "salary": salary,
+        }
+        self.aria = aria
+
+    async def is_visible(self):
+        return True
+
+    async def count(self):
+        return 1
+
+    async def get_attribute(self, name):
+        return self.href if name == "href" else self.aria if name == "aria-label" else None
+
+    async def inner_text(self):
+        return self.fields["title"]
+
+    @property
+    def first(self):
+        return self
+
+    def locator(self, selector):
+        if selector == locators.CARD_LINKS:
+            return _AdaptiveCollection([self])
+        for key, marker in (
+            ("title", locators.CARD_TITLE), ("company", locators.CARD_COMPANY),
+            ("salary", locators.CARD_SALARY), ("grade", locators.CARD_GRADE),
+            ("location", locators.CARD_LOCATION), ("work_format", locators.CARD_FORMAT),
+        ):
+            if selector == marker and self.fields[key]:
+                return _AdaptiveCollection([_AdaptiveText(self.fields[key])])
+        return _AdaptiveCollection()
+
+
+class _AdaptiveText:
+    def __init__(self, text):
+        self.text = text
+        self.first = self
+
+    async def count(self):
+        return 1
+
+    async def is_visible(self):
+        return True
+
+    async def inner_text(self):
+        return self.text
+
+
+class _AdaptivePage:
+    def __init__(self, cards, *, next_page=True, pro_modal=False, pro_item=True):
+        self.url = "https://hirehi.ru/"
+        self.cards = cards
+        self.next_page = next_page
+        self.pro_modal = pro_modal
+        self.pro_item = pro_item
+        self.events = []
+        self.goto_urls = []
+
+    async def goto(self, url, **kwargs):
+        self.events.append("goto")
+        self.goto_urls.append(url)
+        self.url = url
+
+    async def wait_for_timeout(self, _value):
+        return None
+
+    def locator(self, selector):
+        if selector == locators.CARDS:
+            return _AdaptiveCollection(self.cards)
+        if selector == locators.LINKS:
+            return _AdaptiveCollection(self.cards)
+        if selector == locators.PAGINATION:
+            return _AdaptiveCollection([_AdaptiveLink("/management?page=2")]) if self.next_page else _AdaptiveCollection()
+        if selector == ".filter-checkbox-item[data-filter-type='match'][data-filter-value='me']":
+            return _AdaptiveProItem(self) if self.pro_item else _NodeEmpty()
+        if selector == "#proModalClose, #proModalBuyBtn":
+            return _AdaptiveCollection([_AdaptiveModal(self)]) if self.pro_modal else _AdaptiveCollection()
+        if selector == "#proModalClose":
+            return _AdaptiveModal(self) if self.pro_modal else _NodeEmpty()
+        if selector == "#proModalBuyBtn":
+            return _AdaptiveModal(self) if self.pro_modal else _NodeEmpty()
+        return _AdaptiveCollection()
+
+    def get_by_text(self, *_args, **_kwargs):
+        return _NodeEmpty()
+
+
+class _AdaptiveLink(_AdaptiveText):
+    def __init__(self, href):
+        super().__init__("")
+        self.href = href
+
+    async def get_attribute(self, name):
+        return self.href if name == "href" else None
+
+
+class _AdaptiveProItem(_AdaptiveText):
+    def __init__(self, page):
+        super().__init__("подходят мне")
+        self.page = page
+
+    async def click(self):
+        self.page.events.append("pro_click")
+
+
+class _AdaptiveModal(_AdaptiveText):
+    def __init__(self, page):
+        super().__init__("")
+        self.page = page
+
+    async def is_visible(self):
+        return self.page.pro_modal
+
+    async def click(self):
+        self.page.events.append("modal_close")
+        self.page.pro_modal = False
+
+
+def test_adaptive_url_allowlist_and_source_builders():
+    adapter = HireHiAdapter()
+    assert adapter.pro_recommendations_source(False) is None
+    assert adapter.query_source(" product manager +sql -gambling ")["url"] == (
+        "https://hirehi.ru/?search=product+manager+%2Bsql+-gambling"
+    )
+    assert adapter.category_source("менеджмент")["url"] == "https://hirehi.ru/vacancies/management"
+    assert adapter.specialization_source("product-manager")["url"] == "https://hirehi.ru/vacancies/product-manager"
+    assert adapter.validate_search_source({"url": "https://hirehi.ru/vacancies/management?grade=middle&page=2"})["url"] == (
+        "https://hirehi.ru/vacancies/management?grade=middle&page=2"
+    )
+    for url in (
+        "http://hirehi.ru/vacancies/management", "https://user:pass@hirehi.ru/vacancies/management",
+        "https://hirehi.ru:443/vacancies/management", "https://hirehi.ru/vacancies/management#x",
+        "https://hirehi.ru/vacancies/management?unknown=x", "https://hirehi.ru/management/job-92172",
+    ):
+        with pytest.raises(ValueError):
+            adapter.validate_search_source({"url": url})
+    with pytest.raises(ValueError):
+        adapter.validate_search_source({"url": "https://hirehi.ru/vacancies/management", "page": -1})
+
+
+@pytest.mark.asyncio
+async def test_extract_job_without_sidebar_uses_main_and_page_is_not_visibility_checked():
+    class Collection:
+        def __init__(self, items=()):
+            self.items = list(items)
+
+        async def count(self):
+            return len(self.items)
+
+        def nth(self, index):
+            return self.items[index]
+
+        @property
+        def first(self):
+            return self.items[0]
+
+    class Main:
+        async def is_visible(self):
+            return True
+
+        async def inner_text(self):
+            return "РћРїРёСЃР°РЅРёРµ\nBuild reliable systems"
+
+    class Page:
+        url = "https://hirehi.ru/management/engineer-98765"
+
+        def locator(self, selector):
+            if selector == "h1":
+                return Collection([_Node("Engineer")])
+            if selector == "main":
+                return Collection([Main()])
+            # No sidebar or dedicated description fields are present.
+            return Collection()
+
+        async def is_visible(self, selector):
+            raise AssertionError("Page.is_visible requires a selector and must not be called as a Locator")
+
+    posting = await HireHiAdapter().extract_job(Page())
+
+    assert posting.title == "Engineer"
+    assert posting.description == "РћРїРёСЃР°РЅРёРµ\nBuild reliable systems"
+    assert posting.external_id == "98765"
+
+
+@pytest.mark.asyncio
+async def test_adaptive_card_metadata_pagination_and_repeated_marker():
+    adapter = HireHiAdapter()
+    card = _AdaptiveCard("job", title="Product Manager", company="Acme", grade="senior", work_format="remote", location="Россия", salary="200 000 ₽")
+    page = _AdaptivePage([card], next_page=True)
+    result = await adapter.read_discovery_page(page, adapter.category_source("management"), 0)
+    assert result["cards"]["92172"]["company"] == "Acme"
+    assert result["cards"]["92172"]["salary_text"] == "200 000 ₽"
+    assert "page=2" not in page.goto_urls[0]
+    result2 = await adapter.read_discovery_page(page, adapter.category_source("management"), 1)
+    assert "page=2" in page.goto_urls[1]
+    assert result2["repeated"] is True
+    assert adapter.last_discovery_result["repeated"] is True
+    assert adapter.job_refs_from_cards([result["cards"]["92172"]])[0].external_id == "92172"
+    empty = _AdaptivePage([], next_page=False)
+    terminal = await adapter.read_discovery_page(empty, adapter.category_source("management"), 0)
+    assert terminal["terminal"] is True and terminal["refs"] == []
+    with pytest.raises(ValueError):
+        await adapter.read_discovery_page(empty, adapter.category_source("management"), -1)
+    assert empty.goto_urls == ["https://hirehi.ru/vacancies/management"]
+
+
+@pytest.mark.asyncio
+async def test_pro_navigation_is_after_goto_and_free_tier_closes_without_purchase():
+    adapter = HireHiAdapter()
+    page = _AdaptivePage([], pro_modal=True)
+    result = await adapter.read_discovery_page(page, adapter.pro_recommendations_source(True), 0)
+    assert result["unavailable"] is True and result["terminal"] is True and not result["refs"]
+    assert page.events == ["goto", "pro_click", "modal_close"]
+    assert "buy" not in page.events
+    again = await adapter.read_discovery_page(page, adapter.pro_recommendations_source(True), 0)
+    assert again["unavailable"] is True and page.events == ["goto", "pro_click", "modal_close", "goto"]
+
+
+@pytest.mark.asyncio
+async def test_pro_success_collects_cards_after_filter_click():
+    adapter = HireHiAdapter()
+    page = _AdaptivePage([_AdaptiveCard("good", title="Product Manager")], next_page=False)
+    result = await adapter.read_discovery_page(page, adapter.pro_recommendations_source(True), 0)
+    assert result["unavailable"] is False and [ref.external_id for ref in result["refs"]] == ["92172"]
+    assert page.events[:2] == ["goto", "pro_click"]
+
+
+class _RelatedSection:
+    def __init__(self, links):
+        self.links = links
+
+    async def is_visible(self):
+        return True
+
+    def locator(self, selector):
+        return _AdaptiveCollection(self.links)
+
+
+class _RelatedPage:
+    url = "https://hirehi.ru/management/source-92172"
+
+    def __init__(self):
+        self.category = _AdaptiveLink("/vacancies/product-manager")
+        self.similar = _RelatedSection([_AdaptiveLink("/management/other-123"), _AdaptiveLink("/blog/article-1")])
+
+    def locator(self, selector):
+        if selector == locators.LINKS:
+            return _AdaptiveCollection([self.category])
+        if selector == locators.RELATED_VACANCIES:
+            return _AdaptiveCollection([self.similar])
+        return _AdaptiveCollection()
+
+
+@pytest.mark.asyncio
+async def test_visible_sources_and_related_refs_are_scoped_to_hirehi_ui_sections():
+    page = _RelatedPage()
+    adapter = HireHiAdapter()
+    sources = await adapter.collect_visible_sources(page)
+    related = await adapter.collect_related_refs(page)
+    assert any(item["url"] == "https://hirehi.ru/vacancies/product-manager" for item in sources)
+    assert {item.external_id for item in related} == {"123"}
+    assert not any("blog" in item["url"] for item in sources)
+
+
+@pytest.mark.asyncio
+async def test_protected_profile_markers_override_misleading_login_button_label():
+    class ProfilePage:
+        url = "https://hirehi.ru/management/source-92172"
+
+        async def goto(self, url, **kwargs):
+            self.url = url
+
+        async def wait_for_timeout(self, _value):
+            return None
+
+        def locator(self, selector):
+            if selector.startswith("#profileBlockDesktop"):
+                return _Node("Профиль")
+            return _NodeEmpty()
+
+    state = await HireHiAdapter().get_login_state(ProfilePage())
+    assert state.authenticated is True
+
+
+def test_observed_management_detail_route_is_a_valid_related_vacancy():
+    parsed = discovery._vacancy_url(
+        HireHiAdapter(), "/management/product-owner-92172", "https://hirehi.ru/"
+    )
+    assert parsed == ("https://hirehi.ru/management/product-owner-92172", "92172")
+
+
+def test_builders_canonicalize_live_filter_values_and_build_source_passes_filters():
+    adapter = HireHiAdapter()
+    filters = {
+        "level": ["senior", "intern", "senior"],
+        "format": ["гибрид", "удалённо"],
+        "english": "english",
+        "direct_contact": ["telegram", "direct_contact"],
+        "salary_from": 100000,
+        "salary_to": 250000,
+    }
+    source = adapter.query_source("product manager", filters=filters)
+    assert "level=intern&level=senior" in source["url"]
+    assert "format=%D0%B3%D0%B8%D0%B1%D1%80%D0%B8%D0%B4&format=%D1%83%D0%B4%D0%B0%D0%BB%D1%91%D0%BD%D0%BD%D0%BE" in source["url"]
+    assert "english=english" in source["url"] and "salary=range%3A100000%3A250000" in source["url"]
+    assert adapter.specialization_source("product-manager", filters=filters)["url"].startswith("https://hirehi.ru/vacancies/product-manager?")
+    assert adapter.coverage_source(filters=filters)["url"].startswith("https://hirehi.ru/?")
+    built = adapter.build_source({"family": "query", "query": "product manager", "filters": filters})
+    assert built["url"] == source["url"]
+
+
+@pytest.mark.parametrize("filters", [
+    {"page": 2}, {"unknown": ["x"]}, {"level": ["principal"]},
+    {"format": ["remote"]}, {"english": "maybe"},
+    {"direct_contact": ["phone"]}, {"salary_from": -1},
+    {"salary_to": True}, {"salary_to": 1_000_000_001},
+])
+def test_planner_filters_reject_unknown_or_invalid_values_before_navigation(filters):
+    with pytest.raises(ValueError):
+        HireHiAdapter().query_source("product manager", filters=filters)
+
+
+def test_detail_reference_rejects_credentials_port_fragment_and_query():
+    adapter = HireHiAdapter()
+    for href in (
+        "https://user:pass@hirehi.ru/management/job-92172",
+        "https://hirehi.ru:443/management/job-92172",
+        "https://hirehi.ru/management/job-92172?x=1",
+        "https://hirehi.ru/management/job-92172#section",
+    ):
+        assert discovery._vacancy_url(adapter, href, "https://hirehi.ru/") is None
+
+
+def test_salary_builder_uses_hirehi_range_query_and_region_is_strict():
+    adapter = HireHiAdapter()
+    assert adapter.query_source("manager", filters={"salary_from": 300000, "salary_to": 600000})["url"] == (
+        "https://hirehi.ru/?salary=range%3A300000%3A600000&search=manager"
+    )
+    assert adapter.query_source("manager", filters={"salary_from": 300000})["url"] == (
+        "https://hirehi.ru/?salary=range%3A300000%3A&search=manager"
+    )
+    assert "region=CIS&region=Russia" in adapter.query_source(
+        "manager", filters={"region": ["Russia", "CIS", "Russia"]}
+    )["url"]
+    for filters in (
+        {"salary": "range:1:2"}, {"salary_from": 2, "salary_to": 1},
+        {"salary_from": None, "salary_to": None},
+        {"region": ["Mars"]}, {"country": ["Russia"]},
+    ):
+        with pytest.raises(ValueError):
+            adapter.query_source("manager", filters=filters)
+
+
+def test_visible_salary_query_requires_canonical_range_grammar():
+    adapter = HireHiAdapter()
+    valid = adapter.validate_search_source({"url": "https://hirehi.ru/?salary=range:300000:600000"})
+    assert valid["url"] == "https://hirehi.ru/?salary=range%3A300000%3A600000"
+    for url in (
+        "https://hirehi.ru/?salary=300000-600000",
+        "https://hirehi.ru/?salary=range::",
+        "https://hirehi.ru/?salary=range:600000:300000",
+        "https://hirehi.ru/?salary=range:-1:2",
+        "https://hirehi.ru/?salary_from=300000",
+    ):
+        with pytest.raises(ValueError):
+            adapter.validate_search_source({"url": url})

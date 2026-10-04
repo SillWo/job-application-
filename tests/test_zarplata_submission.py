@@ -62,6 +62,50 @@ class FakePage:
         return None
 
 
+class RedirectingRetryPage(FakePage):
+    def __init__(self, url, **kwargs):
+        super().__init__(**kwargs)
+        self.url = url
+        self.visited = []
+
+    async def goto(self, url, **_kwargs):
+        self.visited.append(url)
+        self.url = "https://zarplata.ru/applicant/resumes"
+
+
+@pytest.mark.asyncio
+async def test_can_retry_keeps_vacancy_context_without_auth_navigation():
+    page = RedirectingRetryPage(
+        "https://krasnoyarsk.zarplata.ru/vacancy/42",
+        visible={locators.RESPONSE_BUTTON: True},
+    )
+
+    result = await ZarplataAdapter().can_retry_application(page)
+
+    assert result is True
+    assert page.url == "https://krasnoyarsk.zarplata.ru/vacancy/42"
+    assert page.visited == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/vacancy/42",
+        "https://zarplata.ru/applicant/resumes",
+    ],
+)
+@pytest.mark.asyncio
+async def test_can_retry_rejects_non_vacancy_or_untrusted_url(url):
+    page = RedirectingRetryPage(
+        url,
+        visible={locators.RESPONSE_BUTTON: True},
+    )
+
+    assert await ZarplataAdapter().can_retry_application(page) is False
+    assert page.url == url
+    assert page.visited == []
+
+
 class DelayedConfirmationPage(FakePage):
     def __init__(self, *, delay_ms=6_000, **kwargs):
         super().__init__(**kwargs)

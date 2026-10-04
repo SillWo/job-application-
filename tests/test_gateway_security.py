@@ -9,7 +9,7 @@ from openai import APIError
 from pydantic import BaseModel
 
 from backend.intelligence import gateway as gateway_module
-from backend.intelligence.gateway import ModelGateway, ModelUnavailable
+from backend.intelligence.gateway import ModelGateway, ModelPermanentError, ModelUnavailable
 from backend.intelligence.hirehi_category import JobSummary
 from backend.intelligence.security import (
     PromptInjectionDetected,
@@ -201,7 +201,7 @@ async def test_mock_gateway_checks_output(monkeypatch):
 async def test_provider_output_contract_rejects_bad_json_without_echo(monkeypatch, content):
     completions = _Completions(content)
     _configured(monkeypatch, completions)
-    with pytest.raises(ModelUnavailable) as raised:
+    with pytest.raises(ModelPermanentError) as raised:
         await ModelGateway(provider="openai_compat").structured("job_summary", {"job": {}}, JobSummary)
     assert "attacker" not in str(raised.value)
 
@@ -210,7 +210,7 @@ async def test_provider_output_contract_rejects_bad_json_without_echo(monkeypatc
 async def test_provider_optional_nested_extra_is_rejected(monkeypatch):
     completions = _Completions('{"child":{"value":"ok","extra":"attacker"}}')
     _configured(monkeypatch, completions)
-    with pytest.raises(ModelUnavailable):
+    with pytest.raises(ModelPermanentError):
         await ModelGateway(provider="openai_compat").structured("job_summary", {}, _OptionalEnvelope)
 
 
@@ -218,7 +218,7 @@ async def test_provider_optional_nested_extra_is_rejected(monkeypatch):
 async def test_provider_union_nested_extra_is_rejected(monkeypatch):
     completions = _Completions('{"child":{"value":"ok","extra":"attacker"}}')
     _configured(monkeypatch, completions)
-    with pytest.raises(ModelUnavailable):
+    with pytest.raises(ModelPermanentError):
         await ModelGateway(provider="openai_compat").structured("job_summary", {}, _UnionEnvelope)
 
 

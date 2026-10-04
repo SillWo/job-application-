@@ -182,7 +182,7 @@ def test_session_answers_survives_repair_migration_downgrade(tmp_path: Path):
         db.close()
 
 
-def test_resume_storage_migration_normalizes_existing_unconfirmed_outcome(tmp_path: Path):
+def test_resume_storage_migration_normalizes_existing_submission_error(tmp_path: Path):
     path = tmp_path / "resume-storage-existing.db"
     config = Config("alembic.ini")
     config.set_main_option("sqlalchemy.url", f"sqlite:///{path.as_posix()}")
@@ -230,7 +230,7 @@ def test_resume_storage_migration_normalizes_existing_unconfirmed_outcome(tmp_pa
         state, data = db.execute(
             "select state, data from vacancies where external_id = 'unconfirmed'"
         ).fetchone()
-        assert state == "UNCONFIRMED"
+        assert state == "ERROR"
         assert json.loads(data)["error_message"] == (
             "Площадка не подтвердила результат отправки; отклик мог быть отправлен"
         )
@@ -242,3 +242,38 @@ def test_resume_storage_migration_normalizes_existing_unconfirmed_outcome(tmp_pa
         assert "source_url_encrypted" not in preview_columns
         assert db.execute("select private_view from session_resume_snapshots").fetchone()[0] == "dpapi:legacy"
         assert db.execute("select private_view from resume_preview_tokens").fetchone()[0] == "dpapi:legacy-preview"
+
+
+def test_terminal_session_processing_vacancy_is_migrated_to_error_once(tmp_path: Path):
+    path = tmp_path / "terminal-processing-vacancy.db"
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{path.as_posix()}")
+    command.upgrade(config, "0036")
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "insert into sessions (adapter_id, status, counters) values (?, ?, ?)",
+            ("hh", "STOPPED", json.dumps({"errors": 4})),
+        )
+        session_id = db.execute("select last_insert_rowid()").fetchone()[0]
+        db.execute(
+            "insert into vacancies "
+            "(session_id, source, site, external_id, url, title, state, "
+            "status_changed_at, data, updated_at) "
+            "values (?, 'hh', 'HH.ru', 'pending', 'https://example.test/pending', "
+            "'Pending', 'SUBMITTING', CURRENT_TIMESTAMP, '{}', CURRENT_TIMESTAMP)",
+            (session_id,),
+        )
+        db.commit()
+
+    command.upgrade(config, "head")
+    with sqlite3.connect(path) as db:
+        state, data = db.execute(
+            "select state, data from vacancies where external_id = 'pending'"
+        ).fetchone()
+        counters = db.execute(
+            "select counters from sessions where id = ?", (session_id,)
+        ).fetchone()[0]
+        assert state == "ERROR"
+        assert json.loads(data)["error_code"] == "SESSION_STOPPED"
+        assert json.loads(data)["error_message"]
+        assert json.loads(counters)["errors"] == 5

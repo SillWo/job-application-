@@ -87,7 +87,13 @@ async def test_hirehi_category_pagination_and_recovery(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        item = JobSession(adapter_id="hirehi", application_limit=None)
+        # This fixture exercises the legacy category/pagination rollback path;
+        # pin the per-session identity independently of the adaptive default.
+        item = JobSession(
+            adapter_id="hirehi",
+            application_limit=None,
+            recovery={"search_version": "hirehi_v1"},
+        )
         db.add(item)
         db.flush()
         persist_session_snapshot(
@@ -126,7 +132,8 @@ async def test_hirehi_category_pagination_and_recovery(tmp_path, monkeypatch):
             item = db.get(JobSession, session_id)
             assert item.status == SessionStatus.COMPLETED
             assert item.counters["viewed"] == item.counters["filtered"] == 4
-            assert item.recovery["pending_refs"] == []
+            assert "pending_refs" not in item.recovery
+            assert item.recovery["terminal_finalized"] is True
             assert item.recovery["search_checkpoint"]["exhausted"]
             vacancies = list(db.scalars(select(Vacancy)))
             assert {v.external_id for v in vacancies} == {"1", "2", "3", "4"}

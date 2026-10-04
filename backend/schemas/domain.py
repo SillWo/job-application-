@@ -44,6 +44,7 @@ class ResumeIdentity(BaseModel):
     has_photo: SourceField[bool] = Field(
         default_factory=SourceField, validation_alias=AliasChoices("has_photo", "photo_available")
     )
+    photo_url: SourceField[str] = Field(default_factory=SourceField)
 
 
 class ResumeContacts(BaseModel):
@@ -55,6 +56,8 @@ class ResumeContacts(BaseModel):
         default_factory=SourceField,
         validation_alias=AliasChoices("links", "professional_links"),
     )
+    preferred_contact: SourceField[str] = Field(default_factory=SourceField)
+    contact_comment: SourceField[str] = Field(default_factory=SourceField)
 
 
 class ResumeTarget(BaseModel):
@@ -80,6 +83,7 @@ class ResumeLocation(BaseModel):
     business_trips: SourceField[str | bool] = Field(default_factory=SourceField)
     citizenship: SourceField[list[str]] = Field(default_factory=SourceField)
     work_permit: SourceField[str] = Field(default_factory=SourceField)
+    commute_time: SourceField[str] = Field(default_factory=SourceField)
 
 
 class ResumeExperience(BaseModel):
@@ -96,6 +100,13 @@ class ResumeExperience(BaseModel):
         default="", validation_alias=AliasChoices("duties", "description")
     )
     achievements: SourceField[list[str]] | list[str] = Field(default_factory=list)
+    location: SourceField[str] | str = ""
+    company_url: SourceField[str] | str = ""
+    industries: SourceField[list[str]] | list[str] = Field(default_factory=list)
+    employment_type: SourceField[str] | str = ""
+    work_format: SourceField[str] | str = ""
+    grade: SourceField[str] | str = ""
+    duration: SourceField[str] | str = ""
     source_section: str | None = None
 
 
@@ -127,6 +138,9 @@ class ResumeEducation(BaseModel):
         default=None, validation_alias=AliasChoices("start_date", "period")
     )
     end_date: SourceField[str] | str | None = None
+    faculty: SourceField[str] | str = ""
+    duration: SourceField[str] | str = ""
+    description: SourceField[str] | str = ""
 
 
 class ResumeLanguage(BaseModel):
@@ -144,6 +158,14 @@ class ResumeCourse(BaseModel):
     year: SourceField[str] | str | None = Field(
         default=None, validation_alias=AliasChoices("year", "period")
     )
+    description: SourceField[str] | str = ""
+    # Public print pages expose a course as title, provider, qualification and
+    # year.  Keep the historical normalized names above for compatibility and
+    # carry the explicit labels as well so model payloads retain the meaning
+    # of each visible value.
+    title: SourceField[str] | str = ""
+    provider: SourceField[str] | str | None = None
+    qualification: SourceField[str] | str | None = None
 
 
 class ResumeCertification(BaseModel):
@@ -162,6 +184,7 @@ class ResumeAward(BaseModel):
     year: SourceField[str] | str | None = Field(
         default=None, validation_alias=AliasChoices("year", "period")
     )
+    description: SourceField[str] | str = ""
 
 
 class ResumePortfolioItem(BaseModel):
@@ -192,16 +215,20 @@ class ResumeCoverage(BaseModel):
 class SiteResumeSnapshot(BaseModel):
     """Immutable, normalized data captured for exactly one job session."""
     model_config = ConfigDict(extra="forbid")
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: int = Field(default=2, ge=1)
     extractor_version: str = Field(min_length=1, max_length=80)
     source_site: str = Field(min_length=1, max_length=50)
     source_resume_id: str = Field(min_length=1, max_length=255)
     source_url_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_updated_at: datetime | None = None
+    source_updated_text: SourceField[str] = Field(default_factory=SourceField)
     imported_at: datetime = Field(default_factory=utcnow)
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     identity: ResumeIdentity = Field(default_factory=ResumeIdentity)
     contacts: ResumeContacts = Field(default_factory=ResumeContacts)
+    self_employment: SourceField[str] = Field(default_factory=SourceField)
+    job_search_status: SourceField[str] = Field(default_factory=SourceField)
+    source_badges: SourceField[list[str]] = Field(default_factory=SourceField)
     target: ResumeTarget = Field(default_factory=ResumeTarget)
     location: ResumeLocation = Field(default_factory=ResumeLocation)
     experience: list[ResumeExperience] = Field(default_factory=list)
@@ -216,6 +243,7 @@ class SiteResumeSnapshot(BaseModel):
     about: SourceField[str] = Field(default_factory=SourceField)
     additional_sections: list[AdditionalResumeSection] = Field(default_factory=list)
     coverage: ResumeCoverage = Field(default_factory=ResumeCoverage)
+    total_experience: SourceField[str] = Field(default_factory=SourceField)
 
 
 class ResumeRef(BaseModel):
@@ -224,6 +252,7 @@ class ResumeRef(BaseModel):
     source_site: str
     external_id: str
     url: str
+    import_url: str | None = None
     title: str | None = None
     language: str | None = None
 
@@ -232,6 +261,9 @@ class ResumeProfessionalView(BaseModel):
     """The allowlisted candidate context sent to search/evaluation models."""
     model_config = ConfigDict(extra="forbid")
     target: ResumeTarget = Field(default_factory=ResumeTarget)
+    self_employment: SourceField[str] = Field(default_factory=SourceField)
+    job_search_status: SourceField[str] = Field(default_factory=SourceField)
+    source_badges: SourceField[list[str]] = Field(default_factory=SourceField)
     location: ResumeLocation = Field(default_factory=ResumeLocation)
     experience: list[ResumeExperience] = Field(default_factory=list)
     projects: list[ResumeProject] = Field(default_factory=list)
@@ -244,6 +276,7 @@ class ResumeProfessionalView(BaseModel):
     portfolio: list[ResumePortfolioItem] = Field(default_factory=list)
     about: SourceField[str] = Field(default_factory=SourceField)
     additional_sections: list[AdditionalResumeSection] = Field(default_factory=list)
+    total_experience: SourceField[str] = Field(default_factory=SourceField)
 
 
 class ResumePrivateView(BaseModel):
@@ -417,6 +450,7 @@ class JobPosting(BaseModel):
     location: str | None = None
     work_format: str | None = None
     employment_type: str | None = None
+    grade: str | None = None
     payment_frequency: str | None = None
     required_experience: str | None = None
     hiring_format: str | None = None
@@ -501,14 +535,18 @@ class VacancyState(StrEnum):
     ALREADY_APPLIED = "ALREADY_APPLIED"
     READY_TO_REPORT = "READY_TO_REPORT"
     REPORTED = "REPORTED"
-    UNCONFIRMED = "UNCONFIRMED"
     ERROR = "ERROR"
 
 
 class SessionStatus(StrEnum):
+    # PREPARING is durable intent: a session has been accepted but no
+    # browser/import work has started yet.
+    PREPARING = "PREPARING"
     CREATED = "CREATED"
     RUNNING = "RUNNING"
+    STOPPING = "STOPPING"
     PAUSED = "PAUSED"
     COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
     STOPPED = "STOPPED"
     FAILED = "FAILED"

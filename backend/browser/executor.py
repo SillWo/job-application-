@@ -153,6 +153,12 @@ class BrowserExecutor:
         if self._playwright:
             await self._playwright.stop()
 
+    async def bring_to_front(self) -> None:
+        """Focus the existing page without navigating or creating a context."""
+        if self.page is None:
+            raise RuntimeError("Браузер сессии ещё не готов")
+        await self.page.bring_to_front()
+
     async def execute(self, action: str, **kwargs):
         if action not in ALLOWED_ACTIONS:
             raise ValueError(f"Запрещённое действие Browser Agent: {action}")

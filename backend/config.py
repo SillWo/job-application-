@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -38,6 +39,7 @@ class Settings(BaseSettings):
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 Chrome/128 Safari/537.36"
     )
+    hirehi_search_version: Literal["hirehi_v1", "hirehi_adaptive_v3"] = "hirehi_adaptive_v3"
 
 
 settings = Settings()

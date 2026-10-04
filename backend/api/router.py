@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import csv
-import io
-import xml.etree.ElementTree as ET
-from datetime import date, datetime, time, timezone
+from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Literal
 from urllib.parse import urlparse, urlunparse
 
@@ -18,10 +16,11 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import select, update
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
 
 from backend.adapters import adapter_registry
 from backend.browser.executor import BrowserExecutor
@@ -34,6 +33,7 @@ from backend.browser.sessions import (
 )
 from backend.config import settings
 from backend.intelligence.gateway import ModelGateway, ModelUnavailable
+from backend.intelligence.model_broker import ModelRequestBroker
 from backend.intelligence.model_config import (
     auth_headers,
     is_local_url,
@@ -42,43 +42,126 @@ from backend.intelligence.model_config import (
     validate_base_url,
 )
 from backend.intelligence.security import sanitize_untrusted_input
-from backend.orchestrator.workflow import workflow_manager
 from backend.persistence.crypto import decrypt_secret, encrypt_secret
 from backend.persistence.database import get_db
+from backend.persistence.execution_models import (
+    SessionExecution,
+    SessionIdempotencyKey,
+    SiteExecutionLease,
+)
+from backend.persistence.model_request_models import ModelRequest
 from backend.persistence.models import (
     AIModelSettings,
     BrowserEvent,
-    Evaluation,
     JobSession,
     Notification,
     SavedResumeSource,
     SessionResumeSnapshot,
-    Vacancy,
+)
+
+# The API process owns only durable state and worker IPC. Workflow/Playwright
+# are imported lazily by the spawned runtime worker.
+from backend.runtime import runtime_supervisor
+from backend.runtime.lifecycle import (
+    canonical_payload_hash,
+    claim_site_lease,
+    ensure_execution,
+    find_idempotency,
+    idempotency_record,
+    release_site_lease,
+    request_cancel,
+    request_start,
 )
 from backend.schemas.domain import (
     SessionStatus,
     SiteResumeSnapshot,
 )
+from backend.services.private_text import _unseal_private
 from backend.services.resume_session import (
     ResumeImportError,
     ResumeImportUnavailable,
     SavedResumeSourceNotFound,
-    _unseal_private,
+    _private_gender_value,
+    _redacted_snapshot,
     confirm_saved_resume_source,
     delete_saved_resume_source,
     extract_resume,
     issue_preview_token,
     list_saved_resume_sources,
+    load_saved_resume_data,
     persist_session_snapshot,
     public_preview,
     refresh_saved_resume_source,
-    revalidate_saved_resume_source,
     saved_resume_source_record,
     update_saved_resume_gender,
+    uses_saved_resume_data,
     validate_adapter_resume_url,
 )
 
 router = APIRouter(prefix="/api")
+_SAVED_RESUME_REFRESH_ERROR = 'Обновите данные резюме во вкладке «Профиль»'
+
+
+def _validate_session_resume_snapshot(snapshot: SessionResumeSnapshot, adapter_id: str) -> SiteResumeSnapshot:
+    """Validate the durable full copy before starting or resuming a session."""
+    try:
+        full = SiteResumeSnapshot.model_validate(snapshot.full_snapshot)
+        public, _ = _redacted_snapshot(full)
+        if (
+            snapshot.source_site != adapter_id
+            or full.source_site != adapter_id
+            or snapshot.source_url_hash != full.source_url_hash
+            or snapshot.content_hash != public.content_hash
+            or SiteResumeSnapshot.model_validate(snapshot.snapshot).content_hash != snapshot.content_hash
+        ):
+            raise ValueError("snapshot integrity mismatch")
+        _private_gender_value(snapshot.private_view)
+    except Exception as exc:
+        raise HTTPException(422, "Снимок резюме сессии повреждён; запустите новую сессию") from exc
+    return full
+
+
+class _LazyWorkflowManager:
+    """Compatibility shim for report/legacy tests.
+
+    Accessing this object imports workflow only for an explicit legacy API
+    operation; normal session creation and start stay process-isolated.
+    """
+
+    def __getattr__(self, name):
+        from backend.orchestrator.workflow import workflow_manager as manager
+        return getattr(manager, name)
+
+
+workflow_manager = _LazyWorkflowManager()
+_session_create_lock = Lock()
+_profile_operation_guard = Lock()
+_profile_operation_locks: dict[str, Lock] = {}
+
+
+def _profile_operation_lock(site_id: str) -> Lock:
+    """Return one process-wide gate for preview/refresh browser profiles."""
+    with _profile_operation_guard:
+        return _profile_operation_locks.setdefault(site_id, Lock())
+
+
+def _assert_durable_profile_free(db: Session, site_id: str) -> None:
+    """Reject preview/refresh while a durable session owns the profile."""
+    if not hasattr(db, "get"):
+        return
+    lease = db.get(SiteExecutionLease, site_id)
+    if lease is None:
+        return
+    owner = db.get(JobSession, lease.session_id)
+    if owner is None or owner.status in {
+        SessionStatus.COMPLETED, SessionStatus.STOPPED, SessionStatus.FAILED, "CANCELLED",
+    }:
+        if hasattr(db, "delete"):
+            db.delete(lease)
+            if hasattr(db, "commit"):
+                db.commit()
+        return
+    raise HTTPException(409, "Профиль сайта занят другой сессией")
 
 
 def _check_model_origin(request: Request) -> None:
@@ -290,10 +373,12 @@ class SessionCreate(BaseModel):
     adapter_id: str
     application_limit: int | None = Field(default=5, ge=1)
     guaranteed_application: bool = False
+    hirehi_pro_enabled: bool = False
     cover_letter_auto: bool = True
     cover_letter_template: str = Field(default="", max_length=12000)
     # ``None`` means that the cover-letter writer uses its default cap.
     cover_letter_max_words: int | None = Field(default=150, ge=1, le=10000)
+    auto_start: bool = False
 
     @classmethod
     def _minimum_limits(cls) -> dict[str, int]:
@@ -347,8 +432,48 @@ def health() -> dict:
 
 @router.get("/model/status")
 @router.post("/model/check")
-async def model_status():
-    return _no_store(await ModelGateway().status())
+async def model_status(db: Session = Depends(get_db)):
+    """Return catalog availability and observed generation health separately.
+
+    Catalog discovery is a provider check.  Generation health is a read-only
+    summary of real broker work and must never be inferred from that catalog
+    response.  Diagnostic ids are deliberately exposed instead of internal
+    request ids or provider error details.
+    """
+    catalog = await ModelGateway().status()
+    session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, expire_on_commit=False
+    )
+    health = ModelRequestBroker(session_factory).generation_health()
+
+    def event(request_id: str | None, happened_at: datetime | None) -> dict | None:
+        if request_id is None or happened_at is None:
+            return None
+        request_row = db.get(ModelRequest, request_id)
+        timestamp = (
+            happened_at
+            if happened_at.tzinfo is not None
+            else happened_at.replace(tzinfo=timezone.utc)
+        )
+        return {
+            "diagnostic_id": request_row.diagnostic_id if request_row is not None else None,
+            "at": timestamp.isoformat(),
+        }
+
+    generation_health = {
+        "healthy": health["healthy"],
+        "success_count": health["success_count"],
+        "failure_count": health["failure_count"],
+        "running": health["running"],
+        "queued": health["queued"],
+        "last_success": event(
+            health.get("last_success_request_id"), health.get("last_success_at")
+        ),
+        "last_failure": event(
+            health.get("last_failure_request_id"), health.get("last_failure_at")
+        ),
+    }
+    return _no_store({**catalog, "generation_health": generation_health})
 
 
 class ResumeSourcePreviewIn(BaseModel):
@@ -379,21 +504,31 @@ async def preview_resume_source(payload: ResumeSourcePreviewIn, db: Session = De
     but preview responses do not need to return it; private values remain
     server-side until local letter/form filling.
     """
+    lock = _profile_operation_lock(payload.adapter_id)
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "Профиль сайта занят другой операцией")
     try:
-        canonical_url, ref = validate_adapter_resume_url(payload.adapter_id, payload.resume_url)
-        snapshot = await extract_resume(
-            payload.adapter_id, canonical_url, validated=(canonical_url, ref)
-        )
-        token = issue_preview_token(
-            db, payload.adapter_id, snapshot, source_url=canonical_url
-        )
-    except KeyError as exc:
-        raise HTTPException(400, "Неизвестный сайт вакансий") from exc
-    except ResumeImportUnavailable as exc:
-        raise HTTPException(501, str(exc)) from exc
-    except ResumeImportError as exc:
-        db.rollback()
-        raise HTTPException(422, str(exc)) from exc
+        try:
+            _assert_durable_profile_free(db, adapter_registry.get(payload.adapter_id).site_id)
+        except KeyError as exc:
+            raise HTTPException(400, "Неизвестный сайт вакансий") from exc
+        try:
+            canonical_url, ref = validate_adapter_resume_url(payload.adapter_id, payload.resume_url)
+            snapshot = await extract_resume(
+                payload.adapter_id, canonical_url, validated=(canonical_url, ref)
+            )
+            token = issue_preview_token(
+                db, payload.adapter_id, snapshot, source_url=canonical_url
+            )
+        except KeyError as exc:
+            raise HTTPException(400, "Неизвестный сайт вакансий") from exc
+        except ResumeImportUnavailable as exc:
+            raise HTTPException(501, str(exc)) from exc
+        except ResumeImportError as exc:
+            db.rollback()
+            raise HTTPException(422, str(exc)) from exc
+    finally:
+        lock.release()
     return _no_store({"preview_token": token, "preview": public_preview(snapshot)})
 
 
@@ -453,11 +588,22 @@ async def refresh_resume_source(adapter_id: str, db: Session = Depends(get_db)) 
         adapter_registry.get(adapter_id)
     except KeyError as exc:
         raise HTTPException(400, "Неизвестный сайт вакансий") from exc
+    lock = _profile_operation_lock(adapter_id)
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "Профиль сайта занят другой операцией")
     try:
-        row, token = await refresh_saved_resume_source(db, adapter_id)
-    except SavedResumeSourceNotFound as exc:
-        raise HTTPException(404, "Сохраненный источник не найден") from exc
-    return _no_store(saved_resume_source_record(row, preview_token=token))
+        _assert_durable_profile_free(db, adapter_registry.get(adapter_id).site_id)
+        try:
+            row, token = await refresh_saved_resume_source(
+                db,
+                adapter_id,
+                issue_token=not uses_saved_resume_data(adapter_id),
+            )
+        except SavedResumeSourceNotFound as exc:
+            raise HTTPException(404, "Сохраненный источник не найден") from exc
+        return _no_store(saved_resume_source_record(row, preview_token=token))
+    finally:
+        lock.release()
 
 
 @router.delete("/resume-sources/{adapter_id}")
@@ -500,9 +646,11 @@ def session_dict(item: JobSession) -> dict:
         "adapter_id": item.adapter_id,
         "application_limit": item.application_limit,
         "guaranteed_application": bool(item.guaranteed_application),
+        "hirehi_pro_enabled": bool(getattr(item, "hirehi_pro_enabled", False)),
         "cover_letter_auto": getattr(item, "cover_letter_auto", None) is not False,
         "cover_letter_template": getattr(item, "cover_letter_template", "") or "",
         "cover_letter_max_words": getattr(item, "cover_letter_max_words", None),
+        "auto_start": bool(getattr(item, "auto_start", True)),
         "status": item.status,
         "counters": item.counters or {},
         "started_at": item.started_at.isoformat() if item.started_at else None,
@@ -524,8 +672,24 @@ def session_dict(item: JobSession) -> dict:
     return result
 
 
-@router.post("/sessions")
-def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dict:
+@router.post("/sessions", status_code=202)
+def create_session(
+    payload: SessionCreate,
+    db: Session = Depends(get_db),
+    request: Request = None,
+) -> dict:
+    # The idempotency and site-lease rows form one small critical section.
+    # This protects the common two-client race before the database's unique
+    # constraints are reached (and keeps a losing request from creating a
+    # transient JobSession at all).
+    with _session_create_lock:
+        return _create_session(payload, db, request)
+
+
+def _create_session(
+    payload: SessionCreate, db: Session, request: Request | None = None
+) -> dict:
+    # Keep direct service callers usable while FastAPI supplies Request/DB.
     # Persist clean launch/template copies; the submitted request object stays
     # untouched for validation and audit, and injected prose cannot alter the
     # workflow's trusted instructions.
@@ -539,6 +703,24 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         adapter_registry.get(payload.adapter_id)
     except KeyError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # Durable runtime path: HH/Zarplata pin their confirmed local copy here;
+    # HireHi retains its network import in the spawned worker. Check idempotency
+    # before the mutable saved-source row so a retry keeps its original ID
+    # even if the profile was edited between requests.
+    key = (request.headers.get("Idempotency-Key") if request is not None else "") or ""
+    key = key.strip()
+    payload_hash = canonical_payload_hash(payload.model_dump(mode="json"))
+    if len(key) > 255:
+        raise HTTPException(400, "Idempotency-Key too long")
+    if key:
+        prior = find_idempotency(db, key)
+        if prior is not None:
+            if prior.payload_hash != payload_hash:
+                raise HTTPException(409, "Idempotency-Key payload mismatch")
+            existing = db.get(JobSession, prior.session_id)
+            if existing is None:
+                raise HTTPException(409, "Idempotency-Key target is unavailable")
+            return session_dict(existing)
     # Launches always come from a confirmed durable source. Preview tokens are
     # intentionally limited to the confirmation flow and cannot launch a
     # session on their own.
@@ -546,10 +728,99 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         select(SavedResumeSource).where(SavedResumeSource.adapter_id == payload.adapter_id)
     )
     if saved_source is None:
+        if uses_saved_resume_data(payload.adapter_id):
+            raise HTTPException(400, _SAVED_RESUME_REFRESH_ERROR)
         raise HTTPException(400, "Сначала проверьте и подтвердите ссылку на резюме выбранного сайта")
+    # HH and Zarplata sessions are pinned synchronously to the last locally
+    # confirmed full snapshot.  This happens before a JobSession or lease is
+    # created, so a missing/corrupt cache cannot leave accepted work behind.
+    saved_snapshot = None
+    if uses_saved_resume_data(payload.adapter_id):
+        try:
+            saved_snapshot = load_saved_resume_data(saved_source)
+        except ResumeImportError as exc:
+            raise HTTPException(400, _SAVED_RESUME_REFRESH_ERROR) from exc
+    site_id = adapter_registry.get(payload.adapter_id).site_id
+    current_lease = db.get(SiteExecutionLease, site_id)
+    if current_lease is not None:
+        owner = db.get(JobSession, current_lease.session_id)
+        if owner is None or owner.status in {
+            SessionStatus.COMPLETED, SessionStatus.STOPPED, SessionStatus.FAILED, "CANCELLED",
+        }:
+            db.delete(current_lease)
+            db.flush()
+        else:
+            raise HTTPException(409, "Another session owns this site")
+    item = JobSession(
+        desired_job_description=safe_description,
+        minimum_scores=payload.minimum_scores or None,
+        adapter_id=payload.adapter_id,
+        application_limit=None if payload.adapter_id == "hirehi" else payload.application_limit,
+        guaranteed_application=payload.guaranteed_application,
+        hirehi_pro_enabled=payload.hirehi_pro_enabled if payload.adapter_id == "hirehi" else False,
+        cover_letter_auto=payload.cover_letter_auto,
+        cover_letter_template=safe_template,
+        cover_letter_max_words=payload.cover_letter_max_words,
+        status=SessionStatus.PREPARING,
+        counters={},
+    )
+    db.add(item)
+    db.flush()
+    if saved_snapshot is not None:
+        try:
+            persisted_snapshot = persist_session_snapshot(db, item.id, saved_snapshot)
+        except ResumeImportError as exc:
+            db.rollback()
+            raise HTTPException(400, _SAVED_RESUME_REFRESH_ERROR) from exc
+    else:
+        persisted_snapshot = None
+    ensure_execution(
+        db, item.id, stage="PREPARING",
+        source_url=getattr(saved_source, "source_url", None),
+        source_url_hash=(persisted_snapshot.source_url_hash if persisted_snapshot else
+                         getattr(saved_source, "source_url_hash", None)),
+        source_content_hash=(
+            persisted_snapshot.content_hash
+            if persisted_snapshot
+            else (
+                getattr(saved_source, "content_hash", None)
+                if uses_saved_resume_data(payload.adapter_id)
+                else None
+            )
+        ),
+    )
+    if not claim_site_lease(db, site_id, item.id, 0):
+        db.rollback()
+        raise HTTPException(409, "Another session owns this site")
+    if payload.auto_start:
+        request_start(db, item.id)
+    if key:
+        try:
+            idempotency_record(db, key, payload_hash, item.id)
+        except IntegrityError:
+            db.rollback()
+            prior = find_idempotency(db, key)
+            if prior is None or prior.payload_hash != payload_hash:
+                raise HTTPException(409, "Idempotency-Key conflict") from None
+            existing = db.get(JobSession, prior.session_id)
+            return session_dict(existing)
+    db.commit()
+    db.refresh(item)
+    if runtime_supervisor.start(site_id=site_id, session_id=item.id) is None:
+        # A supervisor-level conflict can happen after the transaction (for
+        # example, an old process is still being retired).  Do not leave an
+        # unstartable accepted row or an idempotency key behind.
+        db.query(SessionIdempotencyKey).filter(
+            SessionIdempotencyKey.session_id == item.id
+        ).delete(synchronize_session=False)
+        db.delete(item)
+        db.commit()
+        raise HTTPException(409, "Another session owns this site")
+    return session_dict(item)
+    """
     try:
-        refreshed, launch_snapshot = asyncio.run(
-            revalidate_saved_resume_source(db, payload.adapter_id)
+        refreshed, launch_snapshot = (None, None)  # unreachable legacy text
+            # importer moved to backend.runtime.worker
         )
         if refreshed.status == "unavailable":
             raise ResumeImportError("Не удалось повторно проверить сохраненное резюме")
@@ -560,8 +831,14 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
         desired_job_description=safe_description,
         minimum_scores=payload.minimum_scores or None,
         adapter_id=payload.adapter_id,
-        application_limit=payload.application_limit,
+        # HireHi discovery sessions are stopped manually and therefore never
+        # carry a numeric application cap, including requests from legacy or
+        # third-party clients that still submit one.
+        application_limit=None if payload.adapter_id == "hirehi" else payload.application_limit,
         guaranteed_application=payload.guaranteed_application,
+        # PRO tools are specific to HireHi; normalize the value for all other
+        # adapters so clients can safely send a shared launch payload.
+        hirehi_pro_enabled=payload.hirehi_pro_enabled if payload.adapter_id == "hirehi" else False,
         cover_letter_auto=payload.cover_letter_auto,
         cover_letter_template=safe_template,
         cover_letter_max_words=payload.cover_letter_max_words,
@@ -571,18 +848,97 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
     db.add(item)
     db.flush()
     try:
-        persist_session_snapshot(db, item.id, launch_snapshot)
+        # snapshot persistence moved to backend.runtime.worker
     except ResumeImportError as exc:
         db.rollback()
         raise HTTPException(422, str(exc)) from exc
     db.commit()
     db.refresh(item)
     return session_dict(item)
+    """
+
+
+def _session_list_item(row) -> dict:
+    """Small history projection; deliberately excludes recovery JSON."""
+    return {
+        "id": row.id,
+        "desired_job_description": row.desired_job_description or "",
+        "minimum_scores": row.minimum_scores,
+        "adapter_id": row.adapter_id,
+        "application_limit": row.application_limit,
+        "guaranteed_application": bool(row.guaranteed_application),
+        "hirehi_pro_enabled": bool(row.hirehi_pro_enabled),
+        "cover_letter_auto": row.cover_letter_auto is not False,
+        "cover_letter_template": row.cover_letter_template or "",
+        "cover_letter_max_words": row.cover_letter_max_words,
+        "auto_start": True,
+        "status": row.status,
+        "counters": row.counters or {},
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+        "stop_reason": row.stop_reason,
+        "execution_stage": row.execution_stage,
+        "heartbeat_at": row.heartbeat_at.isoformat() if row.heartbeat_at else None,
+        "resume_snapshot": None,
+    }
+
+
+def _session_history_page(
+    db: Session, *, limit: int, offset: int, terminal_only: bool = False
+) -> dict:
+    if limit < 1 or limit > 200:
+        raise HTTPException(422, "limit must be between 1 and 200")
+    if offset < 0:
+        raise HTTPException(422, "offset must be non-negative")
+    terminal_statuses = (
+        SessionStatus.COMPLETED,
+        SessionStatus.STOPPED,
+        SessionStatus.FAILED,
+        SessionStatus.CANCELLED,
+    )
+    filters = [JobSession.status.in_(terminal_statuses)] if terminal_only else []
+    total = db.scalar(select(func.count(JobSession.id)).where(*filters)) or 0
+    stmt = (
+        select(
+            JobSession.id, JobSession.desired_job_description, JobSession.minimum_scores,
+            JobSession.adapter_id, JobSession.application_limit,
+            JobSession.guaranteed_application, JobSession.hirehi_pro_enabled,
+            JobSession.cover_letter_auto, JobSession.cover_letter_template,
+            JobSession.cover_letter_max_words, JobSession.status, JobSession.counters,
+            JobSession.started_at, JobSession.finished_at, JobSession.stop_reason,
+            SessionExecution.stage.label("execution_stage"),
+            SessionExecution.heartbeat_at,
+        )
+        .outerjoin(SessionExecution, SessionExecution.session_id == JobSession.id)
+        .where(*filters)
+        .order_by(JobSession.id.desc())
+        .limit(limit).offset(offset)
+    )
+    items = [_session_list_item(row) for row in db.execute(stmt)]
+    return {"items": items, "total": total, "limit": limit, "offset": offset,
+            "has_more": offset + len(items) < total}
 
 
 @router.get("/sessions")
-def sessions(db: Session = Depends(get_db)) -> list[dict]:
-    return [session_dict(s) for s in db.scalars(select(JobSession).order_by(JobSession.id.desc()))]
+def sessions(
+    legacy: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    # The historical endpoint is intentionally a light list for old clients.
+    page = _session_history_page(db, limit=50, offset=0)
+    return page["items"]
+
+
+@router.get("/sessions/history")
+def sessions_history(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    terminal_only: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    return _no_store(
+        _session_history_page(db, limit=limit, offset=offset, terminal_only=terminal_only)
+    )
 
 
 @router.get("/sessions/{session_id}/resume")
@@ -597,7 +953,8 @@ def session_resume(session_id: int, db: Session = Depends(get_db)) -> dict:
     if snapshot is None:
         raise HTTPException(404, "Временный снимок резюме недоступен")
     safe = SiteResumeSnapshot.model_validate(snapshot.snapshot)
-    result = public_preview(safe)
+    execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
+    result = public_preview(safe, source_url=getattr(execution, "source_url", None) if execution else None)
     result["session_id"] = session_id
     result["professional"] = snapshot.professional_view
     private = _unseal_private(snapshot.private_view)
@@ -611,8 +968,28 @@ def session_resume(session_id: int, db: Session = Depends(get_db)) -> dict:
         "email": isinstance(contacts, dict) and isinstance(contacts.get("email"), dict)
         and contacts["email"].get("availability") == "present",
     }
+    result["snapshot"] = snapshot.full_snapshot or safe.model_dump(mode="json")
     # Explicitly avoid returning the encrypted private payload as well.
     return _no_store(result)
+
+
+@router.get("/sessions/{session_id}/ai-context")
+def session_ai_context(session_id: int, db: Session = Depends(get_db)) -> JSONResponse:
+    item = db.get(JobSession, session_id)
+    if item is None:
+        raise HTTPException(404, "Session not found")
+    snapshot = db.scalar(select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == session_id))
+    if snapshot is None:
+        raise HTTPException(404, "Resume snapshot unavailable")
+    from backend.services.resume_session import full_resume_model_payload
+    model_resume = full_resume_model_payload(snapshot.full_snapshot or snapshot.snapshot)
+    # The model-facing projection is complete and excludes the sealed private
+    # payload; no-store prevents browser caches retaining resume context.
+    return _no_store({
+        "session_id": session_id,
+        "resume": model_resume,
+        "snapshot": snapshot.full_snapshot or snapshot.snapshot,
+    })
 
 
 @router.post("/sessions/{session_id}/start")
@@ -620,33 +997,51 @@ async def start_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
     if not item:
         raise HTTPException(404, "Сессия не найдена")
-    if item.status != SessionStatus.CREATED:
+    if item.status not in {SessionStatus.PREPARING, SessionStatus.CREATED}:
         raise HTTPException(409, "Запустить можно только новую сессию")
     snapshot = db.scalar(select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == item.id))
-    if snapshot is None:
+    if snapshot is not None:
+        _validate_session_resume_snapshot(snapshot, item.adapter_id)
+        if _private_gender_value(snapshot.private_view) is None:
+            raise HTTPException(422, "Resume snapshot requires a valid gender")
+    elif uses_saved_resume_data(item.adapter_id):
+        # Older PREPARING sessions were created before the API pinned their
+        # local source copy.  Backfill once from disk/database, never from the
+        # public site, before requesting the worker start.
+        source = db.scalar(
+            select(SavedResumeSource).where(SavedResumeSource.adapter_id == item.adapter_id)
+        )
+        try:
+            if source is None:
+                raise ResumeImportError(_SAVED_RESUME_REFRESH_ERROR)
+            full = load_saved_resume_data(source)
+            snapshot = persist_session_snapshot(db, session_id, full)
+        except ResumeImportError as exc:
+            db.rollback()
+            raise HTTPException(422, _SAVED_RESUME_REFRESH_ERROR) from exc
+        _validate_session_resume_snapshot(snapshot, item.adapter_id)
+        ensure_execution(
+            db,
+            session_id,
+            source_url_hash=snapshot.source_url_hash,
+            source_content_hash=snapshot.content_hash,
+        )
+    elif item.status == SessionStatus.CREATED:
         raise HTTPException(400, "Временный снимок резюме не найден; проверьте ссылку ещё раз")
-    # Creation already performs source revalidation. The immutable snapshot
-    # is the only supported input for starting this session.
-    if snapshot.source_site != item.adapter_id:
-        raise HTTPException(409, "Снимок резюме принадлежит другому сайту")
-    private = _unseal_private(snapshot.private_view)
-    gender = (private.get("identity", {}).get("gender", {})
-              if isinstance(private.get("identity"), dict) else {})
-    source = db.scalar(
-        select(SavedResumeSource).where(SavedResumeSource.adapter_id == item.adapter_id)
-    )
-    if (
-        gender.get("value") not in {"male", "female"}
-        and (source is None or source.grammatical_gender not in {"male", "female"})
-    ):
-        raise HTTPException(422, "Выберите мужской или женский род в настройках сохраненного резюме")
-    if not item.cover_letter_auto and not (item.cover_letter_template or "").strip():
-        raise HTTPException(422, "Укажите структуру сопроводительного письма")
-    if workflow_manager.launch(session_id) is False:
-        raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
-    item.status = SessionStatus.RUNNING
+    if item.status == SessionStatus.CREATED:
+        ensure_execution(
+            db,
+            session_id,
+            source_url_hash=snapshot.source_url_hash,
+            source_content_hash=snapshot.content_hash,
+        )
+    item.status = SessionStatus.PREPARING
+    request_start(db, session_id)
     db.commit()
-    return {"ok": True}
+    adapter = adapter_registry.get(item.adapter_id)
+    if runtime_supervisor.start(site_id=adapter.site_id, session_id=session_id) is None:
+        raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
+    return session_dict(item)
 
 
 @router.post("/sessions/{session_id}/pause")
@@ -661,34 +1056,26 @@ async def resume_session(session_id: int, db: Session = Depends(get_db)) -> dict
     item = db.get(JobSession, session_id)
     if not item:
         raise HTTPException(404, "Сессия не найдена")
-    if item.status not in {
-        SessionStatus.PAUSED,
-    }:
+    if item.status != SessionStatus.PAUSED:
         raise HTTPException(409, "Продолжить можно только приостановленную сессию")
     snapshot = db.scalar(select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == item.id))
     if snapshot is None:
         raise HTTPException(400, "Временный снимок резюме не найден; восстановление невозможно")
     # A PAUSED session resumes its already checked immutable snapshot.
-    if snapshot.source_site != item.adapter_id:
-        raise HTTPException(409, "Снимок резюме принадлежит другому сайту")
-    private = _unseal_private(snapshot.private_view)
-    gender = (private.get("identity", {}).get("gender", {})
-              if isinstance(private.get("identity"), dict) else {})
-    source = db.scalar(
-        select(SavedResumeSource).where(SavedResumeSource.adapter_id == item.adapter_id)
+    _validate_session_resume_snapshot(snapshot, item.adapter_id)
+    ensure_execution(
+        db,
+        session_id,
+        source_url_hash=snapshot.source_url_hash,
+        source_content_hash=snapshot.content_hash,
     )
-    if (
-        gender.get("value") not in {"male", "female"}
-        and (source is None or source.grammatical_gender not in {"male", "female"})
-    ):
-        raise HTTPException(422, "Выберите мужской или женский род в настройках сохраненного резюме")
-    if not item.cover_letter_auto and not (item.cover_letter_template or "").strip():
-        raise HTTPException(422, "Укажите структуру сопроводительного письма")
-    if workflow_manager.launch(session_id) is False:
-        raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
-    item.status = SessionStatus.RUNNING
+    request_start(db, session_id)
+    item.status = SessionStatus.PREPARING
     item.stop_reason = None
     db.commit()
+    adapter = adapter_registry.get(item.adapter_id)
+    if runtime_supervisor.start(site_id=adapter.site_id, session_id=session_id) is None:
+        raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
     return session_dict(item)
 
 
@@ -697,27 +1084,89 @@ async def stop_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
     if not item:
         raise HTTPException(404, "Сессия не найдена")
-    item.status = SessionStatus.STOPPED
-    item.stop_reason = "Остановлено пользователем"
-    item.finished_at = datetime.now(timezone.utc)
+    durable_db = all(hasattr(db, name) for name in ("add", "flush", "scalar", "commit"))
+    if not durable_db:
+        item.status = SessionStatus.STOPPED
+        item.stop_reason = "Остановлено пользователем"
+        item.finished_at = datetime.now(timezone.utc)
+        if item.adapter_id == "hirehi":
+            workflow_manager.write_hirehi_report(session_id)
+        await close_browser(session_id)
+        return session_dict(item)
+
+    if item.status in {
+        SessionStatus.COMPLETED,
+        SessionStatus.CANCELLED,
+        SessionStatus.STOPPED,
+        SessionStatus.FAILED,
+    }:
+        try:
+            site_id = adapter_registry.get(item.adapter_id).site_id
+        except KeyError:
+            site_id = item.adapter_id
+        await close_browser(session_id)
+        release_browser_lease(session_id, site_id)
+        release_site_lease(db, site_id, session_id)
+        db.commit()
+        return session_dict(item)
+
+    request_cancel(db, session_id, reason="user")
     db.commit()
-    task = workflow_manager.tasks.get(session_id)
-    if task and not task.done():
+    try:
+        adapter = adapter_registry.get(item.adapter_id)
+        site_id = adapter.site_id
+    except KeyError:
+        # Historical/imported sessions can outlive an adapter registration;
+        # the durable site lease is keyed by the stored adapter identifier.
+        site_id = item.adapter_id
+
+    # A live process worker owns its own browser and terminal cleanup. Its
+    # monitor observes STOPPED/COMPLETED IPC and performs the CANCELLED
+    # transition asynchronously, so the API must return the durable STOPPING
+    # intent without waiting for browser shutdown.
+    if runtime_supervisor.cancel(site_id=site_id, session_id=session_id):
+        return session_dict(item)
+
+    # Compatibility path for an in-process workflow task or a paused session
+    # with no worker. The durable cancel fence is already visible before this
+    # task is interrupted, preventing another form submission from starting.
+    manager = workflow_manager
+    task = manager.tasks.get(session_id)
+    task_was_running = bool(task and not task.done())
+    if task_was_running:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
     await close_browser(session_id)
+    release_browser_lease(session_id, site_id)
+    db.refresh(item)
+
+    # Report generation precedes terminalizing pending vacancies to preserve
+    # the existing HireHi contract for both paused sessions and legacy tasks.
     if item.adapter_id == "hirehi":
-        workflow_manager.write_hirehi_report(session_id)
+        manager.write_hirehi_report(session_id)
+    item.status = SessionStatus.CANCELLED
+    item.stop_reason = "Остановлено пользователем"
+    item.finished_at = datetime.now(timezone.utc)
+    manager._terminalize_pending_vacancies(db, item)
+    from backend.orchestrator.workflow import _scrub_snapshot_question_artifacts
+
+    _scrub_snapshot_question_artifacts(db, session_id)
+    execution = db.scalar(
+        select(SessionExecution).where(SessionExecution.session_id == session_id)
+    )
+    if execution is not None:
+        execution.stage = "CANCELLED"
+        execution.cancel_requested = True
+        execution.last_progress_at = datetime.now(timezone.utc)
+        execution.wait_reason = "user"
+    release_site_lease(db, site_id, session_id)
+    db.commit()
     if (getattr(item, "recovery", None) or {}).get("measurement_identity"):
-        # A CAPTCHA-paused session has no running task to freeze it in finally.
         from backend.services.search_metrics import freeze
 
         db.refresh(item)
         freeze(db, item)
-    # STOPPED is terminal only after any report/metrics work above succeeds.
-    from backend.services.resume_session import delete_snapshot
-
-    delete_snapshot(db, session_id)
     db.commit()
     return session_dict(item)
 
@@ -727,17 +1176,41 @@ async def open_session_browser(session_id: int, db: Session = Depends(get_db)) -
     item = db.get(JobSession, session_id)
     if not item:
         raise HTTPException(404, "Сессия не найдена")
+    adapter = adapter_registry.get(item.adapter_id)
+    worker = runtime_supervisor.worker(adapter.site_id)
+    if worker is not None:
+        if worker.session_id != session_id:
+            raise HTTPException(409, "Браузер сайта принадлежит другой рабочей сессии")
+        if not worker.process.is_alive():
+            raise HTTPException(409, "Рабочая сессия браузера восстанавливается; повторите попытку позже")
+        result = await runtime_supervisor.open_browser(site_id=adapter.site_id, session_id=session_id)
+        if not result.get("ok"):
+            raise HTTPException(503, result.get("message") or "Рабочая сессия не открыла браузер")
+        return result
+    if item.status in {SessionStatus.PREPARING, SessionStatus.RUNNING, SessionStatus.STOPPING}:
+        raise HTTPException(409, "Активная сессия ожидает восстановления рабочего браузера")
     existing = get_browser(session_id)
     if existing:
         return {"ok": True, "message": "Браузер уже открыт"}
-    adapter = adapter_registry.get(item.adapter_id)
+    durable_db = hasattr(db, "add") and hasattr(db, "commit")
+    if durable_db:
+        execution = ensure_execution(db, session_id)
+        if not claim_site_lease(db, adapter.site_id, session_id, execution.generation):
+            raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
+        db.commit()
     if not acquire_browser_lease(session_id, adapter.site_id):
+        if durable_db:
+            release_site_lease(db, adapter.site_id, session_id)
+            db.commit()
         raise HTTPException(409, "Для этого сайта уже открыт браузер другой сессии")
     executor = BrowserExecutor(adapter.site_id, adapter.allowed_domains, headless=False)
     try:
         await executor.start()
     except Exception:
         release_browser_lease(session_id, adapter.site_id)
+        if durable_db:
+            release_site_lease(db, adapter.site_id, session_id)
+            db.commit()
         raise
     # Keep the landing page explicit per supported site: this is also the
     # first page used for manual login in the persistent Chromium profile.
@@ -766,21 +1239,51 @@ async def check_session_browser(session_id: int, db: Session = Depends(get_db)) 
     item = db.get(JobSession, session_id)
     if not item:
         raise HTTPException(404, "Сессия не найдена")
-    executor = get_browser(session_id)
-    if not executor:
-        raise HTTPException(
-            400,
-            f"Сначала откройте Chromium для {getattr(adapter_registry.get(item.adapter_id), 'display_name', item.adapter_id)}",
-        )
     adapter = adapter_registry.get(item.adapter_id)
-    login = await adapter.get_login_state(executor.page)
-    if not login.authenticated:
-        raise HTTPException(400, login.message)
-    if workflow_manager.launch(session_id) is False:
-        raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
-    item.status = SessionStatus.RUNNING
-    item.stop_reason = None
+    worker = runtime_supervisor.worker(adapter.site_id)
+    if worker is not None:
+        if worker.session_id != session_id:
+            raise HTTPException(409, "Браузер сайта принадлежит другой рабочей сессии")
+        if not worker.process.is_alive():
+            raise HTTPException(409, "Рабочая сессия браузера восстанавливается; повторите попытку позже")
+        login = await runtime_supervisor.check_login(site_id=adapter.site_id, session_id=session_id)
+        if not login.get("ok"):
+            raise HTTPException(503, login.get("message") or "Не удалось проверить вход в браузере сессии")
+        if not login.get("authenticated"):
+            raise HTTPException(400, login.get("message") or "Войдите в аккаунт в открытом браузере")
+        execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
+        if execution is not None and not execution.start_requested:
+            request_start(db, session_id)
+            item.status = SessionStatus.PREPARING
+            db.commit()
+            if runtime_supervisor.start(site_id=adapter.site_id, session_id=session_id) is None:
+                raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
+        return {
+            "ok": True,
+            "message": f"Вход в {getattr(adapter, 'display_name', item.adapter_id)} подтверждён в браузере сессии",
+        }
+    else:
+        if item.status in {SessionStatus.PREPARING, SessionStatus.RUNNING, SessionStatus.STOPPING}:
+            raise HTTPException(409, "Вход проверяется рабочей сессией автоматически")
+        executor = get_browser(session_id)
+        if not executor:
+            raise HTTPException(
+                400,
+                f"Сначала откройте Chromium для {getattr(adapter, 'display_name', item.adapter_id)}",
+            )
+        login = await adapter.get_login_state(executor.page)
+        if not login.authenticated:
+            raise HTTPException(400, login.message)
+        # Playwright contexts cannot be transferred between API and worker
+        # processes. Close the manual login window before the worker opens the
+        # same persistent profile, so two contexts never own it at once.
+        await close_browser(session_id)
+        release_browser_lease(session_id, adapter.site_id)
+    request_start(db, session_id)
+    item.status = SessionStatus.PREPARING
     db.commit()
+    if runtime_supervisor.start(site_id=adapter.site_id, session_id=session_id) is None:
+        raise HTTPException(409, "Для этого сайта уже выполняется другая сессия")
     return {
         "ok": True,
         "message": f"Вход в {getattr(adapter, 'display_name', item.adapter_id)} подтверждён, сессия продолжена",
@@ -794,6 +1297,26 @@ async def session_browser_login_status(session_id: int, db: Session = Depends(ge
     if not item:
         raise HTTPException(404, "Сессия не найдена")
     adapter = adapter_registry.get(item.adapter_id)
+    worker = runtime_supervisor.worker(adapter.site_id)
+    if worker is not None:
+        if worker.session_id != session_id:
+            raise HTTPException(409, "Браузер сайта принадлежит другой рабочей сессии")
+        if not worker.process.is_alive():
+            raise HTTPException(409, "Рабочая сессия браузера восстанавливается; повторите попытку позже")
+        result = await runtime_supervisor.check_login(site_id=adapter.site_id, session_id=session_id)
+        if not result.get("ok"):
+            raise HTTPException(503, result.get("message") or "Не удалось проверить браузер сессии")
+        return {
+            "authenticated": bool(result.get("authenticated")),
+            "message": str(result.get("message", ""))[:255],
+            "url": result.get("url"),
+        }
+    if item.status in {SessionStatus.PREPARING, SessionStatus.RUNNING, SessionStatus.STOPPING}:
+        return {
+            "authenticated": False,
+            "message": "Вход проверяется рабочей сессией автоматически",
+            "url": None,
+        }
     executor = get_browser(session_id)
     if not executor:
         raise HTTPException(
@@ -827,7 +1350,20 @@ def get_session(session_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(JobSession, session_id)
     if not item:
         raise HTTPException(404, "Сессия не найдена")
-    return session_dict(item)
+    result = session_dict(item)
+    snapshot = db.scalar(select(SessionResumeSnapshot).where(SessionResumeSnapshot.session_id == session_id))
+    if snapshot is not None:
+        execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
+        result["resume_snapshot"] = {
+            "source_site": snapshot.source_site,
+            "imported_at": snapshot.imported_at.isoformat(),
+            "snapshot": snapshot.full_snapshot or snapshot.snapshot,
+            "import_url": public_preview(
+                SiteResumeSnapshot.model_validate(snapshot.snapshot),
+                source_url=getattr(execution, "source_url", None) if execution else None,
+            ).get("import_url"),
+        }
+    return _no_store(result)
 
 
 @router.get("/sessions/{session_id}/report")
@@ -894,468 +1430,6 @@ def public_evaluation(data: dict | None) -> dict | None:
     result = dict(data)
     result.pop("flag_matches", None)
     return result
-
-
-VACANCY_SCORE_KEYS = (
-    "tasks",
-    "skills",
-    "experience_depth",
-    "role_match",
-    "industry",
-    "special_requirements",
-)
-VACANCY_SCORE_ALIASES = {
-    "experience_depth": "required_years",
-    "role_match": "title",
-    "special_requirements": "languages",
-}
-VacancySort = Literal[
-    "id",
-    "title",
-    "state",
-    "date",
-    "site",
-    "total_score",
-    "tasks",
-    "skills",
-    "experience_depth",
-    "role_match",
-    "industry",
-    "special_requirements",
-]
-VacancySortDirection = Literal["asc", "desc"]
-VacancyExportFormat = Literal["csv", "xlsx", "xml"]
-VacancyStatusGroup = Literal["SUCCESS", "PROCESSING", "REJECTED", "UNCONFIRMED", "ERROR"]
-VACANCY_STATUS_GROUPS = {
-    "SUCCESS": frozenset({"SUBMITTED", "ALREADY_APPLIED", "REPORTED"}),
-    "PROCESSING": frozenset({"EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING"}),
-    "REJECTED": frozenset({"REJECTED_BY_MODEL"}),
-    "UNCONFIRMED": frozenset({"UNCONFIRMED"}),
-    "ERROR": frozenset({"ERROR"}),
-}
-VACANCY_EXPORT_HEADERS = (
-    "Номер вакансии",
-    "Название вакансии",
-    "Компания",
-    "Сайт",
-    "Дата",
-    "Общий балл",
-    "Задачи",
-    "Навыки",
-    "Опыт",
-    "Роль",
-    "Сфера",
-    "Особые требования",
-)
-
-
-def _numeric_score(value: object) -> int | float | None:
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
-
-
-def _evaluation_scores(evaluation: Evaluation | None) -> dict[str, int | float | None]:
-    if evaluation is None:
-        return {}
-    data = evaluation.data or {}
-    result: dict[str, int | float | None] = {"total_score": _numeric_score(data.get("score"))}
-    breakdown = data.get("score_breakdown")
-    if isinstance(breakdown, list):
-        for row in breakdown:
-            if not isinstance(row, dict) or not isinstance(row.get("key"), str):
-                continue
-            result[row["key"]] = _numeric_score(row.get("points"))
-    for key, alias in VACANCY_SCORE_ALIASES.items():
-        if result.get(key) is None and result.get(alias) is not None:
-            result[key] = result[alias]
-    return result
-
-
-def _comparable_status_time(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is not None:
-        return value.astimezone(timezone.utc).replace(tzinfo=None)
-    return value
-
-
-def _public_status_time(vacancy: Vacancy) -> str | None:
-    value = vacancy.status_changed_at
-    if value is None:
-        return None
-    # SQLite drops timezone offsets. New rows have a display platform and are
-    # written by ``now()`` in UTC; migrated legacy rows intentionally keep the
-    # exact local-looking literal requested for 01.09.2026 00:00.
-    if vacancy.site and value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.isoformat(timespec="seconds")
-
-
-def _export_status_time(vacancy: Vacancy) -> str:
-    value = vacancy.status_changed_at
-    if value is None:
-        return ""
-    if vacancy.site:
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        value = value.astimezone()
-    return value.strftime("%d.%m.%Y %H:%M")
-
-
-def _filtered_vacancy_rows(
-    db: Session,
-    *,
-    search: str | None = None,
-    state: str | None = None,
-    status_group: VacancyStatusGroup | None = None,
-    site: str | None = None,
-    status_date_from: date | None = None,
-    status_date_to: date | None = None,
-    total_score_min: float | None = None,
-    total_score_max: float | None = None,
-    score_limits: dict[str, tuple[float | None, float | None]] | None = None,
-    sort: VacancySort = "date",
-    sort_dir: VacancySortDirection = "desc",
-) -> list[tuple[Vacancy, Evaluation | None]]:
-    rows = list(
-        db.execute(
-            select(Vacancy, Evaluation).outerjoin(
-                Evaluation, Evaluation.vacancy_id == Vacancy.id
-            )
-        ).all()
-    )
-    needle = (search or "").strip().casefold()
-    date_from = datetime.combine(status_date_from, time.min) if status_date_from else None
-    date_to = datetime.combine(status_date_to, time.max) if status_date_to else None
-    requested_site = "" if site == "__legacy__" else site
-    limits = score_limits or {}
-    filtered: list[tuple[Vacancy, Evaluation | None]] = []
-
-    state_groups = {
-        **VACANCY_STATUS_GROUPS,
-        # Keep exact-state filters useful for clients that need one status.
-        "SUBMITTED": {"SUBMITTED"},
-        "ALREADY_APPLIED": {"ALREADY_APPLIED"},
-        "REPORTED": {"REPORTED"},
-        "REJECTED_BY_MODEL": {"REJECTED_BY_MODEL"},
-        "EXTRACTED": {"EXTRACTED"},
-        "EVALUATING": {"EVALUATING"},
-        "READY_TO_SUBMIT": {"READY_TO_SUBMIT"},
-        "READY_TO_REPORT": {"READY_TO_REPORT"},
-        "SUBMITTING": {"SUBMITTING"},
-        "UNCONFIRMED": {"UNCONFIRMED"},
-    }
-    accepted_states: set[str] | None = None
-    if status_group:
-        accepted_states = set(state_groups[status_group])
-    if state:
-        requested_states = state_groups.get(state, {state})
-        accepted_states = (
-            set(requested_states)
-            if accepted_states is None
-            else accepted_states.intersection(requested_states)
-        )
-
-    for vacancy, evaluation in rows:
-        haystack = " ".join(
-            (
-                str(vacancy.id),
-                vacancy.external_id or "",
-                vacancy.title or "",
-                vacancy.company or "",
-            )
-        ).casefold()
-        if needle and needle not in haystack:
-            continue
-        if accepted_states is not None and vacancy.state not in accepted_states:
-            continue
-        if requested_site is not None and vacancy.site != requested_site:
-            continue
-        status_time = _comparable_status_time(vacancy.status_changed_at)
-        if date_from and (status_time is None or status_time < date_from):
-            continue
-        if date_to and (status_time is None or status_time > date_to):
-            continue
-        scores = _evaluation_scores(evaluation)
-        total_score = scores.get("total_score")
-        if total_score_min is not None and (
-            total_score is None or total_score < total_score_min
-        ):
-            continue
-        if total_score_max is not None and (
-            total_score is None or total_score > total_score_max
-        ):
-            continue
-        outside_limit = False
-        for key, (minimum, maximum) in limits.items():
-            value = scores.get(key)
-            if minimum is not None and (value is None or value < minimum):
-                outside_limit = True
-                break
-            if maximum is not None and (value is None or value > maximum):
-                outside_limit = True
-                break
-        if not outside_limit:
-            filtered.append((vacancy, evaluation))
-
-    def sort_value(row: tuple[Vacancy, Evaluation | None]) -> object | None:
-        vacancy, evaluation = row
-        if sort == "id":
-            return vacancy.id
-        if sort == "title":
-            return (vacancy.title or "").casefold()
-        if sort == "state":
-            return (vacancy.state or "").casefold()
-        if sort == "date":
-            return _comparable_status_time(vacancy.status_changed_at)
-        if sort == "site":
-            return (vacancy.site or "").casefold()
-        return _evaluation_scores(evaluation).get(sort)
-
-    filtered.sort(key=lambda row: row[0].id)
-    populated = [row for row in filtered if sort_value(row) is not None]
-    missing = [row for row in filtered if sort_value(row) is None]
-    populated.sort(key=sort_value, reverse=sort_dir == "desc")
-    return populated + missing
-
-
-def _vacancy_score_limits(
-    *,
-    tasks_min: float | None,
-    tasks_max: float | None,
-    skills_min: float | None,
-    skills_max: float | None,
-    experience_depth_min: float | None,
-    experience_depth_max: float | None,
-    role_match_min: float | None,
-    role_match_max: float | None,
-    industry_min: float | None,
-    industry_max: float | None,
-    special_requirements_min: float | None,
-    special_requirements_max: float | None,
-) -> dict[str, tuple[float | None, float | None]]:
-    return {
-        "tasks": (tasks_min, tasks_max),
-        "skills": (skills_min, skills_max),
-        "experience_depth": (experience_depth_min, experience_depth_max),
-        "role_match": (role_match_min, role_match_max),
-        "industry": (industry_min, industry_max),
-        "special_requirements": (special_requirements_min, special_requirements_max),
-    }
-
-
-def _public_vacancy(vacancy: Vacancy, evaluation: Evaluation | None, include_data: bool) -> dict:
-    status_group = next(
-        (group for group, states in VACANCY_STATUS_GROUPS.items() if vacancy.state in states),
-        "ERROR",
-    )
-    result = {
-        "id": vacancy.id,
-        "session_id": vacancy.session_id,
-        "title": vacancy.title,
-        "company": vacancy.company,
-        "url": vacancy.url,
-        "state": vacancy.state,
-        "status_group": status_group,
-        "source": vacancy.source or "",
-        "site": vacancy.site or "",
-        "status_changed_at": _public_status_time(vacancy),
-        "evaluation": public_evaluation(evaluation.data) if evaluation else None,
-    }
-    data = vacancy.data or {}
-    if vacancy.state in {"ERROR", "UNCONFIRMED"}:
-        default_code = "SUBMISSION_UNCONFIRMED" if vacancy.state == "UNCONFIRMED" else "VACANCY_PROCESSING_FAILED"
-        default_message = (
-            "Площадка не подтвердила результат отправки; отклик мог быть отправлен"
-            if vacancy.state == "UNCONFIRMED"
-            else "Вакансия не обработана из-за ошибки"
-        )
-        message = data.get("error_message") or data.get("outcome_message")
-        if not isinstance(message, str) or not message.strip() or message.strip() == "[удалено]":
-            message = default_message
-        result["error_code"] = data.get("error_code") or data.get("outcome_code") or default_code
-        result["error_message"] = message
-        if vacancy.state == "UNCONFIRMED":
-            result["outcome_code"] = result["error_code"]
-            result["outcome_message"] = message
-    if include_data:
-        result["data"] = vacancy.data
-    return result
-
-
-@router.get("/vacancies")
-def vacancies(
-    limit: int = Query(30, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    include_data: bool = Query(False),
-    search: str | None = Query(None),
-    state: str | None = Query(None),
-    status_group: VacancyStatusGroup | None = Query(None),
-    site: str | None = Query(None),
-    status_date_from: date | None = Query(None),
-    status_date_to: date | None = Query(None),
-    total_score_min: float | None = Query(None, ge=0, le=100),
-    total_score_max: float | None = Query(None, ge=0, le=100),
-    sort: VacancySort = Query("date"),
-    sort_dir: VacancySortDirection = Query("desc"),
-    tasks_min: float | None = Query(None, ge=0, le=100),
-    tasks_max: float | None = Query(None, ge=0, le=100),
-    skills_min: float | None = Query(None, ge=0, le=100),
-    skills_max: float | None = Query(None, ge=0, le=100),
-    experience_depth_min: float | None = Query(None, ge=0, le=100),
-    experience_depth_max: float | None = Query(None, ge=0, le=100),
-    role_match_min: float | None = Query(None, ge=0, le=100),
-    role_match_max: float | None = Query(None, ge=0, le=100),
-    industry_min: float | None = Query(None, ge=0, le=100),
-    industry_max: float | None = Query(None, ge=0, le=100),
-    special_requirements_min: float | None = Query(None, ge=0, le=100),
-    special_requirements_max: float | None = Query(None, ge=0, le=100),
-    db: Session = Depends(get_db),
-) -> dict:
-    all_rows = _filtered_vacancy_rows(
-        db,
-        search=search,
-        state=state,
-        status_group=status_group,
-        site=site,
-        status_date_from=status_date_from,
-        status_date_to=status_date_to,
-        total_score_min=total_score_min,
-        total_score_max=total_score_max,
-        score_limits=_vacancy_score_limits(
-            tasks_min=tasks_min,
-            tasks_max=tasks_max,
-            skills_min=skills_min,
-            skills_max=skills_max,
-            experience_depth_min=experience_depth_min,
-            experience_depth_max=experience_depth_max,
-            role_match_min=role_match_min,
-            role_match_max=role_match_max,
-            industry_min=industry_min,
-            industry_max=industry_max,
-            special_requirements_min=special_requirements_min,
-            special_requirements_max=special_requirements_max,
-        ),
-        sort=sort,
-        sort_dir=sort_dir,
-    )
-    total = len(all_rows)
-    page_rows = all_rows[offset : offset + limit]
-    rows = [_public_vacancy(vacancy, evaluation, include_data) for vacancy, evaluation in page_rows]
-    return {
-        "items": rows,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "has_more": offset + len(rows) < total,
-    }
-
-
-@router.get("/vacancies/export")
-def export_vacancies(
-    format: VacancyExportFormat = Query("csv"),
-    search: str | None = Query(None),
-    state: str | None = Query(None),
-    status_group: VacancyStatusGroup | None = Query(None),
-    site: str | None = Query(None),
-    status_date_from: date | None = Query(None),
-    status_date_to: date | None = Query(None),
-    total_score_min: float | None = Query(None, ge=0, le=100),
-    total_score_max: float | None = Query(None, ge=0, le=100),
-    sort: VacancySort = Query("date"),
-    sort_dir: VacancySortDirection = Query("desc"),
-    tasks_min: float | None = Query(None, ge=0, le=100),
-    tasks_max: float | None = Query(None, ge=0, le=100),
-    skills_min: float | None = Query(None, ge=0, le=100),
-    skills_max: float | None = Query(None, ge=0, le=100),
-    experience_depth_min: float | None = Query(None, ge=0, le=100),
-    experience_depth_max: float | None = Query(None, ge=0, le=100),
-    role_match_min: float | None = Query(None, ge=0, le=100),
-    role_match_max: float | None = Query(None, ge=0, le=100),
-    industry_min: float | None = Query(None, ge=0, le=100),
-    industry_max: float | None = Query(None, ge=0, le=100),
-    special_requirements_min: float | None = Query(None, ge=0, le=100),
-    special_requirements_max: float | None = Query(None, ge=0, le=100),
-    db: Session = Depends(get_db),
-) -> Response:
-    rows = _filtered_vacancy_rows(
-        db,
-        search=search,
-        state=state,
-        status_group=status_group,
-        site=site,
-        status_date_from=status_date_from,
-        status_date_to=status_date_to,
-        total_score_min=total_score_min,
-        total_score_max=total_score_max,
-        score_limits=_vacancy_score_limits(
-            tasks_min=tasks_min,
-            tasks_max=tasks_max,
-            skills_min=skills_min,
-            skills_max=skills_max,
-            experience_depth_min=experience_depth_min,
-            experience_depth_max=experience_depth_max,
-            role_match_min=role_match_min,
-            role_match_max=role_match_max,
-            industry_min=industry_min,
-            industry_max=industry_max,
-            special_requirements_min=special_requirements_min,
-            special_requirements_max=special_requirements_max,
-        ),
-        sort=sort,
-        sort_dir=sort_dir,
-    )
-
-    def export_values(vacancy: Vacancy, evaluation: Evaluation | None) -> list[object]:
-        scores = _evaluation_scores(evaluation)
-        return [
-            vacancy.id,
-            vacancy.title,
-            vacancy.company or "",
-            vacancy.site or "",
-            _export_status_time(vacancy),
-            scores.get("total_score") if scores.get("total_score") is not None else "",
-            *[
-                scores.get(key) if scores.get(key) is not None else ""
-                for key in VACANCY_SCORE_KEYS
-            ],
-        ]
-
-    data = [export_values(vacancy, evaluation) for vacancy, evaluation in rows]
-    if format == "xlsx":
-        from openpyxl import Workbook
-
-        book = Workbook()
-        sheet = book.active
-        sheet.title = "Вакансии"
-        sheet.append(VACANCY_EXPORT_HEADERS)
-        for row in data:
-            sheet.append(row)
-        output = io.BytesIO()
-        book.save(output)
-        return Response(
-            output.getvalue(),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": 'attachment; filename="vacancies.xlsx"'},
-        )
-    if format == "xml":
-        root = ET.Element("vacancies")
-        for row in data:
-            item = ET.SubElement(root, "vacancy")
-            for header, value in zip(VACANCY_EXPORT_HEADERS, row, strict=True):
-                field = ET.SubElement(item, "field", name=header)
-                field.text = "" if value is None else str(value)
-        return Response(
-            ET.tostring(root, encoding="utf-8", xml_declaration=True),
-            media_type="application/xml",
-            headers={"Content-Disposition": 'attachment; filename="vacancies.xml"'},
-        )
-    output = io.StringIO(newline="")
-    csv.writer(output).writerows([VACANCY_EXPORT_HEADERS, *data])
-    return Response(
-        output.getvalue().encode("utf-8-sig"),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="vacancies.csv"'},
-    )
 
 
 async def session_socket(websocket: WebSocket, session_id: int) -> None:

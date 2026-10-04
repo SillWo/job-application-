@@ -11,7 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.api import router as api
+from backend.api import vacancies as api
 from backend.persistence.database import Base
 from backend.persistence.models import Evaluation, Vacancy
 
@@ -46,6 +46,7 @@ def vacancy_api():
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     app = FastAPI()
+    # The canonical router already owns the /api prefix.
     app.include_router(api.router)
     app.dependency_overrides[api.get_db] = lambda: (yield from _session(session_factory))
 
@@ -329,4 +330,38 @@ def test_new_vacancies_get_platform_and_state_changes_get_a_new_timestamp(vacanc
         old_timestamp = vacancy.status_changed_at
         vacancy.state = "EVALUATING"
         db.commit()
-        assert api._comparable_status_time(vacancy.status_changed_at) > old_timestamp
+        assert vacancy.status_changed_at.replace(tzinfo=None) > old_timestamp.replace(tzinfo=None)
+
+
+def test_main_app_registers_vacancy_routes_once_with_unique_operation_ids():
+    from fastapi.routing import APIRoute
+
+    from backend.main import app
+
+    route_keys = [
+        (method, route.path)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods or ()
+    ]
+    assert len(route_keys) == len(set(route_keys))
+
+    operations = [
+        operation["operationId"]
+        for path_item in app.openapi()["paths"].values()
+        for operation in path_item.values()
+        if isinstance(operation, dict) and "operationId" in operation
+    ]
+    assert len(operations) == len(set(operations))
+
+
+def test_canonical_vacancy_list_and_export_expose_utc_time_bounds(vacancy_api):
+    client, _, _ = vacancy_api
+    schema = client.get("/openapi.json").json()
+
+    for path in ("/api/vacancies", "/api/vacancies/export"):
+        names = {
+            parameter["name"]
+            for parameter in schema["paths"][path]["get"].get("parameters", [])
+        }
+        assert {"status_time_from", "status_time_before"} <= names

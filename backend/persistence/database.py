@@ -27,7 +27,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 
 
 def init_database() -> None:
-    from . import models  # noqa: F401
+    from . import execution_models, model_request_models, models, pipeline_models  # noqa: F401
 
     Path("data").mkdir(exist_ok=True)
     Base.metadata.create_all(engine)

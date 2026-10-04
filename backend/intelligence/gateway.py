@@ -5,7 +5,7 @@ import json
 import math
 import re
 from types import SimpleNamespace
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 import httpx
 from openai import APIError, AsyncOpenAI
@@ -41,6 +41,14 @@ _RESUME_ANALYSIS_CRITERIA = (
 
 class ModelUnavailable(RuntimeError):
     pass
+
+
+class ModelTimeout(ModelUnavailable):
+    """The provider did not finish within the logical operation deadline."""
+
+
+class ModelPermanentError(RuntimeError):
+    """A request failed validation or policy checks and must not be retried."""
 
 
 class ConnectionCheck(BaseModel):
@@ -389,27 +397,71 @@ class ModelGateway:
         # sanitized copy is the only value that reaches either provider.
         sanitized_payload = sanitize_untrusted_input(payload, context=f"{role}.input")
         with measure(f"model.{role}"):
-            return await self._structured(role, sanitized_payload, schema)
+            return await self.direct_structured(role, sanitized_payload, schema)
 
-    async def _structured(self, role: str, payload: dict, schema: type[T]) -> T:
+    async def direct_structured(
+        self,
+        role: str,
+        payload: dict,
+        schema: type[T],
+        *,
+        logical_timeout: float = 180.0,
+        diagnostic_id: str | None = None,
+    ) -> T:
+        """Invoke the provider directly, bypassing any durable broker wrapper.
+
+        The central broker uses this explicit boundary to avoid recursive
+        enqueueing. ``logical_timeout`` covers initial generation and every
+        format-repair attempt together; it is never reset by a repair.
+        """
+        if logical_timeout <= 0 or logical_timeout > 180:
+            raise ValueError("logical_timeout must be in (0, 180] seconds")
+        if diagnostic_id is not None and not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", diagnostic_id):
+            raise ValueError("diagnostic_id has an invalid format")
+        return await self._structured(
+            role,
+            sanitize_untrusted_input(payload, context=f"{role}.input"),
+            schema,
+            logical_timeout=logical_timeout,
+            diagnostic_id=diagnostic_id,
+        )
+
+    async def _structured(
+        self,
+        role: str,
+        payload: dict,
+        schema: type[T],
+        *,
+        logical_timeout: float = 180.0,
+        diagnostic_id: str | None = None,
+    ) -> T:
         payload = sanitize_untrusted_input(payload, context=f"{role}.input")
         if self.provider == "mock":
             result = self._mock(role, payload, schema)
             assert_safe_output(result, context=f"{role}.output", payload=payload)
             return result
         if self.provider == "openai_compat":
-            return await self._structured_openai(role, payload, schema)
+            return await self._structured_openai(
+                role,
+                payload,
+                schema,
+                logical_timeout=logical_timeout,
+                diagnostic_id=diagnostic_id,
+            )
         raise ValueError(f"Unsupported AI provider: {self.provider}")
 
     async def check_connection(self, base_url: str, key: str, model: str) -> None:
         await self._structured_openai(
             "connection_check", {"request": "Return result ok."}, ConnectionCheck,
             connection=(base_url, key, model),
+            logical_timeout=45.0,
         )
 
     async def _structured_openai(
         self, role: str, payload: dict, schema: type[T],
         *, connection: tuple[str, str, str] | None = None,
+        logical_timeout: float = 180.0,
+        diagnostic_id: str | None = None,
     ) -> T:
         """Call an OpenAI-compatible API endpoint to get a structured response."""
         # Keep this boundary safe for direct internal callers as well as the
@@ -443,8 +495,11 @@ class ModelGateway:
         )
         system_prompt = TRUSTED_SYSTEM_SECURITY_POLICY + "\n\n" + system_prompt
         opts = {"num_predict": 128} if role == "connection_check" else ROLE_OPTIONS[role]
+        # Keep format repair bounded inside the provider call. The broker's
+        # durable attempt accounts for this whole logical provider operation.
         attempts = 4 if role == "resume_analyst" else 2
-        request_timeout = 45 if role == "connection_check" else 180
+        request_timeout = min(45.0, logical_timeout) if role == "connection_check" else logical_timeout
+        operation_deadline = asyncio.get_running_loop().time() + request_timeout
 
         async with self._lock:
             messages: list[dict] = [
@@ -454,14 +509,16 @@ class ModelGateway:
             validation_error = "unknown validation error"
             try:
                 for attempt in range(attempts):
-                    response = await create_completion(
-                        client,
-                        model=config.model,
-                        messages=messages,  # type: ignore[arg-type]
-                        temperature=opts.get("temperature", 0.1),
-                        max_tokens=opts.get("num_predict", 4096),
-                        timeout=request_timeout,
-                        response_format={  # type: ignore[arg-type]
+                    remaining = operation_deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    request_options: dict[str, Any] = {
+                        "model": config.model,
+                        "messages": messages,
+                        "temperature": opts.get("temperature", 0.1),
+                        "max_tokens": opts.get("num_predict", 4096),
+                        "timeout": remaining,
+                        "response_format": {
                             "type": "json_schema",
                             "json_schema": {
                                 "name": schema.__name__,
@@ -469,19 +526,30 @@ class ModelGateway:
                                 "strict": False,
                             },
                         },
+                    }
+                    if diagnostic_id is not None:
+                        # OpenAI-compatible gateways receive the same durable
+                        # correlation ID that ties the request to its session,
+                        # vacancy and stage in model_requests.
+                        request_options["extra_headers"] = {
+                            "X-Client-Request-Id": diagnostic_id
+                        }
+                    response = await asyncio.wait_for(
+                        create_completion(client, **request_options),
+                        timeout=remaining,
                     )
                     usage = getattr(response, "usage", None)
                     if usage is not None:
                         tokens = {name: getattr(usage, name, None) for name in ("prompt_tokens", "completion_tokens", "total_tokens")}
                         if all(isinstance(value, int) for value in tokens.values()):
-                            record("tokens", {"role": role, **tokens})
+                            record("tokens", {"role": role, "diagnostic_id": diagnostic_id, **tokens})
                     try:
                         message = response.choices[0].message
                         if getattr(message, "tool_calls", None) or getattr(message, "function_call", None):
                             raise PromptInjectionDetected("unexpected_tool_call", context=f"{role}.output")
                         content = message.content
                         if not isinstance(content, str):
-                            raise ModelUnavailable("OpenAI-compat вернул ответ неожиданной структуры")
+                            raise ModelPermanentError("OpenAI-compat вернул ответ неожиданной структуры")
                         content = content.strip()
                     except PromptInjectionDetected:
                         # Tool/function calls are never executed.  Give the
@@ -492,10 +560,16 @@ class ModelGateway:
                             raise PromptInjectionDetected(
                                 "unexpected_tool_call", context=f"{role}.output"
                             ) from None
+                        record("model_repair", {
+                            "role": role,
+                            "repair_kind": "unexpected_tool_call",
+                            "attempt": attempt + 1,
+                            "diagnostic_id": diagnostic_id,
+                        })
                         messages[0]["content"] += _TRUSTED_OUTPUT_REPAIR
                         continue
                     except (IndexError, AttributeError, TypeError) as exc:
-                        raise ModelUnavailable(
+                        raise ModelPermanentError(
                             "OpenAI-compat API вернул ответ неожиданной структуры"
                         ) from exc
                     try:
@@ -536,13 +610,25 @@ class ModelGateway:
                             raise PromptInjectionDetected(
                                 "unsafe_model_output", context=f"{role}.output"
                             ) from None
+                        record("model_repair", {
+                            "role": role,
+                            "repair_kind": "unsafe_model_output",
+                            "attempt": attempt + 1,
+                            "diagnostic_id": diagnostic_id,
+                        })
                         messages[0]["content"] += _TRUSTED_OUTPUT_REPAIR
                     except (ValidationError, ValueError) as exc:
                         validation_error = _validation_reason(exc)
                         if attempt == attempts - 1:
-                            raise ModelUnavailable(
+                            raise ModelPermanentError(
                                 "OpenAI-compat вернул неполный или некорректный JSON после повторной попытки"
                             ) from exc
+                        record("model_repair", {
+                            "role": role,
+                            "repair_kind": "schema_validation",
+                            "attempt": attempt + 1,
+                            "diagnostic_id": diagnostic_id,
+                        })
                     # Retry with a larger explicit repair prompt
                     root_contract = ""
                     if role == "resume_analyst" and schema.__name__ == "ResumeAnalysis":
@@ -568,6 +654,10 @@ class ModelGateway:
             except APIError as exc:
                 raise ModelUnavailable(
                     f"OpenAI-compat API недоступен: {_safe_api_error_summary(exc)}"
+                ) from exc
+            except TimeoutError as exc:
+                raise ModelTimeout(
+                    "OpenAI-compat не завершил логическую операцию за отведённое время"
                 ) from exc
             finally:
                 await transport.aclose()
@@ -635,8 +725,8 @@ class ModelGateway:
                 reason="Оценка по исходным зарплатным правилам и контексту вакансии",
             )
             return schema.model_validate(result.model_dump())
-        if role == "adaptive_search_planner":
-            return schema.model_validate({"queries": []})
+        if role in {"adaptive_search_planner", "hirehi_adaptive_planner"}:
+            return schema.model_validate({"queries": []} if role == "adaptive_search_planner" else {"sources": []})
         from backend.schemas.domain import (
             CoverLetterDraft,
             JobEvaluation,

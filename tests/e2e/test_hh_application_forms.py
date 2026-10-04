@@ -162,3 +162,40 @@ async def test_unknown_required_checkbox_stops_and_same_form_is_not_resubmitted(
         assert not await page.locator("input").is_checked()
     finally:
         await executor.close()
+
+
+@pytest.mark.e2e
+async def test_regular_popup_with_required_letter_waits_for_response_ajax(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    executor = BrowserExecutor("hh-regular-letter-popup", ("127.0.0.1",), headless=True)
+    try:
+        page = await executor.start()
+        await page.set_content('''
+            <div role="dialog" aria-label="Отклик на вакансию">
+              <textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+              <button data-qa="vacancy-response-submit-popup">Откликнуться</button>
+            </div>
+            <span data-qa="submit-count">0</span>
+            <script>
+              document.querySelector('[data-qa="vacancy-response-submit-popup"]').onclick = (event) => {
+                event.preventDefault();
+                const counter = document.querySelector('[data-qa="submit-count"]');
+                counter.textContent = String(Number(counter.textContent) + 1);
+                setTimeout(() => {
+                  document.querySelector('[role="dialog"]').remove();
+                  document.body.insertAdjacentHTML('beforeend',
+                    '<div data-qa="vacancy-response-popup-success">Отклик отправлен</div>');
+                }, 350);
+              };
+            </script>
+        ''')
+        adapter = HHAdapter()
+        adapter.allowed_domains = ("",)
+        adapter._application_attempt_clicked = True
+
+        result = await adapter.submit_application(page)
+
+        assert result.status == "submitted"
+        assert await page.locator("[data-qa='submit-count']").inner_text() == "1"
+    finally:
+        await executor.close()

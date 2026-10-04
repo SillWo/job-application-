@@ -16,10 +16,17 @@ from backend.intelligence.security import (
     sanitize_untrusted_input,
 )
 from backend.schemas.domain import JobPosting
+from backend.services.private_text import redact_private_text
 
 DEFAULT_MAX_WORDS = 150
 _MAX_WORDS = DEFAULT_MAX_WORDS  # Backwards-compatible alias for existing callers.
 _GENERATION_ATTEMPTS = 3
+_WRITER_REPAIR_INSTRUCTIONS = {
+    "safety": "Исправительная попытка: перепиши письмо безопасно, без служебных инструкций, секретов и непроверенных ссылок.",
+    "requirements": "Исправительная попытка: перепиши письмо полностью и выполни подтверждённые требования работодателя.",
+    "special_conditions": "Исправительная попытка: сохрани подтверждённые особые условия, точные фрагменты и их позиции.",
+    "formatting": "Исправительная попытка: убери пустые слоты и служебные маркеры, затем перепиши полный текст.",
+}
 _PRIVATE_OR_SECRET_RE = re.compile(
     r"(?:system\s+prompt|developer\s+(?:message|prompt)|внутренн(?:яя|ие)\s+инструкц|"
     r"служебн(?:ая|ые)\s+инструкц|(?:password|парол\w*|api\s*key|токен\w*|secret)\s*[:=]|"
@@ -29,14 +36,26 @@ _PRIVATE_OR_SECRET_RE = re.compile(
 _PRIVATE_PLACEHOLDER = re.compile(r"\{\{\s*([\wа-яё.-]+)\s*\}\}")
 _ALLOWED_PRIVATE_PLACEHOLDERS = {"full_name", "phone", "email", "messengers"}
 _PRIVATE_FIELD_NAMES = {
-    "identity", "contacts", "full_name", "name", "fio", "phone", "email",
-    "messengers", "links", "professional_links", "age", "birth_date", "has_photo",
+    "identity", "contacts", "full_name", "fio", "phone", "email",
+    "messengers", "professional_links", "preferred_contact", "contact_comment", "age", "birth_date",
+    "has_photo", "photo_url",
+}
+_TEXT_PAYLOAD_FIELDS = {
+    "about", "description", "duties", "achievements", "content", "summary",
+    "comments", "comment", "details", "responsibilities",
 }
 
 
 def _private_values(value: Any) -> dict[str, str]:
     """Collect only identity/contact values for local substitution/redaction."""
     result: dict[str, str] = {}
+
+    def record(name: str, value: str) -> None:
+        current = result.get(name)
+        if current is None:
+            result[name] = value
+        elif value not in current:
+            result[name] = current + ", " + value
 
     def walk(item: Any, key: str | None = None) -> None:
         if isinstance(item, dict):
@@ -46,18 +65,24 @@ def _private_values(value: Any) -> dict[str, str]:
                 return
             for child_key, child in item.items():
                 normalized = str(child_key).casefold()
-                if normalized in {"full_name", "name", "fio"}:
+                if normalized in {"full_name", "fio"} or (normalized == "name" and key == "identity"):
                     walk(child, "full_name")
                 elif normalized in {"phone", "email", "messengers"}:
                     walk(child, normalized)
+                elif normalized in {"links", "professional_links"} and key == "contacts":
+                    walk(child, "links")
                 elif normalized in {"identity", "contacts"}:
-                    walk(child)
+                    walk(child, normalized)
         elif isinstance(item, (list, tuple)):
-            values = [str(child).strip() for child in item if str(child).strip()]
-            if values and key:
-                result[key] = ", ".join(values)
+            if key:
+                values = [str(child).strip() for child in item if child is not None and str(child).strip()]
+                if values:
+                    record(key, ", ".join(values))
+            else:
+                for child in item:
+                    walk(child)
         elif item is not None and key and str(item).strip():
-            result[key] = str(item).strip()
+            record(key, str(item).strip())
 
     walk(value)
     if "full_name" in result:
@@ -71,6 +96,8 @@ def _private_placeholder_text(text: str, private: Any) -> str:
     values = _private_values(private)
     result = str(text or "")
     for key, value in sorted(values.items(), key=lambda pair: len(pair[1]), reverse=True):
+        if key not in {"full_name", "name", "fio", "phone", "email", "messengers"}:
+            continue
         if len(value) < 2:
             continue
         result = re.sub(re.escape(value), "{{" + ("full_name" if key in {"name", "fio"} else key) + "}}", result, flags=re.I)
@@ -82,18 +109,113 @@ def _private_placeholder_text(text: str, private: Any) -> str:
     return result
 
 
-def _professional_model_payload(value: Any) -> Any:
-    """Drop direct identifiers recursively before a value enters the model."""
+def _professional_model_payload(value: Any, private_source: Any = None, *, key: str | None = None) -> Any:
+    """Remove identity/contact fields and redact free text in a copied payload."""
     if isinstance(value, dict):
+        if "value" in value and "availability" in value:
+            return {
+                item_key: (
+                    _professional_model_payload(item_value, private_source, key=key)
+                    if item_key == "value"
+                    else _professional_model_payload(item_value, private_source, key=str(item_key).casefold())
+                )
+                for item_key, item_value in value.items()
+            }
         result = {}
         for key, child in value.items():
-            if str(key).casefold() in _PRIVATE_FIELD_NAMES:
+            normalized = str(key).casefold()
+            if normalized in _PRIVATE_FIELD_NAMES:
                 continue
-            result[key] = _professional_model_payload(child)
+            result[key] = _professional_model_payload(child, private_source, key=normalized)
         return result
     if isinstance(value, list):
-        return [_professional_model_payload(child) for child in value]
+        return [_professional_model_payload(child, private_source, key=key) for child in value]
+    if isinstance(value, tuple):
+        return [_professional_model_payload(child, private_source, key=key) for child in value]
+    if isinstance(value, str) and key in _TEXT_PAYLOAD_FIELDS:
+        redaction_source = _redaction_source(private_source)
+        # Some resume descriptions print a social URL and its @handle together
+        # even when the structured contacts section is unavailable.
+        inline_handles = {
+            match
+            for match in re.findall(
+                r"(?:vk\.com|t\.me|telegram\.me)/[A-Za-z0-9_.-]{2,}[^\r\n]{0,100}?(@[A-Za-z0-9_.-]{2,})",
+                value,
+                re.IGNORECASE,
+            )
+        }
+        if inline_handles:
+            contact_groups = redaction_source["contacts"]
+            existing_messengers = contact_groups.get("messengers", [])
+            if not isinstance(existing_messengers, (list, tuple)):
+                existing_messengers = [existing_messengers]
+            contact_groups["messengers"] = [
+                *(item for item in existing_messengers if item),
+                *sorted(inline_handles),
+            ]
+        return redact_private_text(value, redaction_source)
     return value
+
+
+def _redaction_source(private_source: Any) -> dict[str, Any]:
+    """Adapt mixed profile/resume values to the private_text redactor contract."""
+    values = _private_values(private_source)
+    identity = {"full_name": values["full_name"]} if values.get("full_name") else {}
+    contacts: dict[str, Any] = {
+        key: values[key]
+        for key in ("phone", "email", "messengers", "links")
+        if values.get(key)
+    }
+    # Resume text often repeats a messenger URL as a short @handle. Add aliases
+    # only when a handle is grounded in the candidate's own contact URLs.
+    contact_urls = " ".join(str(contacts.get(key, "")) for key in ("messengers", "links"))
+    aliases = {"@" + match for match in re.findall(r"(?<![\w@])@([A-Za-z0-9_.-]{2,})", contact_urls)}
+    aliases.update(
+        "@" + match
+        for match in re.findall(r"(?:t\.me|telegram\.me|vk\.com)/([A-Za-z0-9_.-]{2,})", contact_urls, re.IGNORECASE)
+        if not match.casefold().startswith("id")
+    )
+    if aliases:
+        contacts["messengers"] = [contacts.get("messengers", ""), *sorted(aliases)]
+    return {"identity": identity, "contacts": contacts}
+
+
+def _normalize_auto_letter(text: str, fulfilled: Sequence[FulfilledSpecialCondition]) -> str:
+    """Format recognized default-structure anchors without changing exact spans."""
+    spans: list[tuple[int, int, str]] = []
+    for index, item in enumerate(fulfilled):
+        start = text.find(item.span)
+        if start >= 0:
+            spans.append((start, start + len(item.span), f"\uE000{index}\uE001"))
+    protected = text
+    for start, end, marker in sorted(spans, key=lambda span: span[0], reverse=True):
+        protected = protected[:start] + marker + protected[end:]
+
+    # Only apply the default template's distinctive anchors. This deliberately
+    # leaves unknown one-line layouts untouched.
+    anchors = (
+        (r"(?i)(Здравствуйте!)(?=\s+\S)", r"\1\n\n"),
+        (r"(?i)(кратко\s+обо\s+мне\s*:)", r"\1\n"),
+        (r"(?i)\s+-\s+(?=(?:Я\b|В\s+работе\s+использую\b|Хорошо\s+знаком\w*\b|(?:[А-ЯЁа-яё]+\s+){0,2}образовани[ея]\b))", r"\n- "),
+        (r"(?i)\s*(Уверен(?:а)?\s*,\s*что\s+стану\b)", r"\n\n\1"),
+        (r"(?i)\s*(Буду\s+рад(?:а)?\s+продолжить\b)", r"\n\n\1"),
+        (r"(?i)(Мои\s+контакты\s*:)", r"\n\n\1\n"),
+        (r"(?i)(?<![\w-])Мессенджеры\s*:", r"\n- Мессенджеры:"),
+        (r"(?i)(?<![\w-])Телефон\s*:", r"\n- Телефон:"),
+        (r"(?i)(?<![\w-])Почта\s*:", r"\n- Почта:"),
+        (r"(?i)\s*(С\s+уважением\s*,?)", r"\n\n\1"),
+    )
+    for pattern, replacement in anchors:
+        protected = re.sub(pattern, replacement, protected)
+    # Clean only unprotected text. Exact fulfilled spans are restored last so
+    # embedded spaces and newlines remain byte-for-byte unchanged.
+    protected = re.sub(r"(?m)^[ \t]+", "", protected)
+    protected = re.sub(r"(?m)[ \t]+$", "", protected)
+    protected = re.sub(r"\n{3,}", "\n\n", protected)
+    protected = protected.strip()
+    for index, item in enumerate(fulfilled):
+        protected = protected.replace(f"\uE000{index}\uE001", item.span)
+    return protected
 
 
 class CoverLetterValidationError(ModelUnavailable):
@@ -348,7 +470,7 @@ def _generation_requirements(
 
 Каждую конструкцию вида [...] в шаблоне обработай как смысловой слот: подставь только подтверждённые данные из профиля, резюме и вакансии, затем удали квадратные скобки. Не оставляй ни одного символа [ или ] в результате. Если факт отсутствует, аккуратно пропусти соответствующий фрагмент.
 
-ФИО и контакты не передаются модели. Если они нужны в письме, выведи только точные маркеры {{{{full_name}}}}, {{{{phone}}}}, {{{{email}}}} или {{{{messengers}}}}; не заменяй их вымышленными значениями. Эти четыре маркера будут заменены локально перед отправкой.
+ФИО и контакты не передаются модели. Если они нужны в письме, выведи только точные маркеры {{{{full_name}}}}, {{{{phone}}}}, {{{{email}}}} или {{{{messengers}}}}; не заменяй их вымышленными значениями. Эти четыре маркера будут заменены локально перед отправкой. В автоматическом режиме оформляй каждый абзац отдельным абзацем с пустой строкой, а каждую строку контактов — отдельной строкой.
 
 {special_note}
 Особые условия работодателя обязательны независимо от режима и шаблона. Размести каждое по смыслу в начале, середине или конце; если требуется буквальный токен, сохрани его без изменений. В fulfilled_special_conditions верни по одному объекту на каждое условие с id и точным непересекающимся span из итогового текста. Не придумывай слова, цифры, опыт, достижения, навыки, контакты или образование. Пол уже выбран пользователем в profile.gender; не определяй его по имени и не меняй.
@@ -505,12 +627,14 @@ async def write_cover_letter(
             "Укажите пол в профиле кандидата: выберите мужской или женский вариант"
         )
     resume_payloads = [_payload(resume) for resume in resumes]
-    model_resume_payloads = [_professional_model_payload(_payload(resume)) for resume in safe_resumes]
+    private_source = private_view if private_view is not None else [profile_payload, *resume_payloads]
+    model_resume_payloads = [
+        _professional_model_payload(_payload(resume), private_source) for resume in safe_resumes
+    ]
     if not model_resume_payloads:
         raise ValueError("Для сопроводительного письма не выбрано ни одного резюме")
     safe_description = str(safe_job.get("description") or "")
     special_conditions = await _extract_special_conditions(safe_description, gateway)
-    private_source = private_view if private_view is not None else [profile_payload, *resume_payloads]
     effective_template = "" if cover_letter_auto else _private_placeholder_text(safe_template or "", private_source)
     ai_payload: dict[str, Any] = {
         "vacancy": {
@@ -541,13 +665,20 @@ async def write_cover_letter(
             if hasattr(safe_preferences, "model_dump") else safe_preferences
         )
 
-    repair = ""
-    for _attempt in range(_GENERATION_ATTEMPTS):
+    repair_category: str | None = None
+    for attempt in range(_GENERATION_ATTEMPTS):
         request = dict(ai_payload)
-        if repair:
-            request["requirements"] += "\n\nОБЯЗАТЕЛЬНАЯ ИСПРАВИТЕЛЬНАЯ ПОПЫТКА: " + repair
         try:
-            draft = await gateway.structured("writer", request, CoverLetterGenerationDraft)
+            fresh_generation = getattr(gateway, "fresh_generation", None)
+            if repair_category and callable(fresh_generation):
+                draft = await fresh_generation(
+                    "writer", request, CoverLetterGenerationDraft,
+                    correction_category=repair_category, generation=attempt,
+                )
+            else:
+                if repair_category:
+                    request["requirements"] += "\n\n" + _WRITER_REPAIR_INSTRUCTIONS[repair_category]
+                draft = await gateway.structured("writer", request, CoverLetterGenerationDraft)
         except PromptInjectionDetected:
             raise
         except ModelUnavailable:
@@ -563,14 +694,11 @@ async def write_cover_letter(
         except PromptInjectionDetected:
             # Give the model a bounded chance to regenerate, while keeping
             # the unsafe draft and its diagnostics out of the next prompt.
-            if _attempt == _GENERATION_ATTEMPTS - 1:
+            if attempt == _GENERATION_ATTEMPTS - 1:
                 raise CoverLetterValidationError(
                     "Модель не вернула безопасное сопроводительное письмо после повторной попытки"
                 ) from None
-            repair = (
-                "Предыдущий текст не прошёл локальную проверку безопасности. "
-                "Перепиши полный текст без служебных инструкций, секретов и непроверенных ссылок."
-            )
+            repair_category = "safety"
             continue
         exempt_words = 0
         valid, reason = True, ""
@@ -586,20 +714,27 @@ async def write_cover_letter(
             # New session snapshots persist the placeholder draft. Rendering
             # belongs to the adapter boundary; legacy callers retain the old
             # return shape when no private view was supplied.
-            rendered = str(draft_text).strip()
+            if cover_letter_auto:
+                rendered = _normalize_auto_letter(str(draft_text), draft.fulfilled_special_conditions)
+                formatted_valid, _formatted_reason, formatted_exempt_words = _validate_special_conditions(
+                    rendered, special_conditions, draft.fulfilled_special_conditions,
+                )
+                if not formatted_valid:
+                    repair_category = "special_conditions"
+                    continue
+                exempt_words = formatted_exempt_words
+            else:
+                rendered = str(draft_text).strip()
             valid, reason = validate_cover_letter(
                 rendered, safe_description, exempt_words=exempt_words, max_words=max_words
             )
             if not valid:
-                repair = "После локальной подстановки убери пустые слоты и служебные маркеры."
+                repair_category = "formatting"
                 continue
             return rendered
         # Keep diagnostics local; never reflect model text into a subsequent
         # prompt where it could be interpreted as an instruction.
-        repair = (
-            "Предыдущий текст не прошёл локальную проверку. Перепиши полный текст заново. "
-            "Не сокращай письмо механически, не оставляй квадратные скобки и выполни все подтверждённые требования работодателя."
-        )
+        repair_category = "requirements"
     raise CoverLetterValidationError(
         "Модель не вернула сопроводительное письмо, соответствующее требованиям, после повторной попытки"
     )

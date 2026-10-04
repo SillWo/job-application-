@@ -4,6 +4,8 @@ from backend.intelligence.letter_writer import (
     CoverLetterGenerationDraft,
     CoverLetterValidationError,
     SpecialConditionBatch,
+    _private_values,
+    _professional_model_payload,
     validate_cover_letter,
     write_cover_letter,
 )
@@ -25,6 +27,147 @@ class Gateway:
 
 def _job(description="Описание вакансии"):
     return JobPosting(source="test", url="https://example.test", title="Аналитик", company="Тест", description=description)
+
+
+def test_professional_payload_keeps_named_professional_items_and_redacts_free_text():
+    source = {
+        "identity": {"full_name": {"value": "Иван Иванов", "availability": "present"}},
+        "contacts": {
+            "phone": {"value": "+7 999 123-45-67", "availability": "present"},
+            "email": {"value": "ivan@example.test", "availability": "present"},
+            "messengers": {"value": ["https://t.me/ivan"], "availability": "present"},
+        },
+    }
+    resume = {
+        "identity": source["identity"],
+        "contacts": source["contacts"],
+        "about": {"value": "Иван Иванов: SQL, ivan@example.test, +7 999 123-45-67 https://t.me/ivan", "availability": "present"},
+        "experience": [{
+            "company": {"value": "ООО Пример", "availability": "present"},
+            "company_url": {"value": "https://company.example.test", "availability": "present"},
+            "duties": {"value": "Иван Иванов улучшил отчёты; бюджет 2 млн рублей", "availability": "present"},
+        }],
+        "skills": [{"name": {"value": "SQL", "availability": "present"}}],
+        "courses": [{"name": {"value": "Курс SQL", "availability": "present"}}],
+        "projects": [{"name": {"value": "Проект Альфа", "availability": "present"}}],
+        "additional_sections": [{"name": "Профессиональные интересы", "content": {"value": "Иван Иванов изучает SQL", "availability": "present"}}],
+    }
+    original = __import__("copy").deepcopy(resume)
+
+    payload = _professional_model_payload(resume, [source, resume])
+
+    assert "identity" not in payload and "contacts" not in payload
+    assert payload["skills"][0]["name"]["value"] == "SQL"
+    assert payload["courses"][0]["name"]["value"] == "Курс SQL"
+    assert payload["projects"][0]["name"]["value"] == "Проект Альфа"
+    assert payload["additional_sections"][0]["name"] == "Профессиональные интересы"
+    assert "Иван Иванов" not in payload["about"]["value"]
+    assert "ivan@example.test" not in payload["about"]["value"]
+    assert "+7 999 123-45-67" not in payload["about"]["value"]
+    assert "t.me/ivan" not in payload["about"]["value"]
+    assert payload["experience"][0]["company_url"]["value"] == "https://company.example.test"
+    assert "2 млн рублей" in payload["experience"][0]["duties"]["value"]
+    assert resume == original
+    assert "full_name" not in _private_values({"skills": [{"name": "Python"}]})
+
+
+def test_professional_payload_handles_flat_normalized_fields_without_dropping_names():
+    payload = _professional_model_payload({
+        "skills": [{"name": "SQL"}],
+        "courses": [{"name": "Курс аналитики"}],
+        "projects": [{"name": "Дашборд продаж"}],
+        "additional_sections": [{"name": "Дополнительно", "content": "Email me at person@example.test"}],
+        "about": "Мой телефон +7 999 123-45-67",
+    }, {"full_name": "Иван Иванов", "phone": "+7 999 123-45-67", "email": "person@example.test"})
+
+    assert payload["skills"] == [{"name": "SQL"}]
+    assert payload["courses"] == [{"name": "Курс аналитики"}]
+    assert payload["projects"] == [{"name": "Дашборд продаж"}]
+    assert payload["additional_sections"][0]["name"] == "Дополнительно"
+    assert "person@example.test" not in payload["additional_sections"][0]["content"]
+    assert "+7 999 123-45-67" not in payload["about"]
+
+
+def test_professional_payload_redacts_grounded_messenger_handles_from_about():
+    resume = {
+        "contacts": {
+            "messengers": ["https://t.me/synthetic_handle"],
+            "links": ["https://vk.com/synthetic_vk"],
+        },
+        "about": "Experienced analyst. Telegram: @synthetic_handle; VK: @synthetic_vk",
+    }
+    payload = _professional_model_payload(resume, resume)
+
+    assert "Experienced analyst." in payload["about"]
+    assert "@synthetic_handle" not in payload["about"]
+    assert "@synthetic_vk" not in payload["about"]
+
+
+def test_professional_payload_redacts_inline_vk_url_and_handle_without_contact_links():
+    payload = _professional_model_payload({
+        "contacts": {"links": None},
+        "about": "Experienced analyst. ВК - https://vk.com/synthetic_user (@synthetic_user). Increased revenue 25%.",
+    })
+
+    assert "Experienced analyst." in payload["about"]
+    assert "Increased revenue 25%." in payload["about"]
+    assert "vk.com/synthetic_user" not in payload["about"]
+    assert "@synthetic_user" not in payload["about"]
+
+
+def test_professional_payload_keeps_flat_grounded_handles_and_redacts_inline_vk_handle():
+    private_source = {
+        "contacts": {
+            "messengers": {"value": ["https://t.me/synthetic_telegram", "@synthetic_telegram"], "availability": "present"},
+            "links": {"value": None, "availability": "not_provided"},
+        },
+    }
+    resume = {
+        "about": {"value": "Experienced analyst. Telegram @synthetic_telegram; VK https://vk.com/vk_handle (@vk_handle).", "availability": "present"},
+        "skills": [{"name": {"value": "Python", "availability": "present"}}],
+        "courses": [{"name": {"value": "SQL Analytics", "availability": "present"}}],
+        "experience": [{"company_url": {"value": "https://company.example.test", "availability": "present"}}],
+    }
+
+    payload = _professional_model_payload(resume, private_source)
+
+    assert "Experienced analyst." in payload["about"]["value"]
+    assert "@synthetic_telegram" not in payload["about"]["value"]
+    assert "@vk_handle" not in payload["about"]["value"]
+    assert payload["skills"][0]["name"]["value"] == "Python"
+    assert payload["courses"][0]["name"]["value"] == "SQL Analytics"
+    assert payload["experience"][0]["company_url"]["value"] == "https://company.example.test"
+
+
+@pytest.mark.asyncio
+async def test_writer_payload_keeps_professional_names_and_excludes_profile_contacts():
+    captured = {}
+
+    def draft(schema, payload, _count):
+        captured.update(payload)
+        return schema.model_validate({"text": "Подхожу под задачи вакансии.", "fulfilled_special_conditions": []})
+
+    profile = {
+        "gender": "female", "full_name": "Иван Иванов", "phone": "+7 999 123-45-67",
+        "email": "ivan@example.test", "messengers": ["https://t.me/synthetic_handle"],
+    }
+    resume = {
+        "identity": {"full_name": "Иван Иванов"},
+        "contacts": {"phone": "+7 999 123-45-67", "messengers": ["https://t.me/synthetic_handle"]},
+        "skills": [{"name": "Python"}],
+        "courses": [{"name": "Курс анализа данных"}],
+        "projects": [{"name": "Сервис отчётности"}],
+        "about": "Иван Иванов. Telegram: @synthetic_handle. Анализ данных и Python.",
+    }
+
+    await write_cover_letter(_job(), profile, [resume], Gateway(draft))
+
+    model_resume = captured["resumes"][0]
+    assert model_resume["skills"][0]["name"] == "Python"
+    assert model_resume["courses"][0]["name"] == "Курс анализа данных"
+    assert model_resume["projects"][0]["name"] == "Сервис отчётности"
+    for personal_value in ("Иван Иванов", "+7 999 123-45-67", "ivan@example.test", "@synthetic_handle"):
+        assert personal_value not in str(model_resume)
 
 
 @pytest.mark.asyncio
@@ -127,6 +270,36 @@ async def test_custom_template_is_forwarded_and_unresolved_slot_is_repaired():
     assert seen[0]["cover_letter_template"] == "Я [ФИО] и мой опыт [сильная сторона]"
     assert len(seen) == 2
     assert "исправительн" in seen[1]["requirements"].casefold()
+
+
+@pytest.mark.asyncio
+async def test_writer_uses_fresh_generation_with_safe_repair_category():
+    class FreshGateway(Gateway):
+        def __init__(self):
+            super().__init__(lambda *_: None)
+            self.fresh_calls = []
+
+        async def fresh_generation(self, role, payload, schema, *, correction_category, generation):
+            self.fresh_calls.append((role, payload, correction_category, generation))
+            return schema.model_validate({
+                "text": "Полный текст письма без пустых слотов.",
+                "fulfilled_special_conditions": [],
+            })
+
+        async def structured(self, role, payload, schema):
+            self.calls.append((role, payload, schema))
+            if role == "special_conditions":
+                return SpecialConditionBatch(conditions=[])
+            return schema.model_validate({"text": "Я [ФИО]", "fulfilled_special_conditions": []})
+
+    gateway = FreshGateway()
+    result = await write_cover_letter(
+        _job(), {"gender": "female"}, [{"name": "Резюме"}], gateway,
+    )
+
+    assert result == "Полный текст письма без пустых слотов."
+    assert gateway.fresh_calls[0][2:] == ("requirements", 1)
+    assert "Я [ФИО]" not in str(gateway.fresh_calls[0][1])
 
 
 @pytest.mark.asyncio
