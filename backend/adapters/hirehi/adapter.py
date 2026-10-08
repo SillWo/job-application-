@@ -4,6 +4,7 @@ import re
 from contextlib import suppress
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
+from backend.adapters.base.errors import CaptchaRequired, JobDescriptionUnavailable
 from backend.adapters.base.protocol import (
     AdapterManifest,
     ApplicationRoute,
@@ -764,11 +765,20 @@ class HireHiAdapter(ResumeImportMixin):
     async def extract_job(self, page) -> JobPosting:
         title = await self._text(page, locators.VACANCY_TITLE, "название")
         company = await self._text(page, locators.VACANCY_COMPANY, "компанию", False)
-        description = await self._text(page, locators.VACANCY_DESCRIPTION, "описание", False)
-        if not description:
-            description = await self._main_vacancy_description(page)
-        if not description:
-            description = await self._text(page, "main", "описание")
+        try:
+            description = await self._text(
+                page, locators.VACANCY_DESCRIPTION, "описание", False
+            )
+            if not description:
+                description = await self._main_vacancy_description(page)
+            if not description:
+                description = await self._text(page, "main", "описание")
+            if not description or not description.strip():
+                raise ValueError(JobDescriptionUnavailable.DEFAULT_MESSAGE)
+        except CaptchaRequired:
+            raise
+        except Exception as exc:
+            raise JobDescriptionUnavailable(title=title, company=company) from exc
         salary_values = await self._sidebar_labeled_values(page, {"зарплата", "salary"})
         if not salary_values:
             salary_values = await self._sidebar_values(page, locators.VACANCY_SALARY, exclude_market=True)

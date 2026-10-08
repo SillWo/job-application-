@@ -47,26 +47,15 @@ export type ModelStatus = {
 };
 export type JobSession = { guaranteed_application?: boolean; hirehi_pro_enabled?: boolean; cover_letter_auto?: boolean; cover_letter_template?: string | null; cover_letter_max_words?: number | null; id: number; adapter_id: string; resume_source_site?: string | null; desired_job_description?: string | null; application_limit?: number | null; status: string; stage?: string | null; stage_started_at?: string | null; last_progress_at?: string | null; wait_reason?: string | null; next_retry_at?: string | null; counters: Record<string, number>; started_at: string | null; finished_at: string | null; stop_reason: string | null };
 export type SessionHistoryPage = { items: JobSession[]; total: number; limit: number; offset: number; has_more: boolean };
-export type ResumeSnapshot = {
-  session_id?: number;
-  adapter_id?: string;
-  source?: Record<string, unknown> | null;
-  resume?: Record<string, unknown> | null;
-  snapshot?: Record<string, unknown> | null;
-  sections?: Array<Record<string, unknown>> | string[];
-  contacts?: Record<string, unknown> | null;
-  coverage?: Record<string, unknown> | null;
-  import_url?: string | null;
-  [key: string]: unknown;
+export type VacancyStatusGroup = "SUCCESS" | "PARTIAL" | "PROCESSING" | "REJECTED" | "ERROR" | "CANCELLED";
+export type VacancyAnalysisStatus = "scored" | "not_evaluated_history" | "not_evaluated" | "pending";
+export type VacancyHistoryContext = {
+  source_vacancy_id: number | null;
+  source_session_id: number | null;
+  outcome: "confirmed" | "already_applied" | "partial" | "unconfirmed";
+  reason_code: string;
 };
-export type ResumeAiContext = {
-  model?: string;
-  resume_context?: Record<string, unknown> | null;
-  context?: Record<string, unknown> | null;
-  [key: string]: unknown;
-};
-export type VacancyStatusGroup = "SUCCESS" | "PROCESSING" | "REJECTED" | "ERROR" | "CANCELLED";
-export type Vacancy = VacancyEvaluationFields & { id: number; session_id: number | null; title: string; company: string | null; url: string; state: string; status_group?: VacancyStatusGroup; error_code?: string | null; error_message?: string | null; site?: string; source?: string; status_changed_at?: string | null; data?: Record<string, unknown>; evaluation: Evaluation | null };
+export type Vacancy = VacancyEvaluationFields & { id: number; session_id: number | null; title: string; company: string | null; url: string; state: string; status_group?: VacancyStatusGroup; error_code?: string | null; error_message?: string | null; site?: string; source?: string; status_changed_at?: string | null; analysis_status?: VacancyAnalysisStatus; history_context?: VacancyHistoryContext | null; data?: Record<string, unknown>; evaluation: Evaluation | null };
 export type VacancyPage = { items: Vacancy[]; total: number; limit: number; offset: number; has_more: boolean };
 export type Notification = {
   id: number;

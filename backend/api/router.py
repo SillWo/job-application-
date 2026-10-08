@@ -1447,11 +1447,17 @@ def session_metrics(session_id: int, db: Session = Depends(get_db)) -> dict:
 
 
 @router.get("/sessions/{session_id}/events")
-def events(session_id: int, after: int = 0, db: Session = Depends(get_db)) -> list[dict]:
+def events(
+    session_id: int,
+    after: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=1000),
+    db: Session = Depends(get_db),
+) -> list[dict]:
     rows = db.scalars(
         select(BrowserEvent)
         .where(BrowserEvent.session_id == session_id, BrowserEvent.id > after)
         .order_by(BrowserEvent.id)
+        .limit(limit)
     )
     return [
         {
@@ -1475,7 +1481,14 @@ def public_evaluation(data: dict | None) -> dict | None:
 
 async def session_socket(websocket: WebSocket, session_id: int) -> None:
     await websocket.accept()
-    after = 0
+    try:
+        after = int(websocket.query_params.get("after", "0"))
+    except ValueError:
+        await websocket.close(code=1008)
+        return
+    if after < 0:
+        await websocket.close(code=1008)
+        return
     try:
         while True:
             from backend.persistence.database import SessionLocal
@@ -1486,6 +1499,7 @@ async def session_socket(websocket: WebSocket, session_id: int) -> None:
                         select(BrowserEvent)
                         .where(BrowserEvent.session_id == session_id, BrowserEvent.id > after)
                         .order_by(BrowserEvent.id)
+                        .limit(500)
                     )
                 )
                 for event in batch:

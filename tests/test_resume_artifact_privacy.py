@@ -63,6 +63,23 @@ async def test_snapshot_writer_never_sends_or_persists_private_values():
             calls.append((role, payload))
             if role == "special_conditions":
                 return schema.model_validate({"conditions": []})
+            if role == "letter_claim_check":
+                payload_text = str(payload)
+                assert set(payload) == {"letter", "resumes"}
+                for private_value in (
+                    "Ada Lovelace", "ada@example.test", "+7 900 000-00-00",
+                    "https://example.test/job", "Задачи",
+                ):
+                    assert private_value not in payload_text
+                assert "{{full_name}}" in payload["letter"]
+                assert "{{email}}" in payload["letter"]
+                assert "{{phone}}" in payload["letter"]
+                return schema.model_validate({
+                    "all_candidate_claims_supported": True,
+                    "confidence": 1,
+                    "unsupported_claims": [],
+                    "evidence": [],
+                })
             return schema.model_validate({
                 "text": "Я Ada Lovelace, email ada@example.test, телефон +7 900 000-00-00. "
                 "Готова обсудить задачи вакансии.",
@@ -83,3 +100,4 @@ async def test_snapshot_writer_never_sends_or_persists_private_values():
     assert "ada@example.test" not in payload_text
     assert "+7 900 000-00-00" not in payload_text
     assert "{{full_name}}" in result and "{{email}}" in result and "{{phone}}" in result
+    assert [role for role, _payload in calls] == ["special_conditions", "writer", "letter_claim_check"]

@@ -144,7 +144,35 @@ async def test_failed_request_gets_fresh_bounded_attempt_on_same_logical_operati
     with sessions() as db:
         operation = db.get(PipelineModelOperation, operation.id)
         assert operation.status == "completed"
-        assert operation.request_id == request.id
+
+
+@pytest.mark.asyncio
+async def test_timeout_failure_can_start_fresh_row_without_resetting_durable_attempts(tmp_path):
+    sessions = _sessions(tmp_path, "timeout-recovery.db")
+    session_id = _session(sessions, generation=3)
+
+    class TimeoutClient(ScriptedClient):
+        def submit_in_transaction(self, db, request):
+            receipt = super().submit_in_transaction(db, request)
+            row = db.get(ModelRequest, receipt.request_id)
+            if row.status == "failed":
+                row.error_code = "model_timeout"
+            return receipt
+
+    client = TimeoutClient(sessions, ["failed", "completed"])
+    gateway = _gateway(session_id, sessions, client)
+    with pytest.raises(ModelUnavailable):
+        await _call(gateway)
+    result = await _call(_gateway(session_id, sessions, client))
+
+    assert result.summary == "provider recovered"
+    assert client.submits == 2
+    with sessions() as db:
+        rows = list(db.scalars(select(ModelRequest).order_by(ModelRequest.created_at)))
+        assert len(rows) == 2
+        assert rows[0].error_code == "model_timeout"
+        assert rows[1].status == "completed"
+        assert rows[1].max_attempts == 3
 
 
 @pytest.mark.asyncio

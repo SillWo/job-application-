@@ -1,5 +1,11 @@
 SEARCH_INPUT_NAME = "text"
 VACANCY_LINK = "a[data-qa='serp-item__title']"
+DISCOVERY_LINKS = "a[href]"
+RELATED_VACANCIES = (
+    "[data-qa*='similar'] a[href*='/vacancy/'], "
+    "[data-qa*='related'] a[href*='/vacancy/'], "
+    "[data-qa*='recommend'] a[href*='/vacancy/']"
+)
 VACANCY_TITLE = "[data-qa='vacancy-title']"
 COMPANY = "[data-qa='vacancy-company'], [data-qa='vacancy-company__details']"
 DESCRIPTION = "[data-qa='vacancy-description']"
@@ -14,6 +20,8 @@ RESPONSE_BUTTON = "[data-qa='vacancy-response-link-top'], [data-qa='vacancy-resp
 RESPONSE_SUBMIT = "[data-qa='vacancy-response-submit-popup']"
 COVER_LETTER_TOGGLE = "[data-qa='vacancy-response-letter-toggle']"
 COVER_LETTER_INPUT = "[data-qa='vacancy-response-popup-form-letter-input']"
+ATTACH_COVER_LETTER = "[data-qa='responded-success-attach-cover-letter']"
+COVER_LETTER_SUBMIT = "[data-qa='vacancy-response-letter-submit']"
 APPLICATION_QUESTION = "[data-qa^='vacancy-response-popup-form'] label"
 APPLICATION_CONTROL = "textarea, select, input"
 TASK_QUESTION = "[data-qa='task-question']"
@@ -24,3 +32,5 @@ CAPTCHA_MARKERS = ("captcha", "Подтвердите, что вы не робо
 
 # Explicit empty-result UI; a blank/error page is never exhaustion.
 SEARCH_EMPTY = "[data-qa='vacancy-serp__vacancy-not-found'], [data-qa='vacancy-serp__no-results']"
+SEARCH_PAGER = "[data-qa='pager-block']"
+SEARCH_NEXT = "[data-qa='pager-next']"

@@ -138,7 +138,10 @@ def test_ai_context_is_exact_frozen_full_model_payload_after_source_deletion():
         assert body["resume"]["identity"]["full_name"] == "Ada Lovelace"
         assert body["resume"]["contacts"]["email"] == "ada@frozen.example"
         assert body["resume"]["contacts"]["phone"] == "+7 900 000-00-00"
-        assert body["resume"]["coverage"]["missing_sections"] == ["education"]
+        assert "coverage" not in body["resume"]
+        assert "availability" not in str(body["resume"])
+        assert "source_section" not in str(body["resume"])
+        assert body["snapshot"]["coverage"]["missing_sections"] == ["education"]
         assert "private_view" not in body and "ciphertext" not in response.text
     finally:
         client.close()

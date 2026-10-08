@@ -3,11 +3,8 @@ from __future__ import annotations
 
 import asyncio
 
+from backend.adapters.base.errors import CaptchaRequired as CaptchaRequired
 from backend.services.search_metrics import discovery, measure
-
-
-class CaptchaRequired(RuntimeError):
-    pass
 
 
 class RecoverableFailure(RuntimeError):
@@ -32,6 +29,13 @@ class RecoveryAdapter:
             return value
 
         async def invoke(*args, **kwargs):
+            captcha_guarded_operations = {
+                "open_application", "prepare_application", "read_application",
+                "fill_application", "submit_application", "verify_submission",
+                "verify_cv_submission", "resume_application", "can_retry_application",
+            }
+            if args and name in captcha_guarded_operations:
+                await self._captcha(args[0])
             try:
                 with measure(f"browser.{name}"):
                     result = await asyncio.wait_for(value(*args, **kwargs), timeout=self.timeout)
@@ -40,9 +44,7 @@ class RecoveryAdapter:
                 if args and name != "detect_blockers":
                     await self._captcha(args[0])
                 raise
-            if args and (name.startswith("collect_") or name in {
-                "open_application", "prepare_application", "read_application", "fill_application", "submit_application", "verify_submission",
-            }):
+            if args and (name.startswith("collect_") or name in captcha_guarded_operations):
                 await self._captcha(args[0])
             if name in {"collect_job_refs", "collect_more_job_refs"}:
                 discovery(self.adapter, result)

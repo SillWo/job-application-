@@ -47,9 +47,30 @@ def record(kind: str, data: dict) -> None:
 def flush(db, session_id: int) -> bool:
     queue = _pending.get()
     if queue:
+        overlap_ids: list[str] = []
+        overlap_raw = 0
         for kind, data, timestamp in queue:
+            if kind == "overlap":
+                ids = _event_ids(data)
+                if not ids and data.get("external_id") is not None:
+                    ids = [str(data["external_id"])]
+                overlap_ids.extend(ids)
+                count = data.get("raw_count")
+                overlap_raw += (
+                    int(count) if isinstance(count, (int, float)) and not isinstance(count, bool)
+                    else len(ids)
+                )
+                continue
             db.add(BrowserEvent(session_id=session_id, event_type=f"metric_{kind}",
                                 message="Search measurement", data=data, created_at=timestamp))
+        if overlap_ids:
+            db.add(BrowserEvent(
+                session_id=session_id,
+                event_type="metric_overlap",
+                message="Search measurement",
+                data={"ids": list(dict.fromkeys(overlap_ids)), "raw_count": overlap_raw},
+                created_at=queue[0][2],
+            ))
         queue.clear()
         return True
     return False
@@ -250,6 +271,7 @@ def summary(db, item: JobSession) -> dict:
     finish = _utc(item.finished_at) if item.finished_at else datetime.now(timezone.utc)
     elapsed = max(0, (finish - start).total_seconds()) if start else 0
     found, overlap = set(), set()
+    overlap_raw = 0
     first_source, first_mode, per_source_ids = {}, {}, defaultdict(set)
     raw = 0
     sources = {}
@@ -302,9 +324,15 @@ def summary(db, item: JobSession) -> dict:
             if isinstance(cost, (int, float)):
                 row["cost"] += cost
         elif event.event_type in {"metric_overlap", "overlap"}:
-            key = data.get("external_id")
-            if key is not None:
-                overlap.add(str(key))
+            ids = _event_ids(data)
+            if not ids and data.get("external_id") is not None:
+                ids = [str(data["external_id"])]
+            overlap.update(ids)
+            count = data.get("raw_count")
+            overlap_raw += (
+                int(count) if isinstance(count, (int, float)) and not isinstance(count, bool)
+                else len(ids)
+            )
         elif event.event_type == "metric_stage":
             stage = str(data.get("stage", "unknown"))
             row = stages.setdefault(stage, {"calls": 0, "seconds": 0, "errors": 0})
@@ -526,6 +554,7 @@ def summary(db, item: JobSession) -> dict:
         "raw_discoveries": raw, "unique_discovered": D,
         "duplicate_discoveries": max(raw - D, 0), "exact_duplicates": max(raw - D, 0),
         "semantic_near_duplicates": len(semantic_near), "historical_overlap": len(overlap),
+        "historical_overlap_raw": overlap_raw,
         "judged": N, "relevant": reported_R,
         "unjudged": max(D - N, 0) if hirehi_semantics else len(found - judged_ids),
         "relevant_per_discovered": _ratio(reported_R, D),

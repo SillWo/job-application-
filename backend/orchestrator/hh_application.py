@@ -33,7 +33,8 @@ def _signature(form) -> str:
 
 async def complete_application(adapter, page, plan, job, profile, resumes, description,
                                gateway, checkpoint, max_steps=5, *, memory=None,
-                               guaranteed_application=False, private_view=None) -> ApplicationOutcome:
+                               guaranteed_application=False, private_view=None,
+                               progress_checkpoint=None) -> ApplicationOutcome:
     submitted_forms: set[str] = set()
 
     def assert_plan_outgoing(current_plan, *, context: str, source_form=None) -> None:
@@ -66,6 +67,10 @@ async def complete_application(adapter, page, plan, job, profile, resumes, descr
         if not checkpoint(plan):
             return ApplicationOutcome(stopped=True)
         form = await adapter.prepare_application(page, plan)
+        if progress_checkpoint is not None:
+            progress = getattr(adapter, "get_submission_progress", None)
+            if callable(progress) and not progress_checkpoint(progress()):
+                return ApplicationOutcome(stopped=True)
         model_form = sanitize_untrusted_input(form, context="application_form")
         if form.confirmation:
             return ApplicationOutcome(
@@ -121,7 +126,19 @@ async def complete_application(adapter, page, plan, job, profile, resumes, descr
         sanitize_untrusted_input(current, context="application_form_before_submit")
         assert_plan_outgoing(plan, context="application_plan_before_submit", source_form=current)
         submitted_forms.add(signature)
+        if progress_checkpoint is not None:
+            prepare_submission_progress = getattr(adapter, "prepare_submission_progress", None)
+            if callable(prepare_submission_progress):
+                # Record the durable intent only after the final live-form and
+                # outgoing-text checks, then checkpoint it before the click.
+                progress = prepare_submission_progress()
+                if not progress_checkpoint(progress):
+                    return ApplicationOutcome(stopped=True)
         submission = await adapter.submit_application(page)
+        if progress_checkpoint is not None:
+            progress = getattr(adapter, "get_submission_progress", None)
+            if callable(progress) and not progress_checkpoint(progress()):
+                return ApplicationOutcome(stopped=True)
         if submission.status != "needs_input":
             return ApplicationOutcome(submission=submission)
     return ApplicationOutcome(

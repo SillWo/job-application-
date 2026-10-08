@@ -240,12 +240,13 @@ test("keeps profile gender normalization as helper behavior without a profile ed
 
 test("keeps the saved source visible when auto-start creation fails", async () => {
   const server = installServer({ sources: [saved()], createOk: false });
-  mount("/session");
+  mount("/session", new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retryDelay: 0 } } }));
   const launch = await screen.findByRole("button", { name: "Создать и запустить" });
   await waitFor(() => expect(launch).toBeEnabled());
   fireEvent.click(launch);
   await waitFor(() => expect(server.calls.some((call) => call.url.endsWith("/api/sessions") && call.init?.method === "POST")).toBe(true));
   expect(await screen.findByRole("alert")).toHaveTextContent("Ошибка запроса");
+  expect(server.calls.filter((call) => call.url.endsWith("/api/sessions") && call.init?.method === "POST")).toHaveLength(2);
   expect(document.querySelector(".session-resume-requirement")).not.toBeInTheDocument();
 });
 

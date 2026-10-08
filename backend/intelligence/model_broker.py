@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backend.intelligence.gateway import (
     ModelGateway,
+    ModelOverloaded,
     ModelPermanentError,
     ModelTimeout,
     ModelUnavailable,
@@ -49,9 +50,12 @@ from backend.services.search_metrics import record as record_metric
 
 GLOBAL_RUNNING_LIMIT = 3
 SESSION_RUNNING_LIMIT = 2
+SESSION_OUTSTANDING_LIMIT = 10
+GLOBAL_OUTSTANDING_LIMIT = 30
 LOGICAL_DEADLINE_SECONDS = 180.0
 MIN_RETRY_SECONDS = 5.0
 MAX_RETRY_SECONDS = 300.0
+QUEUE_WAIT_SECONDS = GLOBAL_OUTSTANDING_LIMIT * LOGICAL_DEADLINE_SECONDS + 4 * MAX_RETRY_SECONDS
 
 _SECRET_KEY = re.compile(
     r"^(?:api[_-]?key|password|passwd|proxy[_-]?password|secret|client[_-]?secret|"
@@ -285,6 +289,16 @@ class ModelRequestClient:
             raise ValueError("Invalid request generation or attempt limit")
         if not request.site_id.strip() or not request.stage.strip() or not request.role.strip():
             raise ValueError("site_id, stage and role are required")
+        if db.get_bind().dialect.name == "sqlite":
+            # SQLite has no row-level SELECT FOR UPDATE. A no-op write to an
+            # impossible UUID acquires its single writer slot before reading
+            # durable admission counts.
+            db.execute(
+                update(ModelRequest)
+                .where(ModelRequest.id == "__queue_admission_lock__")
+                .values(available_at=ModelRequest.available_at)
+                .execution_options(synchronize_session=False)
+            )
         canonical_input = canonical_json(request.payload)
         if not isinstance(json.loads(canonical_input), dict):
             raise ValueError("Model request payload must be a JSON object")
@@ -305,7 +319,10 @@ class ModelRequestClient:
             canonical_input.encode("utf-8") + b"\0" + version_document.encode("utf-8")
         ).hexdigest()
         now = self._clock()
-        deadline = now + timedelta(seconds=self._deadline_seconds)
+        # Before its first provider claim this is the admission/queue deadline.
+        # The first claim replaces it with the execution deadline, which then
+        # remains fixed across retries and broker restarts.
+        deadline = now + timedelta(seconds=QUEUE_WAIT_SECONDS)
         request_id = str(uuid.uuid4())
         diagnostic_id = str(uuid.uuid4())
         spent_attempts = db.scalar(
@@ -321,6 +338,19 @@ class ModelRequestClient:
             )
         )
         budget_exhausted = cached is None and remaining_attempts == 0
+        if cached is None and not budget_exhausted:
+            outstanding = ModelRequest.status.in_(("queued", "running", "retry"))
+            session_count = db.scalar(
+                select(func.count(ModelRequest.id)).where(
+                    ModelRequest.session_id == request.session_id,
+                    outstanding,
+                )
+            ) or 0
+            global_count = db.scalar(
+                select(func.count(ModelRequest.id)).where(outstanding)
+            ) or 0
+            if session_count >= SESSION_OUTSTANDING_LIMIT or global_count >= GLOBAL_OUTSTANDING_LIMIT:
+                raise ModelOverloaded()
         status = "completed" if cached is not None else "failed" if budget_exhausted else "queued"
         row = ModelRequest(
             id=request_id,
@@ -407,7 +437,11 @@ class ModelRequestClient:
                             completed_at=now,
                             lease_owner=None,
                             heartbeat_at=None,
-                            error_code="deadline_exceeded",
+                            error_code=(
+                                "queue_wait_exceeded"
+                                if state.status == "queued"
+                                else "deadline_exceeded"
+                            ),
                         )
                         .execution_options(synchronize_session=False)
                     )
@@ -482,16 +516,44 @@ class ModelRequestBroker(ModelRequestClient):
         )
 
     def _expire_waiting(self, db: Session, now: datetime) -> int:
+        # Requests persisted by older versions used the 180 second execution
+        # window for queueing too. Give those unclaimed rows the current finite
+        # queue allowance anchored at creation. Never extend a request more
+        # than once or let broker ticks turn this into an unbounded deadline.
+        expired_unclaimed = list(db.scalars(
+            select(ModelRequest).where(
+                ModelRequest.status == "queued",
+                ModelRequest.attempt == 0,
+                ModelRequest.deadline_at <= now,
+            )
+        ))
+        legacy = 0
+        legacy_window = timedelta(seconds=self._deadline_seconds)
+        queue_window = timedelta(seconds=QUEUE_WAIT_SECONDS)
+        for row in expired_unclaimed:
+            created_at = _aware(row.created_at)
+            deadline_at = _aware(row.deadline_at)
+            if deadline_at > created_at + legacy_window:
+                continue
+            row.deadline_at = created_at + queue_window
+            legacy += 1
         changed = db.execute(
             update(ModelRequest)
             .where(
                 ModelRequest.status.in_(("queued", "retry")),
                 ModelRequest.deadline_at <= now,
             )
-            .values(status="failed", completed_at=now, error_code="deadline_exceeded")
+            .values(
+                status="failed",
+                completed_at=now,
+                error_code=case(
+                    (ModelRequest.status == "queued", "queue_wait_exceeded"),
+                    else_="deadline_exceeded",
+                ),
+            )
             .execution_options(synchronize_session=False)
         ).rowcount
-        return int(changed or 0)
+        return int(changed or 0) + int(legacy or 0)
 
     def _next_candidate(self, db: Session, now: datetime) -> ModelRequest | None:
         running = db.execute(
@@ -561,6 +623,11 @@ class ModelRequestBroker(ModelRequestClient):
                     started_at=now,
                     heartbeat_at=now,
                     lease_owner=self._owner,
+                    deadline_at=(
+                        now + timedelta(seconds=self._deadline_seconds)
+                        if candidate.attempt == 0
+                        else candidate.deadline_at
+                    ),
                     error_code=None,
                 )
                 .execution_options(synchronize_session=False)
@@ -738,7 +805,7 @@ class ModelRequestBroker(ModelRequestClient):
         except asyncio.CancelledError:
             raise
         except TimeoutError:
-            self._fail_or_retry(request_id, "model_timeout", force_terminal=True)
+            self._fail_or_retry(request_id, "model_timeout")
         except PromptInjectionDetected as exc:
             reason = re.sub(r"[^a-z0-9_]+", "_", exc.reason_code.lower())[:70]
             self._fail_or_retry(
@@ -746,12 +813,14 @@ class ModelRequestBroker(ModelRequestClient):
                 f"prompt_injection_{reason or 'detected'}",
                 force_terminal=True,
             )
-        except ModelPermanentError:
-            self._fail_or_retry(request_id, "permanent_model_error", force_terminal=True)
+        except ModelPermanentError as exc:
+            code = re.sub(r"[^a-z0-9_]+", "_", exc.error_code.lower())[:100]
+            self._fail_or_retry(request_id, code or "permanent_model_error", force_terminal=True)
         except ModelTimeout:
-            self._fail_or_retry(request_id, "model_timeout", force_terminal=True)
-        except ModelUnavailable:
-            self._fail_or_retry(request_id, "provider_unavailable")
+            self._fail_or_retry(request_id, "model_timeout")
+        except ModelUnavailable as exc:
+            code = re.sub(r"[^a-z0-9_]+", "_", exc.error_code.lower())[:100]
+            self._fail_or_retry(request_id, code or "provider_unavailable")
         except (TypeError, ValueError):
             self._fail_or_retry(request_id, "schema_validation_failed", force_terminal=True)
         except Exception as exc:

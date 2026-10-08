@@ -17,7 +17,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.config import settings
-from backend.intelligence.gateway import ModelPermanentError, ModelTimeout, ModelUnavailable
+from backend.intelligence.gateway import (
+    ModelOverloaded,
+    ModelPermanentError,
+    ModelTimeout,
+    ModelUnavailable,
+)
+from backend.intelligence.letter_claims import LETTER_CLAIMS_VERSION
 from backend.intelligence.model_broker import (
     ModelRequestClient,
     ModelVersions,
@@ -33,7 +39,7 @@ from backend.persistence.pipeline_models import PipelineItem, PipelineModelOpera
 
 T = TypeVar("T", bound=BaseModel)
 
-BROKER_PROMPT_VERSION = "workflow-prompts-2026-09-23"
+BROKER_PROMPT_VERSION = "workflow-prompts-2026-10-08-required-verification-v1"
 BROKER_PARSER_VERSION = "resume-schema-v2"
 _SUBMISSION_CLAIM_SECONDS = 30
 _FRESH_CORRECTIONS = {
@@ -50,7 +56,9 @@ _ROLE_STAGE = {
     "hirehi_category": "discovery",
     "preference_compiler": "discovery",
     "resume_analyst": "evaluation",
+    "required_preference_check": "evaluation",
     "writer": "letter",
+    "letter_claim_check": "letter",
     "special_conditions": "letter",
     "job_summary": "reporting",
     "application_answers": "submission",
@@ -176,10 +184,13 @@ class BrokeredModelGateway:
             "markers": markers,
             "search": HIREHI_SEARCH_ADAPTIVE_V3,
         }
+        prompt_base = BROKER_PROMPT_VERSION
+        if role in {"writer", "letter_claim_check"}:
+            prompt_base = _digest({"base": BROKER_PROMPT_VERSION, "letter_claims": LETTER_CLAIMS_VERSION})
         return ModelVersions(
             model_id=f"{provider}:{model}",
             model_version=_digest({"model": model, "config_revision": config_revision})[:32],
-            prompt_version=_digest({"base": BROKER_PROMPT_VERSION, "role": role})[:32],
+            prompt_version=_digest({"base": prompt_base, "role": role})[:32],
             schema_version=_digest(schema.model_json_schema())[:32],
             parser_version=_digest(parser_document)[:32],
         )
@@ -278,6 +289,10 @@ class BrokeredModelGateway:
                 request = db.get(ModelRequest, linked.request_id)
                 if request is not None:
                     if request.status in {"queued", "running", "retry", "completed"}:
+                        if request.error_code == "payload_retained_metadata":
+                            raise ModelPermanentError(
+                                f"Durable model operation {request.diagnostic_id} payload was retired"
+                            )
                         return request.id, None
                     if request.status == "cancelled":
                         db.execute(
@@ -294,8 +309,12 @@ class BrokeredModelGateway:
                         return None, None
                     if request.status == "failed":
                         terminal_error = (
-                            request.error_code == "model_timeout"
-                            or request.error_code == "permanent_model_error"
+                            request.error_code == "permanent_model_error"
+                            or request.error_code == "model_disabled"
+                            or request.error_code == "model_retired"
+                            or request.error_code == "provider_capability_unsupported"
+                            or request.error_code == "provider_unauthorized"
+                            or request.error_code == "model_not_configured"
                             or request.error_code == "schema_validation_failed"
                             or request.error_code == "attempt_budget_exhausted"
                             or bool(request.error_code and request.error_code.startswith("prompt_injection_"))
@@ -551,17 +570,23 @@ class BrokeredModelGateway:
             if self._cancelled():
                 self._finish_operation(operation.id, claim_token, "cancelled")
                 raise asyncio.CancelledError
-            request_id = self._submit_and_link(operation.id, claim_token, SubmitRequest(
-                session_id=self.session_id,
-                site_id=self.site_id,
-                vacancy_id=self._vacancy_id,
-                stage=stage,
-                role=role,
-                payload=safe_payload,
-                schema=schema,
-                versions=versions,
-                generation=self.generation,
-            ))
+            try:
+                request_id = self._submit_and_link(operation.id, claim_token, SubmitRequest(
+                    session_id=self.session_id,
+                    site_id=self.site_id,
+                    vacancy_id=self._vacancy_id,
+                    stage=stage,
+                    role=role,
+                    payload=safe_payload,
+                    schema=schema,
+                    versions=versions,
+                    generation=self.generation,
+                ))
+            except ModelOverloaded:
+                # Free the reservation so a later invocation can retry once
+                # capacity returns. The overload itself creates no request row.
+                self._finish_operation(operation.id, claim_token, "failed")
+                raise
             claim_token = None
             if request_id is None:
                 continue
@@ -573,6 +598,11 @@ class BrokeredModelGateway:
                 raise asyncio.CancelledError
             state = self.client.poll(request_id)
             if state.status == "completed":
+                if state.error_code == "payload_retained_metadata":
+                    self._finish_operation(operation.id, request_id, "failed")
+                    raise ModelPermanentError(
+                        f"Durable model operation {state.diagnostic_id} payload was retired"
+                    )
                 self._finish_operation(operation.id, request_id, "completed")
                 return schema.model_validate(state.result)
             if state.status == "cancelled":
@@ -588,6 +618,11 @@ class BrokeredModelGateway:
                     "permanent_model_error",
                     "schema_validation_failed",
                     "attempt_budget_exhausted",
+                    "model_disabled",
+                    "model_retired",
+                    "provider_capability_unsupported",
+                    "provider_unauthorized",
+                    "model_not_configured",
                 }:
                     raise ModelPermanentError(
                         f"Durable model operation {state.diagnostic_id} reached a terminal failure"

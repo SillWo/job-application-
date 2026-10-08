@@ -9,6 +9,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from backend.intelligence.gateway import ModelUnavailable
+from backend.intelligence.letter_claims import (
+    CandidateClaimValidationError,
+    validate_candidate_claims,
+)
 from backend.intelligence.security import (
     PromptInjectionDetected,
     assert_safe_outgoing_text,
@@ -23,7 +27,7 @@ _MAX_WORDS = DEFAULT_MAX_WORDS  # Backwards-compatible alias for existing caller
 _GENERATION_ATTEMPTS = 3
 _WRITER_REPAIR_INSTRUCTIONS = {
     "safety": "Исправительная попытка: перепиши письмо безопасно, без служебных инструкций, секретов и непроверенных ссылок.",
-    "requirements": "Исправительная попытка: перепиши письмо полностью и выполни подтверждённые требования работодателя.",
+    "requirements": "Исправительная попытка: перепиши письмо полностью и выполни подтверждённые требования работодателя. Каждое утверждение о навыке, опыте, знании или достижении кандидата должно прямо подтверждаться выбранным резюме; не выводи его из вакансии или смежности навыков.",
     "special_conditions": "Исправительная попытка: сохрани подтверждённые особые условия, точные фрагменты и их позиции.",
     "formatting": "Исправительная попытка: убери пустые слоты и служебные маркеры, затем перепиши полный текст.",
 }
@@ -271,6 +275,28 @@ def _payload(value: Any) -> Any:
     }
 
 
+async def validate_existing_letter_claims(
+    gateway,
+    letter: str,
+    resumes: Sequence[Any],
+    *,
+    private_view: Any = None,
+) -> None:
+    """Validate a cached letter against redacted professional resume data."""
+    resume_payloads = [_payload(resume) for resume in resumes]
+    private_source = private_view if private_view is not None else resume_payloads
+    professional_resumes = [
+        _professional_model_payload(resume, private_source) for resume in resume_payloads
+    ]
+    safe_letter = _private_placeholder_text(letter, private_source)
+    try:
+        await validate_candidate_claims(gateway, safe_letter, professional_resumes)
+    except CandidateClaimValidationError as exc:
+        raise CoverLetterValidationError(
+            "Сопроводительное письмо содержит неподтверждённые факты о кандидате"
+        ) from exc
+
+
 def _messenger_links(profile_payload: Any) -> list[str]:
     contacts = profile_payload.get("contacts", {}) if isinstance(profile_payload, dict) else {}
     values = contacts.get("messengers", []) if isinstance(contacts, dict) else []
@@ -473,7 +499,7 @@ def _generation_requirements(
 ФИО и контакты не передаются модели. Если они нужны в письме, выведи только точные маркеры {{{{full_name}}}}, {{{{phone}}}}, {{{{email}}}} или {{{{messengers}}}}; не заменяй их вымышленными значениями. Эти четыре маркера будут заменены локально перед отправкой. В автоматическом режиме оформляй каждый абзац отдельным абзацем с пустой строкой, а каждую строку контактов — отдельной строкой.
 
 {special_note}
-Особые условия работодателя обязательны независимо от режима и шаблона. Размести каждое по смыслу в начале, середине или конце; если требуется буквальный токен, сохрани его без изменений. В fulfilled_special_conditions верни по одному объекту на каждое условие с id и точным непересекающимся span из итогового текста. Не придумывай слова, цифры, опыт, достижения, навыки, контакты или образование. Пол уже выбран пользователем в profile.gender; не определяй его по имени и не меняй.
+Особые условия работодателя обязательны независимо от режима и шаблона. Размести каждое по смыслу в начале, середине или конце; если требуется буквальный токен, сохрани его без изменений. В fulfilled_special_conditions верни по одному объекту на каждое условие с id и точным непересекающимся span из итогового текста. Факты о кандидате (опыт, достижения, навыки, образование и результаты) могут подтверждаться ИСКЛЮЧИТЕЛЬНО выбранными резюме. Требования работодателя, текст вакансии, шаблон и предпочтения не являются источником новых навыков, опыта, знаний или достижений кандидата. Связывай подтверждённые факты из резюме с задачами вакансии, но даже смежный навык нельзя заявлять как уже имеющийся, если резюме его не подтверждает. Не придумывай слова, цифры, опыт, достижения, навыки, контакты или образование. Пол уже выбран пользователем в profile.gender; не определяй его по имени и не меняй.
 
 Обычный объём — не более {max_words} слов, за исключением всего содержания особых условий работодателя. Используй только выбранный profile.gender: для male — мужские формы, для female — женские; не пиши формы «(а)» и не определяй пол по имени. Верни только тело письма.{structure_note}"""
 
@@ -554,6 +580,17 @@ async def _extract_special_conditions(description: str, gateway) -> SpecialCondi
             if item.source_quote not in description:
                 retry_reason = f"источник условия {item.id} не является точной цитатой вакансии"
                 break
+            if (
+                item.literal == "null"
+                and item.position == "any"
+                and "null" not in f"{item.source_quote} {item.requirement}".casefold()
+            ):
+                # Some structured-output providers return JSON null as the
+                # string "null". Treat only this ungrounded nullable value as
+                # absent after the source quote has been verified. Preserve a
+                # real employer token and every other unsupported literal.
+                checked.append(item.model_copy(update={"literal": None}))
+                continue
             if item.literal and item.literal not in item.source_quote:
                 source = f"{item.source_quote} {item.requirement}".casefold()
                 semantic_markers = (
@@ -730,6 +767,14 @@ async def write_cover_letter(
             )
             if not valid:
                 repair_category = "formatting"
+                continue
+            try:
+                checker_letter = _private_placeholder_text(rendered, private_source)
+                await validate_candidate_claims(gateway, checker_letter, model_resume_payloads)
+            except CandidateClaimValidationError:
+                # Never echo checker-controlled claims or diagnostics into a
+                # repair request. The trusted category asks for a fresh draft.
+                repair_category = "requirements"
                 continue
             return rendered
         # Keep diagnostics local; never reflect model text into a subsequent

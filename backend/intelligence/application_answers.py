@@ -19,6 +19,11 @@ from backend.intelligence.security import (
 from backend.schemas.domain import ApplicationField, ApplicationPlan, FormAnswer, JobPosting
 
 SALARY_MARKERS = re.compile(r"зарплат|\bзп\b|з/п|доход|оплат|оклад|финансов\w*\s+ожидан|вознагражд|salary|compensation|pay\b|income|wage|от какой суммы рассматрива|какую сумму (?:ожида|рассматрива|хотите)", re.I)
+EXACT_SALARY_DIRECTIVE = re.compile(
+    r"зарплата\s*:\s*только\s+точные\s+правила\s*;\s*без\s+оценки\s*\.?|"
+    r"не\s+придумывай\s+и\s+не\s+оценивай\s+обязательную\s+зарплату",
+    re.I,
+)
 MONEY = re.compile(r"\d[\d\s.,]*\s*(?:тыс|[кk]\b|руб|₽|\$|€|rub|usd|eur)", re.I)
 SENSITIVE = re.compile(r"паспорт|снилс|инн\b|банковск\w*\s+реквизит|(?:номер|реквизит)\w*\s+(?:банковск\w*\s+)?(?:карт|сч[её]т)|парол|код из|здоровь|заболеван|диагноз|религи|судим|политическ|согласие на|согласен с|passport|password|bank account\s+(?:number|details)|social security|agree to", re.I)
 PERSONAL = re.compile(r"\b(?:вы|ваш\w*|вам|вас|ты|твой|your|you)\b|опыт|прожив|готовност|готовы|гражданств|портфолио|резюме|experience|relocat", re.I)
@@ -230,6 +235,183 @@ def _answer_salary_scope(description: str) -> str | None:
     return description[heading.end():].strip() if heading else None
 
 
+def _salary_exact_only(description: str) -> bool:
+    return bool(EXACT_SALARY_DIRECTIVE.search(description))
+
+
+def _work_format_bucket(value: str | None) -> str | None:
+    text = _normalized(value or "")
+    if re.search(r"гибрид|hybrid|частично\s+(?:удален|дистанцион)|офис\w*[- ]удален", text):
+        return "hybrid"
+    found = set()
+    if re.search(r"удален|дистанцион|remote|из\s+любой\s+точки", text):
+        found.add("remote")
+    if re.search(r"офис|на\s+месте\s+работодател|на\s+территории\s+компан|office", text):
+        found.add("office")
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _location_bucket(value: str | None) -> str | None:
+    text = _normalized(value or "")
+    if not text:
+        return None
+    noncapital = bool(re.search(
+        r"(?:вне|кроме|за\s+пределами|не\s+в)\s+.*(?:москв|мск|спб|петербург)|"
+        r"не\s+(?:москв|мск)",
+        text,
+    ))
+    if noncapital:
+        return "noncapital"
+    capital = bool(re.search(r"москв|мск|санкт[- ]?петербург|спб|питер|moscow|st\.?\s*petersburg", text))
+    if capital:
+        return "capital"
+    # Generic regions, countries, formats, and unknown values cannot establish
+    # a city-specific salary band.
+    if re.search(
+        r"не\s+указан|неизвест|любой|удален|дистанцион|remote|вся|росси|\bрф\b|"
+        r"европ|\bснг\b|везде|любая\s+точка|весь\s+мир|континент|\b(?:область|край|регион|республика)\b",
+        text,
+    ):
+        return None
+    # A concrete named non-capital city is evidence for the non-capital bucket.
+    return "noncapital" if re.search(r"[а-яa-z]", text) else None
+
+
+def _experience_requirement(description: str) -> tuple[int, int] | None:
+    """Return an explicitly stated minimum/maximum experience requirement."""
+    clauses = re.findall(
+        r"[^.!?;\n]*(?:требу\w*|необходим\w*|нуж\w*|опыт\s+работы|стаж\s+работы)[^.!?;\n]*",
+        description,
+        re.I,
+    )
+    bounds: list[tuple[int, int]] = []
+    for clause in clauses:
+        strict_lower = re.search(
+            r"(?:более|больше|свыше|>)\s*(\d+)\s*(?:лет|года?|год)", clause, re.I
+        )
+        if strict_lower:
+            bounds.append((int(strict_lower[1]) + 1, 99))
+            continue
+        match = re.search(
+            r"(?:от|не\s+менее|как\s+минимум)\s*(\d+)\s*(?:лет|года?|год)?|"
+            r"(\d+)\s*(?:лет|года?|год)\s*(?:и\s+)?(?:более|больше|не\s+менее)|"
+            r"(\d+)\s*[-–—]\s*(\d+)\s*(?:лет|года?)|"
+            r"(?<!\d)(\d+)\s*(?:лет|года?|год)(?!\s*\d)",
+            clause,
+            re.I,
+        )
+        if not match:
+            continue
+        groups = [int(value) if value is not None else None for value in match.groups()]
+        if groups[0] is not None:
+            bounds.append((groups[0], 99))
+        elif groups[1] is not None:
+            bounds.append((groups[1], 99))
+        elif groups[2] is not None:
+            bounds.append((groups[2], groups[3]))
+        elif groups[4] is not None:
+            bounds.append((groups[4], groups[4]))
+    if not bounds or len(set(bounds)) != 1:
+        return None
+    return bounds[0]
+
+
+def _has_experience_requirement_clause(description: str) -> bool:
+    return bool(re.search(
+        r"(?:требу\w*|необходим\w*|нуж\w*|опыт\s+работы|стаж\s+работы)",
+        description,
+        re.I,
+    ))
+
+
+def _required_experience_bounds(value: str | None) -> tuple[int, int] | None:
+    text = _normalized(value or "")
+    text = re.sub(r"^опыт\s+работы\s*:\s*", "", text)
+    match = re.fullmatch(r"(\d+)\s*[-–—]\s*(\d+)\s*(?:лет|года?)", text)
+    if match:
+        lower, upper = map(int, match.groups())
+        return (lower, upper) if lower <= upper else None
+    match = re.fullmatch(r"(?:более|больше|свыше|>)\s*(\d+)\s*(?:лет|года?)", text)
+    if match:
+        return int(match[1]) + 1, 99
+    match = re.fullmatch(r"(?:от|не\s+менее|как\s+минимум|>=)\s*(\d+)\s*(?:лет|года?)", text)
+    if match:
+        return int(match[1]), 99
+    match = re.fullmatch(r"(?:до|не\s+более|<=)\s*(\d+)\s*(?:лет|года?)", text)
+    if match:
+        return 0, int(match[1])
+    match = re.fullmatch(r"(\d+)\s*(?:лет|года?|год)", text)
+    if match:
+        years = int(match[1])
+        return years, years
+    return None
+
+
+def _job_experience_bounds(job: JobPosting) -> tuple[int, int] | None:
+    full_text = _experience_requirement(job.description or "")
+    card_text = _required_experience_bounds(job.required_experience)
+    if card_text is None:
+        card_text = _experience_requirement(job.required_experience or "")
+    if (_has_experience_requirement_clause(job.description or "") and full_text is None) or (
+        _has_experience_requirement_clause(job.required_experience or "") and card_text is None
+    ):
+        return None
+    if card_text:
+        lower, upper = card_text
+        if full_text:
+            lower = max(lower, full_text[0])
+            upper = min(upper, full_text[1])
+            return (lower, upper) if lower <= upper else None
+        return lower, upper
+    if full_text:
+        return full_text
+    return None
+
+
+def _exact_experience_matches(job: JobPosting, condition: str) -> bool:
+    rule_text = _normalized(condition)
+    lower = upper = None
+    match = re.search(r"(?<!\d)(\d+)\s*[-–—]\s*(\d+)\s*(?:лет|года?)", rule_text)
+    if match:
+        lower, upper = map(int, match.groups())
+    else:
+        match = re.search(r"(\d+)\s*(?:лет|года?)\s+и\s+(?:меньше|менее|не\s+более)", rule_text)
+        if match:
+            upper = int(match[1])
+        match = match or re.search(r"(?:до|не\s+более|менее|меньше|<=|<)\s*(\d+)\s*(?:лет|года?)?", rule_text)
+        if match and upper is None:
+            upper = int(match[1])
+        match = re.search(r"(?:более|больше|свыше|от|не\s+менее|>=|>(?!=))\s*(\d+)\s*(?:лет|года?)?", rule_text)
+        if match:
+            lower = int(match[1])
+            if re.match(r"(?:более|больше|свыше|>(?!=))", match[0]):
+                lower += 1
+    if lower is None and upper is None:
+        return True
+    facts = _job_experience_bounds(job)
+    if facts is None:
+        return False
+    fact_lower, fact_upper = facts
+    if lower is not None and fact_lower < lower:
+        return False
+    # Exactly 3 uses the <=3 user band; an explicit minimum of 4 still narrows
+    # a card range that starts at 3 to the >3 salary band.
+    return not (upper is not None and fact_upper > upper)
+
+
+def _exact_salary_context_matches(job: JobPosting, rule: SalaryRule) -> bool:
+    condition = f"{rule.condition} {rule.quote}"
+    rule_format = _work_format_bucket(condition)
+    job_format = _work_format_bucket(job.work_format)
+    if rule_format is not None and (job_format is None or rule_format != job_format):
+        return False
+    rule_location = _location_bucket(condition)
+    job_location = _location_bucket(job.location)
+    if rule_location is not None and (job_location is None or rule_location != job_location):
+        return False
+    return _exact_experience_matches(job, condition)
+
+
 def _experience_range_supported(required_experience: str | None, rule: SalaryRule) -> bool:
     """A site's experience range must fit the selected explicit numeric condition."""
     interval = re.fullmatch(r"(?:опыт\s+работы:\s*)?(\d+)\s*[-–—]\s*(\d+)\s*(?:лет|года?)",
@@ -437,6 +619,7 @@ async def resolve_salary(
     )
     rules = SalaryRules(has_salary_rules=False, rules=[])
     source_text = description.strip()
+    exact_only = _salary_exact_only(source_text)
     answer_scope = _answer_salary_scope(source_text)
     if source_text:
         payload = {"text": source_text}
@@ -445,7 +628,7 @@ async def resolve_salary(
         rules = await gateway.structured("application_salary_rules", payload, SalaryRules)
         assert_safe_output(rules.model_dump(mode="json"), context="salary rules")
     # A mention of paid training or company revenue is not a candidate salary rule.
-    preference_salary = answer_scope is not None or rules.has_salary_rules or bool(rules.rules)
+    preference_salary = exact_only or answer_scope is not None or rules.has_salary_rules or bool(rules.rules)
     source = "preferences"
     if not preference_salary:
         salaries = list(dict.fromkeys(_resume_desired_salary(resume) for resume in resumes))
@@ -478,12 +661,16 @@ async def resolve_salary(
         rules.rules = [rule.model_copy(update={"gross": None}) for rule in rules.rules]
     # An invalid rule poisons the rule set: silently dropping it could select a wrong fallback.
     if not rules.rules or any(not _valid_rule(source_text, rule) for rule in rules.rules):
+        if exact_only:
+            return ResolvedSalary(reason="Точное зарплатное правило отсутствует, неполно или не подтверждено исходным текстом")
         return await _estimate_salary(
             gateway, job, resumes, source_text, rules, source, question,
             "Зарплатные правила отсутствуют, неполны или не подтверждены исходным текстом",
         )
     if len(rules.rules) == 1 and not rules.rules[0].condition.strip():
         if _salary_context_requires_estimate(question, rules.rules[0]):
+            if exact_only:
+                return ResolvedSalary(reason="Точное правило не подтверждает валюту, период или налоговую базу вопроса")
             return await _estimate_salary(
                 gateway, job, resumes, source_text, rules, source, question,
                 "Точная сумма есть, но база вопроса требует адаптации",
@@ -503,16 +690,22 @@ async def resolve_salary(
     if (index is None or not 0 <= index < len(rules.rules) or not selected.context_complete
             or selected.confidence < 1 or not selected.vacancy_evidence
             or any(not _contains(evidence_text, quote) for quote in selected.vacancy_evidence)):
+        if exact_only:
+            return ResolvedSalary(reason=_human_reason(selected.reason, "Условия точного зарплатного правила не подтверждены вакансией"))
         return await _estimate_salary(
             gateway, job, resumes, source_text, rules, source, question,
             _human_reason(selected.reason, "Условия зарплатного правила не подтверждены вакансией"),
         )
-    if not _experience_range_supported(job.required_experience, rules.rules[index]):
+    if exact_only and not _exact_salary_context_matches(job, rules.rules[index]):
+        return ResolvedSalary(reason="Точное зарплатное правило не подтверждено форматом работы, городом или опытом вакансии")
+    if not exact_only and not _experience_range_supported(job.required_experience, rules.rules[index]):
         return await _estimate_salary(
             gateway, job, resumes, source_text, rules, source, question,
             "Диапазон требуемого опыта пересекает границу зарплатного правила",
         )
     if _salary_context_requires_estimate(question, rules.rules[index]):
+        if exact_only:
+            return ResolvedSalary(reason="Точное правило не подтверждает валюту, период или налоговую базу вопроса")
         return await _estimate_salary(
             gateway, job, resumes, source_text, rules, source, question,
             "Точная сумма есть, но база вопроса требует адаптации",

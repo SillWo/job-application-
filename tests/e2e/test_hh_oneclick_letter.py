@@ -112,6 +112,13 @@ async def test_restart_confirms_existing_cv_and_resumes_only_letter(tmp_path, mo
             "cv_confirmed": True,
             "cover_letter_pending": False,
             "cover_letter_confirmed": True,
+            "cover_letter_diagnostic": {
+                "category": "ready",
+                "count": 1,
+                "visible": True,
+                "enabled": True,
+                "exception_category": None,
+            },
         }
     finally:
         await executor.close()

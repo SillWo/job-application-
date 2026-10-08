@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from time import perf_counter
 
 import pytest
@@ -16,6 +17,7 @@ from backend.services.resume_session import (
     ResumeImportError,
     _normalize_extracted,
     delete_snapshot,
+    full_resume_model_payload,
     issue_preview_token,
     persist_session_snapshot,
     private_view,
@@ -122,6 +124,62 @@ def test_legacy_snapshot_without_full_snapshot_restores_complete_model_payload(d
     assert payload["identity"]["full_name"] == "Ada Lovelace"
     assert payload["contacts"]["email"] == "ada@example.test"
     assert payload["skills"][0]["name"] == "Python"
+    assert "coverage" not in payload
+    assert "availability" not in str(payload)
+    assert "source_section" not in str(payload)
+
+
+def test_model_resume_payloads_keep_values_and_drop_completeness_metadata():
+    extracted = {
+        "external_id": "abc123",
+        "identity": {"full_name": {"value": "Ada Lovelace", "availability": "present",
+                                    "source_section": "profile"}},
+        "target": {"title": {"value": "Python engineer", "availability": "present",
+                              "source_section": "target"}},
+        "location": {"business_trips": {"value": False, "availability": "present",
+                                         "source_section": "preferences"}},
+        "total_experience": {"value": "0", "availability": "present",
+                             "source_section": "experience"},
+        "experience": [{
+            "company": {"value": "Analytical Engines", "availability": "present",
+                        "source_section": "work_history", "source_locator": "section:nth-child(2)"},
+            "position": {"value": "Engineer", "availability": "present",
+                         "source_section": "work_history"},
+            "achievements": {"value": ["Built systems", "Improved reliability"],
+                             "availability": "present", "source_section": "work_history"},
+        }],
+        "skills": [{"name": {"value": "Python", "availability": "present",
+                               "source_section": "skills"}}],
+        "additional_sections": [{"name": "Highlights", "content": {
+            "value": "0% incidents; independently owned", "availability": "present",
+            "source_section": "extra"}, "availability": "present"}],
+        "coverage": {"present_sections": ["experience"], "missing_sections": ["education"]},
+    }
+    original = deepcopy(extracted)
+    item = _normalize_extracted(
+        extracted, adapter_id="hh", source_url="https://hh.ru/resume/abc123"
+    )
+
+    complete = full_resume_model_payload(item)
+    professional = professional_model_payload(professional_view(item))
+    for payload in (complete, professional):
+        serialized = str(payload)
+        assert "availability" not in serialized
+        assert "source_section" not in serialized
+        assert "source_locator" not in serialized
+        assert "coverage" not in payload
+        assert payload["experience"][0]["company"] == "Analytical Engines"
+        assert payload["experience"][0]["achievements"] == ["Built systems", "Improved reliability"]
+        assert payload["skills"][0]["name"] == "Python"
+        assert payload["additional_sections"][0]["content"] == "0% incidents; independently owned"
+    assert complete["identity"]["full_name"] == "Ada Lovelace"
+    assert complete["target"]["desired_title"] == "Python engineer"
+    assert complete["location"]["business_trips"] is False
+    assert complete["total_experience"] == "0"
+    assert extracted == original
+    # The completeness model remains available for local UI and persistence.
+    assert item.coverage.missing_sections == ["education"]
+    assert item.experience[0].company.availability.value == "present"
 
 
 def test_dpapi_failure_fails_closed(monkeypatch, db):

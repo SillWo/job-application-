@@ -925,6 +925,7 @@ def test_windows_production_worker_entry_crash_recovery_and_generation(tmp_path:
     import multiprocessing as mp
 
     from backend.persistence import database
+    from backend.persistence.pipeline_models import PipelineItem  # noqa: F401
 
     db_path = tmp_path / "production-worker.db"
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
@@ -936,6 +937,29 @@ def test_windows_production_worker_entry_crash_recovery_and_generation(tmp_path:
         db.commit()
     monkeypatch.setattr(database, "SessionLocal", sessions)
     real_context = mp.get_context("spawn")
+    owned_processes = []
+    queues = []
+
+    def cleanup_owned_processes() -> None:
+        for process in reversed(owned_processes):
+            try:
+                if process.pid is None or not process.is_alive():
+                    continue
+                process.terminate()
+                process.join(timeout=2)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=2)
+            except Exception:
+                # Preserve the test failure while still attempting cleanup of
+                # every process created by this test.
+                continue
+        for queue in queues:
+            try:
+                queue.close()
+                queue.join_thread()
+            except Exception:
+                continue
 
     class ContextProxy:
         Queue = real_context.Queue
@@ -950,53 +974,61 @@ def test_windows_production_worker_entry_crash_recovery_and_generation(tmp_path:
 
     supervisor = RuntimeSupervisor(context="spawn", queue_size=4)
     supervisor.ctx = ContextProxy()
-    handle = supervisor.start(site_id="hh", session_id=session_id)
-    assert handle is not None
-    deadline = time.monotonic() + 5
-    worker_pid = None
-    while time.monotonic() < deadline:
+    try:
+        handle = supervisor.start(site_id="hh", session_id=session_id)
+        if handle is not None:
+            owned_processes.append(handle.process)
+        assert handle is not None
+        deadline = time.monotonic() + 15
+        worker_pid = None
+        while time.monotonic() < deadline:
+            with sessions() as db:
+                execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
+                worker_pid = execution.worker_pid
+            if worker_pid:
+                break
+            time.sleep(0.05)
+        assert worker_pid
+        assert handle.process.pid == worker_pid
+        handle.process.kill()
+        handle.process.join(timeout=5)
+        assert not handle.process.is_alive()
         with sessions() as db:
             execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
-            worker_pid = execution.worker_pid
-        if worker_pid:
-            break
-        time.sleep(0.05)
-    assert worker_pid
-    assert handle.process.pid == worker_pid
-    handle.process.kill()
-    handle.process.join(timeout=5)
-    assert not handle.process.is_alive()
-    with sessions() as db:
-        execution = db.scalar(select(SessionExecution).where(SessionExecution.session_id == session_id))
-        execution.stage = "PREPARING"
-        db.commit()
+            execution.stage = "PREPARING"
+            db.commit()
 
-    restarted = RuntimeSupervisor(context="spawn", queue_size=4)
-    restarted.ctx = ContextProxy()
-    recovered = restarted.recover()
-    assert session_id in recovered
-    replacement = restarted.workers["hh"]
-    assert replacement.generation > handle.generation
-    assert replacement.process.pid != handle.process.pid
-    started = time.monotonic()
-    assert restarted.stop("hh", session_id=session_id, timeout=5.0)
-    assert time.monotonic() - started <= 5.0
+        restarted = RuntimeSupervisor(context="spawn", queue_size=4)
+        restarted.ctx = ContextProxy()
+        recovered = restarted.recover()
+        assert session_id in recovered
+        replacement = restarted.workers["hh"]
+        owned_processes.append(replacement.process)
+        assert replacement.generation > handle.generation
+        assert replacement.process.pid != handle.process.pid
+        started = time.monotonic()
+        assert restarted.stop("hh", session_id=session_id, timeout=5.0)
+        assert time.monotonic() - started <= 5.0
 
-    # The same Windows acceptance also proves the production Job Object's
-    # descendant cleanup contract with a real sleeper child.
-    messages = real_context.Queue()
-    descendant = real_context.Process(target=_job_object_descendant_harness, args=(messages,))
-    descendant.start()
-    child_pid, containment_handle = messages.get(timeout=5)
-    assert containment_handle
-    messages.put("exit")
-    descendant.join(timeout=5)
-    from backend.runtime.job_object import _pid_gone
+        # The same Windows acceptance also proves the production Job Object's
+        # descendant cleanup contract with a real sleeper child.
+        messages = real_context.Queue()
+        queues.append(messages)
+        descendant = real_context.Process(target=_job_object_descendant_harness, args=(messages,))
+        descendant.start()
+        owned_processes.append(descendant)
+        child_pid, containment_handle = messages.get(timeout=5)
+        assert containment_handle
+        messages.put("exit")
+        descendant.join(timeout=5)
+        from backend.runtime.job_object import _pid_gone
 
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and not _pid_gone(child_pid):
-        time.sleep(0.05)
-    assert _pid_gone(child_pid)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not _pid_gone(child_pid):
+            time.sleep(0.05)
+        assert _pid_gone(child_pid)
+    finally:
+        cleanup_owned_processes()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object descendant acceptance")

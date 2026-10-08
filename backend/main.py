@@ -33,6 +33,9 @@ async def lifespan(app: FastAPI):
         db.commit()
     runtime_stop = asyncio.Event()
     runtime_monitor = asyncio.create_task(runtime_supervisor.monitor(runtime_stop))
+    retention_stop = asyncio.Event()
+    from backend.services.payload_retention import run_retention_maintenance
+    retention_task = asyncio.create_task(run_retention_maintenance(retention_stop))
     # The API process is the single provider owner. Spawned workflow workers
     # only enqueue/poll durable rows through ModelRequestClient.
     model_broker = ModelRequestBroker()
@@ -43,6 +46,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         runtime_stop.set()
+        retention_stop.set()
+        await retention_task
         await runtime_monitor
         runtime_supervisor.close()
         await model_broker.stop(drain=True)

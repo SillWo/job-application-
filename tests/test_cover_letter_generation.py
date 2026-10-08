@@ -1,5 +1,8 @@
+import re
+
 import pytest
 
+from backend.intelligence.letter_claims import _has_candidate_fact_claim, _semantic_strings
 from backend.intelligence.letter_writer import (
     CoverLetterGenerationDraft,
     CoverLetterValidationError,
@@ -22,7 +25,36 @@ class Gateway:
         self.calls.append((role, payload, schema))
         if role == "special_conditions":
             return schema.model_validate({"conditions": []})
+        if role == "letter_claim_check":
+            return _claim_check(schema, payload)
         return self.draft_factory(schema, payload, len(self.calls))
+
+
+def _claim_check(schema, payload):
+    letter = payload["letter"]
+    evidence = []
+    unsupported = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", letter):
+        if not _has_candidate_fact_claim(sentence):
+            continue
+        match = next((
+            (index, source)
+            for index, resume in enumerate(payload["resumes"])
+            for source in _semantic_strings(resume)
+            if source.casefold() in sentence.casefold()
+        ), None)
+        if match is None:
+            unsupported.append(sentence.strip())
+        else:
+            evidence.append({
+                "claim_span": sentence.strip(), "resume_index": match[0], "source_quote": match[1],
+            })
+    return schema.model_validate({
+        "all_candidate_claims_supported": not unsupported,
+        "confidence": 1,
+        "unsupported_claims": unsupported,
+        "evidence": evidence,
+    })
 
 
 def _job(description="Описание вакансии"):
@@ -290,6 +322,8 @@ async def test_writer_uses_fresh_generation_with_safe_repair_category():
             self.calls.append((role, payload, schema))
             if role == "special_conditions":
                 return SpecialConditionBatch(conditions=[])
+            if role == "letter_claim_check":
+                return _claim_check(schema, payload)
             return schema.model_validate({"text": "Я [ФИО]", "fulfilled_special_conditions": []})
 
     gateway = FreshGateway()
@@ -319,6 +353,8 @@ async def test_special_span_is_exempt_from_word_limit_but_grounded_to_source():
                         "position": "any",
                     }]
                 })
+            if role == "letter_claim_check":
+                return _claim_check(schema, payload)
             return CoverLetterGenerationDraft.model_validate({
                 "text": text,
                 "fulfilled_special_conditions": [{"id": "s1", "span": special, "position": "any"}],
@@ -346,6 +382,8 @@ async def test_factual_question_answer_is_semantic_not_unverified_literal():
                     "literal": "London",
                     "position": "any",
                 }])
+            if role == "letter_claim_check":
+                return _claim_check(schema, payload)
             return CoverLetterGenerationDraft(
                 text="Здравствуйте! London. С уважением, Иван Иванов.",
                 fulfilled_special_conditions=[{
@@ -378,6 +416,8 @@ async def test_quoted_employer_token_remains_verbatim_requirement():
                     "requirement": "Указать слово ORBITA", "literal": "ORBITA",
                     "position": "any",
                 }])
+            if role == "letter_claim_check":
+                return _claim_check(schema, payload)
             return CoverLetterGenerationDraft(
                 text="Здравствуйте! ORBITA. С уважением, Иван Иванов.",
                 fulfilled_special_conditions=[{"id": "token_1", "span": "ORBITA"}],
@@ -403,6 +443,8 @@ async def test_unknown_fulfilled_condition_id_is_rejected_even_without_extracted
             self.calls.append((role, payload, schema))
             if role == "special_conditions":
                 return SpecialConditionBatch(conditions=[])
+            if role == "letter_claim_check":
+                return _claim_check(schema, payload)
             return CoverLetterGenerationDraft(
                 text="Готов обсудить задачи вакансии.",
                 fulfilled_special_conditions=[{"id": "unknown", "span": "Готов"}],

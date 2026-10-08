@@ -35,26 +35,42 @@ def test_cover_letter_does_not_invent_messenger_link_when_contacts_are_empty():
 @pytest.mark.asyncio
 async def test_write_cover_letter_passes_new_generation_contract():
     class FakeGateway:
+        def __init__(self):
+            self.calls = []
+
         async def structured(self, role, payload, response_model):
+            self.calls.append((role, payload))
             if role == "special_conditions":
                 return response_model(conditions=[])
-            assert role == "writer"
-            requirements = payload["requirements"]
-            assert "не более 150 слов" in requirements
-            assert "квадратные скобки" in requirements
-            assert "Особые условия работодателя" in requirements
+            if role == "writer":
+                requirements = payload["requirements"]
+                assert "не более 150 слов" in requirements
+                assert "квадратные скобки" in requirements
+                assert "Особые условия работодателя" in requirements
+                return response_model(
+                    text="Мне интересна вакансия и задачи. Буду рад обсудить роль.",
+                    fulfilled_special_conditions=[],
+                )
+            assert role == "letter_claim_check"
+            assert set(payload) == {"letter", "resumes"}
             return response_model(
-                text="Мне интересна вакансия и задачи. Компания близка по подходу. Мой опыт подходит.",
-                fulfilled_special_conditions=[],
+                all_candidate_claims_supported=True,
+                confidence=1,
+                unsupported_claims=[],
+                evidence=[],
             )
 
+    gateway = FakeGateway()
     result = await write_cover_letter(
         JobPosting(source="mock", url="https://example.test/job", title="Тестировщик", company="Компания", description="Задачи"),
         {"full_name": "Иван Иванов", "gender": "male", "contacts": {"messengers": ["https://t.me/ivan"]}},
         [{"name": "Резюме"}],
-        FakeGateway(),
+        gateway,
     )
-    assert result == "Мне интересна вакансия и задачи. Компания близка по подходу. Мой опыт подходит."
+    assert result == "Мне интересна вакансия и задачи. Буду рад обсудить роль."
+    assert [role for role, _payload in gateway.calls] == [
+        "special_conditions", "writer", "letter_claim_check",
+    ]
 
 
 def test_cover_letter_does_not_duplicate_greeting():

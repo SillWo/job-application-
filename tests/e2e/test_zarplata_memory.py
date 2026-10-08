@@ -11,11 +11,17 @@ from backend.schemas.domain import ApplicationPlan, JobPosting
 @pytest.mark.asyncio
 async def test_zarplata_fills_confirmed_memory_and_rejects_changed_question(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    executor = BrowserExecutor("zarplata-memory", ("127.0.0.1",), headless=True)
+    executor = BrowserExecutor("zarplata-memory", ("zarplata.ru",), headless=True)
     try:
         page = await executor.start()
+        async def fixture_vacancy(route):
+            await route.fulfill(status=200, content_type="text/html", body="<!doctype html><html><body></body></html>")
+
+        await page.route("https://zarplata.ru/vacancy/1", fixture_vacancy)
+        await page.goto("https://zarplata.ru/vacancy/1")
         await page.set_content('<form><div data-qa="task-question">Когда можете начать?</div><textarea name="task_1_text"></textarea></form>')
         adapter = ZarplataAdapter()
+        adapter._expected_job_id = "1"
         form = await adapter.open_application(page)
         # This synthetic form is already open, with no vacancy response button.
         from backend.adapters.base.protocol import ApplicationForm

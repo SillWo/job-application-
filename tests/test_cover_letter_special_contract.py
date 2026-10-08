@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from pydantic import ValidationError
 
+from backend.intelligence.letter_claims import _has_candidate_fact_claim, _semantic_strings
 from backend.intelligence.letter_writer import (
     CoverLetterGenerationDraft,
     CoverLetterValidationError,
@@ -37,6 +40,32 @@ class RecordingGateway:
         self.calls.append((role, payload, schema))
         if role == "special_conditions":
             return schema.model_validate({"conditions": self.conditions})  # type: ignore[attr-defined]
+        if role == "letter_claim_check":
+            evidence = []
+            unsupported = []
+            for sentence in re.split(r"(?<=[.!?])\s+|\n+", str(payload["letter"])):
+                if not _has_candidate_fact_claim(sentence):
+                    continue
+                source_match = next((
+                    (index, source)
+                    for index, resume in enumerate(payload["resumes"])  # type: ignore[arg-type]
+                    for source in _semantic_strings(resume)
+                    if source.casefold() in sentence.casefold()
+                ), None)
+                if source_match is None:
+                    unsupported.append(sentence.strip())
+                else:
+                    evidence.append({
+                        "claim_span": sentence.strip(),
+                        "resume_index": source_match[0],
+                        "source_quote": source_match[1],
+                    })
+            return schema.model_validate({  # type: ignore[attr-defined]
+                "all_candidate_claims_supported": not unsupported,
+                "confidence": 1,
+                "unsupported_claims": unsupported,
+                "evidence": evidence,
+            })
         return schema.model_validate({  # type: ignore[attr-defined]
             "text": self.text,
             "fulfilled_special_conditions": self.fulfilled,
@@ -49,11 +78,12 @@ async def _write(
     *,
     auto: bool = True,
     template: str = "",
+    resumes: list[dict[str, object]] | None = None,
 ) -> str:
     return await write_cover_letter(
         _job(description),
         {"full_name": "Иван Иванов", "gender": "male"},
-        [{"name": "Резюме", "skills": ["SQL"]}],
+        resumes or [{"name": "Резюме", "skills": ["SQL"]}],
         gateway,
         cover_letter_auto=auto,
         cover_letter_template=template,
@@ -74,7 +104,7 @@ async def test_150_ordinary_and_170_semantic_special_words_are_preserved() -> No
     result = await _write(gateway, source)
 
     assert result == text
-    assert [call[0] for call in gateway.calls] == ["special_conditions", "writer"]
+    assert [call[0] for call in gateway.calls] == ["special_conditions", "writer", "letter_claim_check"]
     assert gateway.calls[1][2] is CoverLetterGenerationDraft
 
 
@@ -192,7 +222,7 @@ async def test_auto_one_line_default_anchors_are_formatted_without_splitting_exa
     source = "В письмо добавьте точную фразу «ORBITA Мои контакты:»."
     exact_span = "ORBITA Мои контакты:"
     one_line = (
-        "Здравствуйте! {{full_name}}, мой опыт соответствует задачам. " + exact_span
+        "Здравствуйте! {{full_name}}, мне интересны задачи. " + exact_span
         + " Мессенджеры: {{messengers}} Телефон: {{phone}} Почта: {{email}} "
         + "С уважением, {{full_name}}"
     )
@@ -204,7 +234,7 @@ async def test_auto_one_line_default_anchors_are_formatted_without_splitting_exa
 
     result = await _write(gateway, source)
 
-    assert "Здравствуйте!\n\n{{full_name}}, мой опыт соответствует задачам." in result
+    assert "Здравствуйте!\n\n{{full_name}}, мне интересны задачи." in result
     assert "\n- Мессенджеры: {{messengers}}\n- Телефон: {{phone}}\n- Почта: {{email}}" in result
     assert "\n\nС уважением, {{full_name}}" in result
     assert exact_span in result
@@ -220,7 +250,15 @@ async def test_auto_one_line_default_body_gets_paragraph_and_bullet_breaks() -> 
         "Мои контакты: Мессенджеры: {{messengers}} Телефон: {{phone}} Почта: {{email}} "
         "С уважением, {{full_name}}"
     )
-    result = await _write(RecordingGateway([], text, []), "Описание вакансии")
+    result = await _write(
+        RecordingGateway([], text, []),
+        "Описание вакансии",
+        resumes=[{
+            "achievement": "Я увеличил выручку проекта на 25%.",
+            "skills": ["Python", "SQL"],
+            "education": "Высшее образование, МГУ, аналитика.",
+        }],
+    )
 
     assert "Здравствуйте!\n\nЯ {{full_name}}, кратко обо мне:\n- Я увеличил выручку проекта на 25%." in result
     assert "\n- В работе использую Python и SQL." in result

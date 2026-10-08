@@ -12,8 +12,6 @@ import { validateVacancyFilters, type VacancyFilterRangeFields } from "./vacancy
 import { useSessionDraft } from "./useSessionDraft";
 import type {
   JobSession,
-  ResumeAiContext,
-  ResumeSnapshot,
   SessionHistoryPage,
   ScoreComponent,
   Vacancy,
@@ -34,7 +32,6 @@ import {
   resumeContactLabel,
   statusLabel,
   publicResumeSourceUrl,
-  safeResumeImportUrl,
   safeResumeUrlLabel,
   resumeCompletionStatus,
   safeCompletionErrorMessage,
@@ -79,6 +76,13 @@ function evaluationRows(evaluation: Vacancy["evaluation"]): ScoreComponent[] {
 }
 
 function detailedVacancy(base: Vacancy, detail: Vacancy): Vacancy {
+  const analysisStatus = detail.analysis_status ?? base.analysis_status;
+  const historyContext = detail.history_context ?? base.history_context;
+  // A history mirror has no current evaluation. Do not allow a stale score in
+  // either endpoint to become its current score during detail merging.
+  if (analysisStatus === "not_evaluated_history") {
+    return { ...base, ...detail, analysis_status: analysisStatus, history_context: historyContext, evaluation: null };
+  }
   const evaluation = detail.evaluation;
   const directScore = typeof detail.score === "number" ? detail.score : undefined;
   const directDecision = typeof detail.decision === "string" ? detail.decision : undefined;
@@ -86,11 +90,13 @@ function detailedVacancy(base: Vacancy, detail: Vacancy): Vacancy {
   const directCategory = typeof detail.category === "string" ? detail.category : undefined;
   const directReason = typeof detail.reason === "string" ? detail.reason : undefined;
   const directBreakdown = detail.score_breakdown ?? undefined;
-  if (!evaluation && directScore === undefined && directDecision === undefined && directConfidence === undefined && directCategory === undefined && directReason === undefined && directBreakdown === undefined) return { ...base, ...detail };
+  if (!evaluation && directScore === undefined && directDecision === undefined && directConfidence === undefined && directCategory === undefined && directReason === undefined && directBreakdown === undefined) return { ...base, ...detail, analysis_status: analysisStatus, history_context: historyContext };
   const fallback = base.evaluation;
   return {
     ...base,
     ...detail,
+    analysis_status: analysisStatus,
+    history_context: historyContext,
     evaluation: {
       ...evaluation,
       decision: directDecision ?? evaluation?.decision ?? fallback?.decision ?? "",
@@ -134,6 +140,7 @@ const STATUS_META: Record<string, { label: string; tone: string }> = {
   CREATED: { label: "Создана", tone: "warning" }, PREPARING: { label: "Подготовка", tone: "warning" }, RUNNING: { label: "В работе", tone: "warning" }, STOPPING: { label: "Остановка", tone: "warning" }, PROCESSING: { label: "В процессе", tone: "warning" }, LOADING: { label: "Проверяем", tone: "warning" }, PENDING: { label: "Ожидание генерации", tone: "warning" },
   PAUSED: { label: "Приостановлена", tone: "info" }, STOPPED: { label: "Остановлена", tone: "info" },
   COMPLETED: { label: "Завершена", tone: "success" }, SUCCESS: { label: "Успех", tone: "success" }, CONNECTED: { label: "Соединение есть", tone: "success" }, AVAILABLE: { label: "Модель доступна", tone: "success" }, HEALTHY: { label: "Генерация работает", tone: "success" },
+  PARTIAL: { label: "Резюме отправлено, письмо не завершено", tone: "warning" },
   FAILED: { label: "Ошибка", tone: "danger" }, REJECTED: { label: "Отклонена", tone: "danger" }, ERROR: { label: "Ошибка", tone: "danger" }, DISCONNECTED: { label: "Нет соединения", tone: "danger" }, UNAVAILABLE: { label: "Модель недоступна", tone: "danger" }, UNHEALTHY: { label: "Ошибка генерации", tone: "danger" }, STATUS_ERROR: { label: "Статус недоступен", tone: "danger" },
   UNKNOWN: { label: "Ещё не проверено", tone: "neutral" },
   CANCELLED: { label: "Отменена", tone: "neutral" },
@@ -279,7 +286,7 @@ function pausedSessionMessage(reason: string | null | undefined) {
   return "Сессия приостановлена. Проверьте CAPTCHA или авторизацию в открытом браузере, затем нажмите «Продолжить».";
 }
 const VACANCY_STATUS_OPTIONS = [
-  { value: "SUCCESS", label: "Успех" }, { value: "PROCESSING", label: "В процессе" }, { value: "REJECTED", label: "Отклонена" }, { value: "ERROR", label: "Ошибка" },
+  { value: "SUCCESS", label: "Успех" }, { value: "PARTIAL", label: "Резюме отправлено, письмо не завершено" }, { value: "PROCESSING", label: "В процессе" }, { value: "REJECTED", label: "Отклонена" }, { value: "ERROR", label: "Ошибка" },
 ] as const;
 const VACANCY_STATUS_OPTIONS_WITH_CANCELLED = [...VACANCY_STATUS_OPTIONS, { value: "CANCELLED", label: "\u041e\u0442\u043c\u0435\u043d\u0435\u043d\u0430" }] as const;
 function vacancyStatusGroup(vacancy: Vacancy): VacancyStatusGroup {
@@ -287,6 +294,7 @@ function vacancyStatusGroup(vacancy: Vacancy): VacancyStatusGroup {
   const legacyStatusGroup = (vacancy as { status_group?: unknown }).status_group;
   if (vacancy.error_code === "SUBMISSION_UNCONFIRMED" || dataErrorCode === "SUBMISSION_UNCONFIRMED" || vacancy.state === "SUBMISSION_UNCONFIRMED" || vacancy.state === "UNCONFIRMED" || legacyStatusGroup === "UNCONFIRMED") return "ERROR";
   if (vacancy.state === "CANCELLED" || vacancy.status_group === "CANCELLED") return "CANCELLED";
+  if (vacancy.state === "PARTIAL" || vacancy.status_group === "PARTIAL") return "PARTIAL";
   if (vacancy.status_group === "SUCCESS" || vacancy.status_group === "PROCESSING" || vacancy.status_group === "REJECTED" || vacancy.status_group === "ERROR") {
     return vacancy.status_group;
   }
@@ -295,17 +303,51 @@ function vacancyStatusGroup(vacancy: Vacancy): VacancyStatusGroup {
   if (vacancy.state === "ERROR") return "ERROR";
   return "PROCESSING";
 }
+function isUnconfirmedSubmission(vacancy: Vacancy) {
+  const dataErrorCode = typeof vacancy.data?.error_code === "string" ? vacancy.data.error_code : undefined;
+  const legacyStatusGroup = (vacancy as { status_group?: unknown }).status_group;
+  return vacancy.error_code === "SUBMISSION_UNCONFIRMED" || dataErrorCode === "SUBMISSION_UNCONFIRMED" || vacancy.state === "SUBMISSION_UNCONFIRMED" || vacancy.state === "UNCONFIRMED" || legacyStatusGroup === "UNCONFIRMED";
+}
+function isHistoricalNoEvaluation(vacancy: Vacancy) {
+  return vacancy.analysis_status === "not_evaluated_history";
+}
+function historyNoEvaluationMessage(vacancy: Vacancy) {
+  const context = vacancy.history_context;
+  let message: string;
+  switch (context?.outcome) {
+    case "unconfirmed":
+      message = "Предыдущую отправку не удалось подтвердить. Повторно отклик автоматически не отправлялся; сверьте результат на площадке, чтобы согласовать историю. Это не ошибка оценки модели.";
+      break;
+    case "partial":
+      message = "Новая оценка не выполнялась: предыдущая обработка завершилась частично, поэтому повторный отклик не запускался. Это не ошибка оценки модели.";
+      break;
+    case "already_applied":
+      message = "Новая оценка не выполнялась: на эту вакансию уже откликались, поэтому повторный отклик не отправлялся. Это не ошибка оценки модели.";
+      break;
+    default:
+      message = "Новая оценка не выполнялась: предыдущий отклик уже учтён, поэтому повторная отправка не запускалась. Это не ошибка оценки модели.";
+  }
+  const references = [
+    context?.source_vacancy_id != null ? `предыдущая вакансия #${context.source_vacancy_id}` : "",
+    context?.source_session_id != null ? `сессия #${context.source_session_id}` : "",
+  ].filter(Boolean);
+  return references.length ? `${message} Источник: ${references.join(", ")}.` : message;
+}
 function vacancyOutcome(vacancy: Vacancy) {
   if (vacancyStatusGroup(vacancy) === "CANCELLED") return "Обработка вакансии отменена до завершения.";
   if (vacancy.state === "SUBMITTED") return "Отклик действительно отправлен после положительной оценки вакансии.";
   if (vacancy.state === "ALREADY_APPLIED") return "Новый отклик не отправлялся: вы уже откликались на эту вакансию.";
+  if (isUnconfirmedSubmission(vacancy)) return "Результат прошлой отправки не подтверждён. Новый отклик автоматически не отправлялся; проверьте вакансию на площадке и согласуйте результат с историей.";
   if (vacancy.state === "REPORTED") return "Вакансия добавлена в отчёт, внешний отклик не отправлялся.";
+  if (vacancyStatusGroup(vacancy) === "PARTIAL") return "Резюме отправлено, письмо не завершено.";
   if (vacancyStatusGroup(vacancy) === "REJECTED") return "Модель отклонила вакансию из-за недостаточной релевантности, поэтому отклик не отправлен.";
   if (vacancyStatusGroup(vacancy) === "ERROR") return "Результат обработки вакансии не подтверждён.";
   return "Обработка вакансии ещё идёт.";
 }
 function vacancyStatusLabel(vacancy: Vacancy): string | undefined {
   const site = (vacancy.site || vacancy.source || "").toLowerCase();
+  if (vacancy.state === "ALREADY_APPLIED") return "Уже откликались";
+  if (isUnconfirmedSubmission(vacancy)) return "Отправка не подтверждена";
   if (vacancy.state === "REPORTED" && (site === "hirehi" || site === "hirehi.ru")) return "\u0412 \u043e\u0442\u0447\u0451\u0442\u0435";
   if (vacancy.state === "SUBMITTED" && site && !site.includes("hirehi")) return "\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e";
   return undefined;
@@ -1035,15 +1077,7 @@ function createIntentKey(): string {
   return `session-create-${randomUuid}`;
 }
 
-const CREATED_SESSION_STORAGE_KEY = "job-orchestrator.last-created-session";
 const SEEN_FAILURES_STORAGE_KEY = "job-orchestrator.seen-session-failures";
-
-function storedCreatedSessionId(): number | null {
-  try {
-    const value = Number(localStorage.getItem(CREATED_SESSION_STORAGE_KEY));
-    return Number.isSafeInteger(value) && value > 0 ? value : null;
-  } catch { return null; }
-}
 
 function storedSeenFailureIds(): number[] {
   try {
@@ -1057,22 +1091,6 @@ function sessionFailureReason(session: JobSession): string {
   const reason = [details.failure_reason, details.error_message, session.stop_reason]
     .find((value): value is string => typeof value === "string" && Boolean(value.trim()));
   return sessionReasonText(reason?.trim()) || "Причина сбоя не указана.";
-}
-
-function lifecycleNotice(session: JobSession): { tone: "neutral" | "info" | "success" | "warning" | "danger"; text: string } {
-  const prefix = `Сессия #${session.id}`;
-  switch (session.status) {
-    case "CREATED": return { tone: "warning", text: `${prefix} создана и ожидает запуска.` };
-    case "PREPARING": return { tone: "warning", text: `${prefix} готовится к запуску.` };
-    case "RUNNING": return { tone: "warning", text: `${prefix} запущена.` };
-    case "PAUSED": return { tone: "info", text: `${prefix} приостановлена. ${pausedSessionMessage(session.stop_reason)}` };
-    case "STOPPING": return { tone: "warning", text: `${prefix}: остановка запрошена, ожидаем завершения.` };
-    case "STOPPED": return { tone: "info", text: `${prefix} остановлена.` };
-    case "COMPLETED": return { tone: "success", text: `${prefix} завершена.` };
-    case "CANCELLED": return { tone: "neutral", text: `${prefix} отменена.` };
-    case "FAILED": return { tone: "danger", text: `${prefix} завершилась с ошибкой: ${sessionFailureReason(session)}` };
-    default: return { tone: statusTone(session.status) as "neutral" | "info" | "success" | "warning" | "danger", text: `${prefix}: состояние ${humanStatus(session.status)}.` };
-  }
 }
 
 function SessionPage() {
@@ -1112,8 +1130,6 @@ function SessionPage() {
   const idempotencyKeyRef = useRef<string | null>(null);
   const createInFlightRef = useRef(false);
   const [pendingActions, setPendingActions] = useState<Record<string, boolean>>({});
-  const [createdSessionId, setCreatedSessionId] = useState<number | null>(() => storedCreatedSessionId());
-  const [createdSessionSnapshot, setCreatedSessionSnapshot] = useState<JobSession | null>(null);
   const [seenFailureIds, setSeenFailureIds] = useState<number[]>(() => storedSeenFailureIds());
   const [historyOpen, setHistoryOpen] = useState(false);
   const terminalSessionSignature = useRef("");
@@ -1177,9 +1193,6 @@ function SessionPage() {
     // response without creating a second session.
     retry: 1,
     onSuccess: (session) => {
-      setCreatedSessionId(session.id);
-      setCreatedSessionSnapshot(session);
-      try { localStorage.setItem(CREATED_SESSION_STORAGE_KEY, String(session.id)); } catch { /* storage can be unavailable */ }
       setMessage("");
       toast.success(`Сессия #${session.id} принята`);
       idempotencyKeyRef.current = null;
@@ -1257,8 +1270,6 @@ function SessionPage() {
     const current = allKnownSessions.get(session.id);
     if (!current || !TERMINAL_SESSION_STATUSES.includes(current.status)) allKnownSessions.set(session.id, session);
   });
-  const createdSession = createdSessionId === null ? null : allKnownSessions.get(createdSessionId) ?? (createdSessionSnapshot?.id === createdSessionId ? createdSessionSnapshot : null);
-  const createdLifecycle = createdSession ? lifecycleNotice(createdSession) : null;
   const latestTerminalByAdapter = new Map<string, JobSession>();
   [...allKnownSessions.values()].filter((session) => TERMINAL_SESSION_STATUSES.includes(session.status)).forEach((session) => {
     const previous = latestTerminalByAdapter.get(session.adapter_id);
@@ -1386,7 +1397,6 @@ function SessionPage() {
           {resumeDataBlocked && <Notice tone="info">Обновите данные резюме во вкладке <NavLink to="/profile">Профиль</NavLink>.</Notice>}
           {missingGenderPreference && <Notice tone="info">Укажите род для сопроводительных писем в <NavLink to="/profile">профиле</NavLink>.</Notice>}
         </article>
-      {createdLifecycle && createdSession?.status !== "FAILED" && <Notice tone={createdLifecycle.tone} role={createdLifecycle.tone === "danger" ? "alert" : "status"}>{createdLifecycle.text}</Notice>}
       {visibleFailures.map((failure) => <Notice key={failure.id} tone="danger" role="alert">
         <span><strong>Сессия #{failure.id} завершилась с ошибкой на площадке {resumeSite(failure.adapter_id).label}.</strong> {sessionFailureReason(failure)}</span>
         <span className="session-failure-actions">
@@ -1411,46 +1421,6 @@ function SessionPage() {
       </details> : null}
     </section>
   );
-}
-
-function ResumeDetails({ session }: { session: JobSession }) {
-  const [open, setOpen] = useState(false);
-  const [aiOpen, setAiOpen] = useState(false);
-  const snapshot = useQuery({
-    queryKey: ["session-resume", session.id],
-    queryFn: () => api<ResumeSnapshot>(`/sessions/${session.id}/resume`, { cache: "no-store" }),
-    enabled: open,
-    staleTime: 0,
-    retry: false,
-  });
-  const aiContext = useQuery({
-    queryKey: ["session-ai-context", session.id],
-    queryFn: () => api<ResumeAiContext>(`/sessions/${session.id}/ai-context`, { cache: "no-store" }),
-    enabled: aiOpen,
-    staleTime: 0,
-    retry: false,
-  });
-  const data = snapshot.data;
-  const nestedResume = data?.resume && typeof data.resume === "object" ? data.resume as Record<string, unknown> : data?.snapshot && typeof data.snapshot === "object" ? data.snapshot : {};
-  const sectionsValue = data?.sections ?? nestedResume.sections;
-  const sections = Array.isArray(sectionsValue) ? sectionsValue as Array<Record<string, unknown> | string> : [];
-  const contactsValue = data?.contacts ?? nestedResume.contacts;
-  const contacts = contactsValue && typeof contactsValue === "object" ? Object.entries(contactsValue) : [];
-  const importUrl = safeResumeImportUrl(typeof data?.import_url === "string" ? data.import_url : typeof nestedResume.import_url === "string" ? nestedResume.import_url : null, session.adapter_id);
-  const coverage = data?.coverage ?? nestedResume.coverage;
-  return <div className="session-resume-details">
-    <button type="button" className="secondary" aria-expanded={open} onClick={() => setOpen((value) => !value)}>{open ? "Скрыть резюме" : "Показать резюме и полноту"}</button>
-    {open && <div className="session-resume-panel">
-      {snapshot.isLoading ? <p role="status">Загружаем снимок резюме…</p> : snapshot.error ? <p className="vacancy-error-message" role="alert">Не удалось загрузить резюме сессии.</p> : data ? <>
-        <div className="resume-source-block"><h3>Разделы</h3>{sections.length ? <ul className="resume-source-list">{sections.map((section, index) => <li key={index}><span>{typeof section === "string" ? section : String(section.title ?? section.label ?? section.key ?? "Раздел")}</span><small>{typeof section === "string" ? "Найдено" : String(section.status ?? "Найдено")}</small></li>)}</ul> : <p className="empty-score">Разделы не переданы.</p>}</div>
-        <div className="resume-source-block"><h3>Контакты</h3>{contacts.length ? <ul className="resume-source-list">{contacts.map(([key, value]) => <li key={key}><span>{key}</span><small>{typeof value === "string" ? value : JSON.stringify(value)}</small></li>)}</ul> : <p className="empty-score">Контакты не переданы.</p>}</div>
-        {coverage && <div className="resume-source-block"><h3>Полнота</h3><pre className="resume-json">{JSON.stringify(coverage, null, 2)}</pre></div>}
-        {importUrl && <a className="button-link secondary" href={importUrl} target="_blank" rel="noreferrer">Печатный HTML</a>}
-        <button type="button" className="secondary" aria-expanded={aiOpen} onClick={() => setAiOpen((value) => !value)}>{aiOpen ? "Скрыть контекст ИИ" : "Показать контекст ИИ"}</button>
-        {aiOpen && (aiContext.isLoading ? <p role="status">Загружаем контекст…</p> : aiContext.error ? <p className="vacancy-error-message" role="alert">Не удалось загрузить контекст ИИ.</p> : <pre className="resume-json">{JSON.stringify(aiContext.data?.resume_context ?? aiContext.data?.context ?? aiContext.data, null, 2)}</pre>)}
-      </> : null}
-    </div>}
-  </div>;
 }
 
 function HireHiReport({ session }: { session: JobSession }) {
@@ -1490,7 +1460,7 @@ function SessionCard({ session, formatSessionLimit, action, pendingAction }: { s
                   : sessionReasonText(session.stop_reason) || "Обработка вакансий идёт последовательно"}
               </p>
               <p className="session-limits-summary">
-                Лимит сессии: {session.adapter_id === "hirehi" ? "выбрано" : "отправка"} — {formatSessionLimit(session.application_limit)}.
+                Лимит сессии: {session.adapter_id === "hirehi" ? "выбрано" : "принятые резюме, включая частичные"} — {formatSessionLimit(session.application_limit)}.
               </p>
             </div>
             <div className="actions session-actions">
@@ -1519,14 +1489,14 @@ function SessionCard({ session, formatSessionLimit, action, pendingAction }: { s
                 </>
               )}
             </div>
-            {terminal && <ResumeDetails session={session} />}
             {terminal && <HireHiReport session={session} />}
           </article>
-          <div className="stats compact">
+          <div className={`stats compact ${session.adapter_id === "hirehi" ? "session-stats-four" : "session-stats-five"}`}>
             {[
               ["Просмотрено", "viewed"],
               ["Отфильтровано", "filtered"],
               [session.adapter_id === "hirehi" ? "В отчёте" : "Отправлено", session.adapter_id === "hirehi" ? "reported" : "submitted"],
+              ...(session.adapter_id === "hirehi" ? [] : [["Резюме отправлено, письмо не завершено", "partial"]]),
               ["Ошибка", "errors"],
             ].map(([label, key]) => (
               <article key={key}>
@@ -1545,6 +1515,7 @@ function formatStatusDate(value: string) {
 function VacancyCard({ v: rawVacancy }: { v: Vacancy }) {
   const [open, setOpen] = useState(false);
   const normalizedVacancy = detailedVacancy(rawVacancy, rawVacancy);
+  const listHistoricalNoEvaluation = isHistoricalNoEvaluation(normalizedVacancy);
   const hasFullEvaluation = Boolean(normalizedVacancy.evaluation && (Array.isArray(normalizedVacancy.evaluation.score_breakdown) || normalizedVacancy.evaluation.reason));
   const legacySubmissionUnconfirmed = vacancyStatusGroup(normalizedVacancy) === "ERROR" && vacancyErrorCode(normalizedVacancy) === "SUBMISSION_UNCONFIRMED";
   const detail = useQuery({
@@ -1552,12 +1523,13 @@ function VacancyCard({ v: rawVacancy }: { v: Vacancy }) {
     queryFn: () => api<Vacancy>(`/vacancies/${rawVacancy.id}`),
     // The list payload already contains the contractual legacy error. Keep
     // it visible while expanding instead of showing a lazy-detail spinner.
-    enabled: open && !hasFullEvaluation && !legacySubmissionUnconfirmed,
+    enabled: open && !hasFullEvaluation && !legacySubmissionUnconfirmed && !listHistoricalNoEvaluation,
     staleTime: 60_000,
     retry: false,
   });
   const fetchedDetail = detail.data && !Array.isArray(detail.data) ? detail.data : undefined;
   const displayed = fetchedDetail ? detailedVacancy(normalizedVacancy, fetchedDetail) : normalizedVacancy;
+  const historicalNoEvaluation = isHistoricalNoEvaluation(displayed);
   const evaluation = displayed.evaluation;
   const breakdown = evaluationRows(evaluation);
   const v = { ...displayed, evaluation: evaluation as NonNullable<Vacancy["evaluation"]> };
@@ -1566,19 +1538,28 @@ function VacancyCard({ v: rawVacancy }: { v: Vacancy }) {
   return <details className="panel vacancy-score vacancy-disclosure" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
     <summary aria-expanded={open} aria-controls={`vacancy-details-${v.id}`}>
       <span className="vacancy-main"><b>{v.title}</b><small>#{v.id} · {v.company || "Компания не указана"}{v.site ? ` · ${v.site}` : ""}</small></span>
-      <span className="score-total"><strong>{v.evaluation?.score ?? "—"}</strong><small>/ 100</small></span>
+      <span className="score-total"><strong>{historicalNoEvaluation ? "—" : v.evaluation?.score ?? "—"}</strong><small>{historicalNoEvaluation ? "Не оценивалась" : "/ 100"}</small></span>
       <span><Status value={statusGroup} label={vacancyStatusLabel(v)} />{v.status_changed_at && <small className="vacancy-status-date">{formatStatusDate(v.status_changed_at)}</small>}</span>
       <span className="vacancy-disclosure-control"><span className="sr-only">{open ? "Скрыть подробности вакансии" : "Показать подробности вакансии"}</span><ChevronIcon className="vacancy-chevron" /></span>
     </summary>
-    {detail.isLoading && !legacySubmissionUnconfirmed && statusGroup !== "ERROR" ? <p className="empty-score" role="status">Загрузка подробностей…</p> : detail.error && statusGroup !== "ERROR" ? <p className="vacancy-error-message" role="alert">Не удалось загрузить подробности вакансии.</p> : (hasFullEvaluation || detail.data) && evaluation ? <div className="score-details" id={`vacancy-details-${v.id}`}>
+    {historicalNoEvaluation ? <div className="score-details" id={`vacancy-details-${v.id}`}>
+      <div className="resume-score-heading"><span className="eyebrow">КРАТКОЕ РЕЗЮМЕ</span><small>Оценка не выполнялась</small></div>
+      <p className="vacancy-history-explanation">{historyNoEvaluationMessage(v)}</p>
+      {isUnconfirmedSubmission(v) && <p className="vacancy-error-code">Код ошибки: {vacancyErrorCode(v)}</p>}
+      <a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a>
+    </div> : detail.isLoading && !legacySubmissionUnconfirmed && statusGroup !== "ERROR" ? <p className="empty-score" role="status">Загрузка подробностей…</p> : detail.error && statusGroup !== "ERROR" ? <p className="vacancy-error-message" role="alert">Не удалось загрузить подробности вакансии.</p> : (hasFullEvaluation || detail.data) && evaluation ? <div className="score-details" id={`vacancy-details-${v.id}`}>
       <div className="resume-score-heading"><span className="eyebrow">КРАТКОЕ РЕЗЮМЕ</span></div>
       <p>{humanModelSummary(evaluation.reason || "", statusGroup, breakdown)}</p>
       {statusGroup === "ERROR" ? <><p className="vacancy-error-message">{errorMessage}</p><p className="vacancy-error-code">Код ошибки: {vacancyErrorCode(v)}</p></> : <p>{vacancyOutcome(v)}</p>}
       <div className="resume-score-heading"><span className="eyebrow">ПО КРИТЕРИЯМ</span></div>
       {presentationBreakdown(v.evaluation.score_breakdown ?? []).map((row) => <div className="score-row" key={row.key}><div><b>{row.title}</b><span>{row.max_points > 0 ? `${row.points} / ${row.max_points}` : "не применяется"}</span></div>{row.max_points > 0 && <div className="scorebar" role="progressbar" aria-label={`Релевантность: ${row.title}`} aria-valuenow={row.points} aria-valuemin={0} aria-valuemax={row.max_points}><i style={{ width: `${Math.min(100, Math.max(0, (row.points / row.max_points) * 100))}%` }} /></div>}<small>{humanCriterionExplanation(row.explanation)}</small></div>)}
       <a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a>
-    </div> : statusGroup === "ERROR"
+    </div> : statusGroup === "PARTIAL"
+      ? <div className="score-details" id={`vacancy-details-${v.id}`}><p>{vacancyOutcome(v)}</p><a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a></div>
+      : statusGroup === "ERROR"
       ? <div className="score-details" id={`vacancy-details-${v.id}`}><div className="resume-score-heading"><span className="eyebrow">КРАТКОЕ РЕЗЮМЕ</span><small>Что произошло с вакансией</small></div><p className="vacancy-error-message">{errorMessage}</p><p className="vacancy-error-code">Код ошибки: {vacancyErrorCode(v)}</p><a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a></div>
+      : statusGroup === "CANCELLED"
+      ? <div className="score-details" id={`vacancy-details-${v.id}`}><p>{vacancyOutcome(v)}</p><a href={v.url} target="_blank" rel="noreferrer">Открыть вакансию на площадке</a></div>
       : <p className="empty-score">Оценка ещё не завершена.</p>}
   </details>;
 }

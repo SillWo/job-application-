@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from sqlalchemy import select
 from test_workflow_non_captcha_continuation import FakeAdapter, run_workflow
 from test_workflow_non_captcha_continuation import runtime as metric_runtime
 
@@ -12,7 +13,7 @@ runtime = metric_runtime
 
 
 @pytest.mark.asyncio
-async def test_overlap_is_unjudged_and_report_survives_version_switch(runtime, monkeypatch):
+async def test_historical_overlap_is_rejudged_and_report_survives_version_switch(runtime, monkeypatch):
     factory, ident = runtime
     with factory() as db:
         db.add(Vacancy(source="fake", external_id="old", url="https://fake/old", title="Old", state="REJECTED_BY_MODEL"))
@@ -25,14 +26,15 @@ async def test_overlap_is_unjudged_and_report_survives_version_switch(runtime, m
         assert report["raw_discoveries"] == 3
         assert report["unique_discovered"] == 2
         assert report["duplicate_discoveries"] == 1
-        assert report["historical_overlap"] == report["unjudged"] == 1
-        assert report["judged"] == 1
+        assert report["historical_overlap"] == 1
+        assert report["unjudged"] == 0
+        assert report["judged"] == 2
         assert report["relevant"] == 0
         identity = report["identity"]
         monkeypatch.setattr(metrics, "HH_SEARCH_VERSION", "changed")
         metrics.initialize(db, item, {}, [])
         assert item.recovery["measurement_identity"] == identity
-        assert report["stages"]["browser.extract_job"]["calls"] == 1
+        assert report["stages"]["browser.extract_job"]["calls"] == 2
 
 
 def test_relevance_counts_before_application_and_duplicates_do_not_inflate(runtime):
@@ -55,6 +57,28 @@ def test_relevance_counts_before_application_and_duplicates_do_not_inflate(runti
         assert report["relevant_per_judged"] == 1 / 2
         assert report["sources"]["rec"]["relevant"] == 1
         assert report["applications"]["submitted"] == 0
+
+
+def test_overlap_measurements_flush_as_one_unique_batch_with_raw_count(runtime):
+    factory, ident = runtime
+    token = metrics.begin()
+    try:
+        metrics.record("overlap", {"external_id": "a"})
+        metrics.record("overlap", {"ids": ["a", "b"], "raw_count": 2})
+        with factory() as db:
+            assert metrics.flush(db, ident)
+            db.commit()
+            events = db.scalars(select(BrowserEvent).where(
+                BrowserEvent.session_id == ident,
+                BrowserEvent.event_type == "metric_overlap",
+            )).all()
+            assert len(events) == 1
+            assert events[0].data == {"ids": ["a", "b"], "raw_count": 3}
+            report = metrics.summary(db, db.get(JobSession, ident))
+            assert report["historical_overlap"] == 2
+            assert report["historical_overlap_raw"] == 3
+    finally:
+        metrics.end(token)
 
 
 def test_model_event_summary_aggregates_durations_repairs_and_recovery_without_ids(runtime):

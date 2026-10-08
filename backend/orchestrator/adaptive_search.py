@@ -38,7 +38,8 @@ class AdaptiveSearch:
         return getattr(self.adapter, name)
 
     def add(self, spec):
-        self.adapter.validate_search_source(spec)
+        validated_url = self.adapter.validate_search_source(spec)
+        spec = {**spec, "url": validated_url or spec["url"]}
         parsed = urlparse(spec["url"])
         params = {k: v for k, v in parse_qsl(parsed.query)
                   if k not in {"page", "hhtmFrom", "hhtmFromLabel", "from", "source"}}
@@ -213,7 +214,7 @@ class AdaptiveSearch:
         self.activity += 1
 
     async def expand(self):
-        if not self.gateway or self.activity < self.next_expansion or not self.examples:
+        if not self.gateway or self.activity < self.next_expansion:
             return
         self.next_expansion = self.activity + 50
         known = [dict(parse_qsl(urlparse(s.spec["url"]).query)).get("text", "")

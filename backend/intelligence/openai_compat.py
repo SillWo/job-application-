@@ -5,6 +5,10 @@ import json
 from openai import APIStatusError
 
 
+class UnsupportedProviderCapability(RuntimeError):
+    """A provider rejected every supported structured-output negotiation."""
+
+
 async def create_completion(client, **kwargs):
     """Negotiate only explicitly rejected options; callers still validate JSON locally."""
     request = dict(kwargs)
@@ -45,4 +49,4 @@ async def create_completion(client, **kwargs):
                     raise
             else:
                 raise
-    raise RuntimeError("Не удалось согласовать параметры OpenAI API")
+    raise UnsupportedProviderCapability("Provider rejected supported request options")

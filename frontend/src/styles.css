@@ -734,6 +734,9 @@ button:disabled {
 .compact {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
+.compact.session-stats-five {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
 .compact article {
   padding: 16px;
 }
@@ -1010,9 +1013,6 @@ button:disabled {
 .resume-source-address { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-control); background: color-mix(in srgb, var(--paper) 75%, var(--canvas)); }
 .resume-source-address span { color: var(--muted); font-size: 12px; }
 .resume-source-address code { overflow-wrap: anywhere; color: var(--ink-soft, var(--ink)); font-family: inherit; font-size: 13px; }
-.resume-source-block { display: grid; gap: 8px; }
-.resume-source-block h3 { margin: 0; font-size: 13px; }
-.resume-source-block p { margin: 0; color: var(--ink-soft, var(--muted)); font-size: 13px; line-height: 1.5; }
 .resume-source-list { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
 .resume-source-list li { display: flex; justify-content: space-between; gap: 10px; padding-bottom: 7px; border-bottom: 1px solid var(--line); font-size: 13px; }
 .resume-source-list small { color: var(--muted); text-align: right; }
@@ -1047,10 +1047,6 @@ button:disabled {
 .session-resume-address { overflow-wrap: anywhere; color: var(--muted); font-family: inherit; font-size: 12px; font-weight: 400; }
 .session-resume-requirement.is-ready { border-color: var(--status-success-border); }
 .session-question { margin-top: 2px; }
-.session-resume-details { display: grid; gap: 10px; grid-column: 1 / -1; }
-.session-resume-panel { display: grid; gap: 14px; padding: 14px; border: 1px solid var(--line); border-radius: var(--radius-subcard); background: var(--surface); }
-.session-resume-panel h3 { margin: 0; font-size: 14px; }
-.resume-json { margin: 0; max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .session-history-head { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 12px; }
 .session-history-head strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; font-weight: 600; }
 @media (max-width: 600px) { .session-history-head strong { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; } }
@@ -1634,7 +1630,6 @@ button:not(:disabled):active, .button-link:active { transform: scale(.98); }
   .title p,
   .overview-copy > p,
   .panel p,
-  .resume-source-block p,
   .session-resume-requirement span,
   .notice {
     text-wrap: pretty;

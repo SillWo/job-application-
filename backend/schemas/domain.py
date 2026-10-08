@@ -322,6 +322,8 @@ class PreferenceFlag(BaseModel):
     id: str = Field(default="", max_length=80)
     text: str = Field(min_length=1, max_length=500)
     category: Literal["desired_industry", "desired_task", "desired_salary", "other"]
+    required: bool = False
+    source_quote: str | None = Field(default=None, max_length=1000)
 
 class SalaryPreference(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -330,6 +332,7 @@ class SalaryPreference(BaseModel):
 
 class DesiredJobPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    contract_version: int = 1
     green_flags: list[PreferenceFlag] = Field(default_factory=list)
     red_flags: list[PreferenceFlag] = Field(default_factory=list)
     desired_salary: SalaryPreference | None = None
@@ -352,10 +355,23 @@ class DesiredJobPolicy(BaseModel):
                     item_category = aliases.get(str(item.get("category")), "other") if isinstance(item, dict) and category is None else category or "other"
                     if isinstance(item, dict) and category is None and item.get("category") in aliases:
                         item_category = aliases[item["category"]]
-                    if isinstance(item, str): result.append({"id": "", "text": item, "category": item_category})
-                    elif isinstance(item, dict) and isinstance(item.get("text"), str): result.append({"id": str(item.get("id", "")), "text": item["text"], "category": item_category})
+                    if isinstance(item, str):
+                        result.append({"id": "", "text": item, "category": item_category})
+                    elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                        result.append({
+                            "id": str(item.get("id", "")),
+                            "text": item["text"],
+                            "category": item_category,
+                            "required": item.get("required", False),
+                            "source_quote": item.get("source_quote"),
+                        })
             return result[:100]
-        output = {"green_flags": flags(value.get("green_flags", [])), "red_flags": flags(value.get("red_flags", [])), "desired_salary": value.get("desired_salary")}
+        output = {
+            "contract_version": value.get("contract_version", 1),
+            "green_flags": flags(value.get("green_flags", [])),
+            "red_flags": flags(value.get("red_flags", [])),
+            "desired_salary": value.get("desired_salary"),
+        }
         salary = output["desired_salary"]
         if isinstance(salary, dict):
             amount = salary.get("minimum_monthly_amount", salary.get("minimum", salary.get("amount")))
@@ -369,6 +385,21 @@ class FlagMatch(BaseModel):
     confidence: float = Field(default=0, ge=0, le=1)
     evidence: list[str] = Field(default_factory=list)
     explanation: str = ""
+
+
+class RequiredFlagVerification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    flag_id: str = Field(min_length=1)
+    matched: bool
+    confidence: float = Field(ge=0, le=1)
+    evidence: list[str]
+    missing_conditions: list[str]
+    explanation: str
+
+
+class RequiredPreferenceVerification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    flags: list[RequiredFlagVerification]
 
 
 class ResumeAnalysis(BaseModel):
@@ -531,6 +562,7 @@ class VacancyState(StrEnum):
     REJECTED_BY_MODEL = "REJECTED_BY_MODEL"
     READY_TO_SUBMIT = "READY_TO_SUBMIT"
     SUBMITTING = "SUBMITTING"
+    PARTIAL = "PARTIAL"
     SUBMITTED = "SUBMITTED"
     ALREADY_APPLIED = "ALREADY_APPLIED"
     READY_TO_REPORT = "READY_TO_REPORT"

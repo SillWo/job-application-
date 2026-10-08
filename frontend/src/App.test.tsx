@@ -197,7 +197,7 @@ test('status filter shows all outcome groups and preserves group values', async 
   const labels = options.map((option) => option.textContent ?? '')
   expect(new Set(labels).size).toBe(labels.length)
   expect(labels.every((label) => !/[A-Za-z]/.test(label))).toBe(true)
-  expect(labels).toEqual(['Все', 'Успех', 'В процессе', 'Отклонена', 'Ошибка', 'Отменена'])
+  expect(labels).toEqual(['Все', 'Успех', 'Резюме отправлено, письмо не завершено', 'В процессе', 'Отклонена', 'Ошибка', 'Отменена'])
   expect(within(select).getByRole('option', { name: 'Отклонена' })).toHaveValue('REJECTED')
   expect(within(select).getByRole('option', { name: 'Успех' })).toHaveValue('SUCCESS')
   fireEvent.change(select, { target: { value: 'SUCCESS' } })
@@ -855,10 +855,10 @@ test('exposes every primary route through keyboard-accessible navigation', () =>
   expect(screen.queryByRole('link', { name: 'Отчёты' })).not.toBeInTheDocument()
 })
 
-test('session keeps the four session counters visible', async () => {
+test('session keeps submitted and partial CV counters separate', async () => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: [{ id: 9, adapter_id: 'hh', status: 'COMPLETED', counters: { viewed: 30, filtered: 12, submitted: 5, errors: 2, matched: 18, already_applied: 3 }, started_at: null, finished_at: null, stop_reason: null }], total: 1, limit: 10, offset: 0, has_more: false }) })
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: [{ id: 9, adapter_id: 'hh', status: 'COMPLETED', counters: { viewed: 30, filtered: 12, submitted: 5, partial: 2, errors: 2, matched: 18, already_applied: 3 }, application_limit: 7, started_at: null, finished_at: null, stop_reason: null }], total: 1, limit: 10, offset: 0, has_more: false }) })
     if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => [] })
     return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
   }))
@@ -866,8 +866,11 @@ test('session keeps the four session counters visible', async () => {
   const stats = await screen.findByText('Просмотрено')
   const container = stats.closest('.stats')
   expect(container).not.toBeNull()
-  expect(within(container as HTMLElement).getAllByRole('article')).toHaveLength(4)
-  for (const label of ['Просмотрено', 'Отфильтровано', 'Отправлено', 'Ошибка']) expect(within(container as HTMLElement).getByText(label)).toBeInTheDocument()
+  expect(within(container as HTMLElement).getAllByRole('article')).toHaveLength(5)
+  for (const label of ['Просмотрено', 'Отфильтровано', 'Отправлено', 'Резюме отправлено, письмо не завершено', 'Ошибка']) expect(within(container as HTMLElement).getByText(label)).toBeInTheDocument()
+  expect(within(container as HTMLElement).getByText('Отправлено').closest('article')).toHaveTextContent('5')
+  expect(within(container as HTMLElement).getByText('Резюме отправлено, письмо не завершено').closest('article')).toHaveTextContent('2')
+  expect(screen.getByText(/принятые резюме, включая частичные/)).toBeInTheDocument()
   for (const label of ['Релевантные', 'Релевантность', 'Не подтверждено']) expect(within(container as HTMLElement).queryByText(label)).not.toBeInTheDocument()
   for (const label of ['Уже откликались', 'Тестовые', 'Проверка', 'Совпадения', 'Ошибки']) expect(within(container as HTMLElement).queryByText(label)).not.toBeInTheDocument()
 })
@@ -889,6 +892,25 @@ test('groups terminal sessions behind a collapsed history block', async () => {
   for (const id of [4, 5, 6]) expect(screen.getByTestId(`session-${id}`)).not.toBeVisible()
   fireEvent.click(history)
   for (const id of [4, 5, 6]) expect(screen.getByTestId(`session-${id}`)).toBeVisible()
+})
+
+test('session cards never expose technical resume details or request them', async () => {
+  const sites = ['hh', 'hirehi', 'zarplata']
+  const activeSessions = sites.map((adapter_id, index) => ({ id: index + 1, adapter_id, status: 'RUNNING', counters: {} }))
+  const completedSessions = sites.map((adapter_id, index) => ({ id: index + 11, adapter_id, status: 'COMPLETED', counters: {} }))
+  const requests: string[] = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input); requests.push(url)
+    if (url.includes('/api/sessions/history')) return Promise.resolve({ ok: true, json: async () => ({ items: completedSessions, total: completedSessions.length, limit: 10, offset: 0, has_more: false }) })
+    if (url.endsWith('/api/sessions')) return Promise.resolve({ ok: true, json: async () => activeSessions })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
+  for (const session of [...activeSessions, ...completedSessions]) expect(await screen.findByTestId(`session-${session.id}`)).toBeInTheDocument()
+  fireEvent.click(await screen.findByText(`Завершённые сессии (${completedSessions.length})`))
+  expect(screen.queryByRole('button', { name: /Показать резюме и полноту|Показать контекст ИИ/ })).not.toBeInTheDocument()
+  for (const label of ['Разделы', 'Контакты', 'Полнота', 'Печатный HTML']) expect(screen.queryByText(label)).not.toBeInTheDocument()
+  expect(requests.some((url) => /\/api\/sessions\/\d+\/(resume|ai-context)(?:\?|$)/.test(url))).toBe(false)
 })
 
 test('does not show terminal history when there are no terminal sessions', async () => {
@@ -1094,12 +1116,12 @@ test.each(['COMPLETED', 'CANCELLED'])(
 )
 
 test.each([
-  ['RUNNING', 'запущена', 'warning'],
-  ['PAUSED', 'приостановлена', 'info'],
-  ['STOPPED', 'остановлена', 'info'],
-  ['COMPLETED', 'завершена', 'success'],
-  ['CANCELLED', 'отменена', 'neutral'],
-] as const)('reports a persisted %s session truthfully after reload', async (status, expected, tone) => {
+  'RUNNING',
+  'PAUSED',
+  'STOPPED',
+  'COMPLETED',
+  'CANCELLED',
+] as const)('shows persisted %s state in its session card without a duplicate lifecycle notice', async (status) => {
   localStorage.setItem('job-orchestrator.last-created-session', '74')
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
@@ -1108,8 +1130,9 @@ test.each([
     return Promise.resolve({ ok: true, json: async () => [] })
   }))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/session']}><App /></MemoryRouter></QueryClientProvider>)
-  const lifecycle = await screen.findByText((_, element) => element?.classList.contains('notice') === true && element.textContent?.startsWith(`Сессия #74 ${expected}`) === true)
-  expect(lifecycle).toHaveAttribute('data-tone', tone)
+  const card = await screen.findByTestId('session-74')
+  expect(card.querySelector(`[data-status="${status}"]`)).toBeInTheDocument()
+  expect(screen.queryByText((_, element) => element?.classList.contains('notice') === true && element.textContent?.startsWith(`Сессия #74`) === true)).not.toBeInTheDocument()
 })
 
 test.each([
@@ -1486,10 +1509,12 @@ test('renders vacancy groups, error messages, and accessible toggle controls', a
     : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
   const localizedStatus = await screen.findAllByText('Успех', { selector: '.status' })
-  expect(localizedStatus).toHaveLength(2)
+  expect(localizedStatus).toHaveLength(1)
   expect(localizedStatus[0]).toHaveClass('status-success')
-  expect(localizedStatus[1]).toHaveClass('status-success')
-  expect(localizedStatus.map((item) => item.getAttribute('data-status'))).toEqual(['SUCCESS', 'SUCCESS'])
+  expect(localizedStatus[0]).toHaveAttribute('data-status', 'SUCCESS')
+  const alreadyAppliedStatus = screen.getByText('Уже откликались', { selector: '.status' })
+  expect(alreadyAppliedStatus).toHaveClass('status-success')
+  expect(alreadyAppliedStatus).toHaveAttribute('data-status', 'SUCCESS')
   expect(screen.queryByText('Отклик уже был отправлен')).not.toBeInTheDocument()
   const summary = screen.getByText('Тестовая роль 501').closest('details')?.querySelector('summary') as HTMLElement
   expect(summary).toHaveAttribute('aria-expanded', 'false')
@@ -1523,6 +1548,116 @@ test('renders vacancy groups, error messages, and accessible toggle controls', a
   fireEvent.click(errorSummary)
   expect(await screen.findByText('Ошибка', { selector: '.status' })).toBeInTheDocument()
   expect(screen.getByText('Не удалось заполнить обязательное поле.')).toHaveClass('vacancy-error-message')
+})
+
+test('shows an unscored already-applied history mirror without carrying forward its old score', async () => {
+  const vacancy = {
+    id: 601, session_id: 18, title: 'Историческая вакансия', company: 'Компания', url: 'https://example.test/601',
+    state: 'ALREADY_APPLIED', status_group: 'SUCCESS' as const, analysis_status: 'not_evaluated_history' as const,
+    history_context: { source_vacancy_id: 41, source_session_id: 7, outcome: 'already_applied' as const, reason_code: 'PRIOR_OUTCOME_ALREADY_APPLIED' },
+    score: 91, data: {}, evaluation: { decision: 'apply', score: 91, confidence: 0.95, category: 'old', reason: 'Старый балл', score_breakdown: [] },
+  }
+  const requests: string[] = []
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input); requests.push(url)
+    return Promise.resolve({ ok: true, json: async () => url.includes('/api/vacancies') ? [vacancy] : { connected: true, model_available: true, model: 'test' } })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+
+  const status = await screen.findByText('Уже откликались', { selector: '.status' })
+  expect(status).toHaveAttribute('data-status', 'SUCCESS')
+  const card = screen.getByText('Историческая вакансия').closest('details') as HTMLElement
+  const summary = card.querySelector('summary') as HTMLElement
+  expect(within(summary).getByText('—')).toBeInTheDocument()
+  expect(within(summary).getByText('Не оценивалась')).toBeInTheDocument()
+  fireEvent.click(summary)
+  expect(await within(card).findByText(/Новая оценка не выполнялась/)).toHaveTextContent('уже откликались')
+  expect(within(card).getByText(/предыдущая вакансия #41, сессия #7/)).toBeInTheDocument()
+  expect(within(card).queryByText('Старый балл')).not.toBeInTheDocument()
+  expect(within(card).queryByText('91')).not.toBeInTheDocument()
+  expect(requests.some((url) => /\/api\/vacancies\/601(?:\?|$)/.test(url))).toBe(false)
+})
+
+test('labels an uncertain historic submission as an error and asks to reconcile it', async () => {
+  const vacancy = {
+    id: 602, session_id: 19, title: 'Отклик с неизвестным результатом', company: 'Компания', url: 'https://example.test/602',
+    state: 'SUBMISSION_UNCONFIRMED', status_group: 'ERROR' as const, error_code: 'SUBMISSION_UNCONFIRMED',
+    analysis_status: 'not_evaluated_history' as const,
+    history_context: { source_vacancy_id: 42, source_session_id: 8, outcome: 'unconfirmed' as const, reason_code: 'PRIOR_OUTCOME_UNCONFIRMED' },
+    data: {}, evaluation: null,
+  }
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/api/vacancies')
+    ? Promise.resolve({ ok: true, json: async () => [vacancy] })
+    : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+
+  const status = await screen.findByText('Отправка не подтверждена', { selector: '.status' })
+  expect(status).toHaveAttribute('data-status', 'ERROR')
+  expect(status).toHaveClass('status-danger')
+  const card = screen.getByText('Отклик с неизвестным результатом').closest('details') as HTMLElement
+  fireEvent.click(card.querySelector('summary') as HTMLElement)
+  expect(await within(card).findByText(/Предыдущую отправку не удалось подтвердить/)).toHaveTextContent('Повторно отклик автоматически не отправлялся')
+  expect(within(card).getByText(/сверьте результат на площадке/)).toBeInTheDocument()
+  expect(within(card).getByText(/сессия #8/)).toBeInTheDocument()
+  expect(within(card).queryByText('Ошибка оценки модели')).not.toBeInTheDocument()
+  expect(within(card).getByText('Код ошибки: SUBMISSION_UNCONFIRMED')).toBeInTheDocument()
+})
+
+test('detail response cannot erase history context or restore a current score', async () => {
+  const detailPayload = {
+    id: 603, session_id: 20, title: 'Деталь исторической вакансии', company: 'Компания', url: 'https://example.test/603',
+    state: 'ALREADY_APPLIED', analysis_status: 'not_evaluated_history' as const,
+    history_context: { source_vacancy_id: 43, source_session_id: 9, outcome: 'confirmed' as const, reason_code: 'PRIOR_CONFIRMED' },
+    score: 88, evaluation: { decision: 'apply', score: 88, confidence: 0.9, category: 'old', reason: 'Старый балл', score_breakdown: [] }, data: {},
+  }
+  let resolveDetail: ((value: { ok: boolean; json: () => Promise<unknown> }) => void) | undefined
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/vacancies')) return Promise.resolve({ ok: true, json: async () => [{ ...detailPayload, analysis_status: undefined, history_context: undefined, evaluation: null, score: null }] })
+    if (url.endsWith('/api/vacancies/603')) return new Promise((resolve) => { resolveDetail = resolve })
+    return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+
+  const card = (await screen.findByText('Деталь исторической вакансии')).closest('details') as HTMLElement
+  const summary = card.querySelector('summary') as HTMLElement
+  fireEvent.click(summary)
+  expect(await within(card).findByText('Загрузка подробностей…')).toBeInTheDocument()
+  expect(within(summary).getByText('Уже откликались')).toBeInTheDocument()
+  await waitFor(() => expect(resolveDetail).toBeDefined())
+  resolveDetail?.({ ok: true, json: async () => detailPayload })
+  expect(await within(card).findByText(/предыдущий отклик уже учтён/)).toBeInTheDocument()
+  expect(within(summary).getByText('Не оценивалась')).toBeInTheDocument()
+  expect(within(card).queryByText('Старый балл')).not.toBeInTheDocument()
+  expect(within(summary).queryByText('88')).not.toBeInTheDocument()
+})
+
+test('pagination preserves historic no-evaluation context on earlier rows', async () => {
+  const historical = {
+    id: 604, session_id: 21, title: 'Историческая строка на первой странице', company: 'Компания', url: 'https://example.test/604',
+    state: 'ALREADY_APPLIED', status_group: 'SUCCESS' as const, analysis_status: 'not_evaluated_history' as const,
+    history_context: { source_vacancy_id: 44, source_session_id: 10, outcome: 'already_applied' as const, reason_code: 'PRIOR_OUTCOME_ALREADY_APPLIED' },
+    data: {}, evaluation: null,
+  }
+  const nextPage = { id: 605, session_id: 22, title: 'Строка со второй страницы', company: 'Компания', url: 'https://example.test/605', state: 'SUBMITTED', status_group: 'SUCCESS' as const, data: {}, evaluation: null }
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('/api/vacancies')) {
+      const offset = new URL(url, window.location.origin).searchParams.get('offset')
+      const page = offset === '30' ? nextPage : historical
+      return Promise.resolve({ ok: true, json: async () => ({ items: [page], total: 2, limit: 30, offset: Number(offset ?? 0), has_more: offset !== '30' }) })
+    }
+    return Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })
+  }))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+
+  const originalCard = (await screen.findByText('Историческая строка на первой странице')).closest('details') as HTMLElement
+  fireEvent.click(screen.getByRole('button', { name: 'Показать ещё' }))
+  expect(await screen.findByText('Строка со второй страницы')).toBeInTheDocument()
+  expect(within(originalCard).getByText('Уже откликались', { selector: '.status' })).toBeInTheDocument()
+  fireEvent.click(originalCard.querySelector('summary') as HTMLElement)
+  expect(await within(originalCard).findByText(/предыдущая вакансия #44, сессия #10/)).toBeInTheDocument()
+  expect(within(originalCard).queryByText('Оценка ещё не завершена.')).not.toBeInTheDocument()
 })
 
 test('paused session does not fetch or render manual application questions', async () => {
@@ -1559,6 +1694,20 @@ test('renders reported vacancy as a successful status group', async () => {
   expect(status).toHaveAttribute('data-status', 'SUCCESS')
 })
 
+test('renders a distinct partial application outcome', async () => {
+  const vacancy = {
+    id: 509, title: 'Частично отправленная вакансия', company: 'Компания', url: 'https://example.test/509',
+    state: 'PARTIAL', status_group: 'PARTIAL' as const, data: {}, evaluation: null,
+  }
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).endsWith('/api/vacancies')
+    ? Promise.resolve({ ok: true, json: async () => [vacancy] })
+    : Promise.resolve({ ok: true, json: async () => vacancy })))
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
+  const status = await screen.findByText('Резюме отправлено, письмо не завершено', { selector: '.status' })
+  expect(status).toHaveClass('status-warning')
+  expect(status).toHaveAttribute('data-status', 'PARTIAL')
+})
+
 test('renders a concrete API error below the model summary', async () => {
   const vacancy = {
     id: 506, title: 'Вакансия с ошибкой', company: 'Компания', url: 'https://example.test/506',
@@ -1589,7 +1738,7 @@ test.each(['hh', 'hirehi', 'zarplata'] as const)('normalizes a legacy unconfirme
   fireEvent.click((await screen.findByText('Отклик без подтверждения')).closest('summary') as HTMLElement)
   expect(screen.getByText('После повторных попыток не удалось подтвердить отправку.')).toBeInTheDocument()
   expect(screen.queryByText(/Отклик не отправлен/)).not.toBeInTheDocument()
-  expect(screen.getByText('Ошибка', { selector: '.status' })).toHaveClass('status-danger')
+  expect(screen.getByText('Отправка не подтверждена', { selector: '.status' })).toHaveClass('status-danger')
 })
 
 test('classifies legacy submission uncertainty as ERROR and shows its concrete code', async () => {
@@ -1602,8 +1751,8 @@ test('classifies legacy submission uncertainty as ERROR and shows its concrete c
     : Promise.resolve({ ok: true, json: async () => ({ connected: true, model_available: true, model: 'test' }) })))
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={['/vacancies']}><App /></MemoryRouter></QueryClientProvider>)
   const summary = (await screen.findByText('Legacy uncertain submission')).closest('summary') as HTMLElement
-  expect(within(summary).getByText('Ошибка', { selector: '.status' })).toBeInTheDocument()
-  expect(within(summary).queryByText('Не подтверждено', { selector: '.status' })).not.toBeInTheDocument()
+  expect(within(summary).getByText('Отправка не подтверждена', { selector: '.status' })).toBeInTheDocument()
+  expect(within(summary).queryByText('Ошибка', { selector: '.status' })).not.toBeInTheDocument()
   fireEvent.click(summary)
   expect(await screen.findByText('После повторных попыток не удалось подтвердить отправку.')).toBeInTheDocument()
   expect(screen.getByText('Код ошибки: SUBMISSION_UNCONFIRMED')).toBeInTheDocument()

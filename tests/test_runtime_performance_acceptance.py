@@ -41,7 +41,7 @@ API_LIMIT_SECONDS = 0.5
 WORKER_STOP_LIMIT_SECONDS = 5.0
 DESCENDANT_LIMIT_SECONDS = 15.0
 BURN_TICKS = 1_800
-ARTIFACT_DIR = Path(r"D:\VScode Projects\job-application-test-artifacts\runtime-performance-final")
+ARTIFACT_DIR = Path(r"D:\Codex Projects\job-application-fix-2026-10-06\runtime-performance-final")
 
 
 @pytest.fixture

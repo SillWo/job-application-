@@ -18,7 +18,7 @@ from backend.persistence.models import AIModelSettings
 from backend.services.search_metrics import measure, record
 
 from .model_config import auth_headers, is_local_url, model_http_client, normalize_base_url
-from .openai_compat import create_completion
+from .openai_compat import UnsupportedProviderCapability, create_completion
 from .prompts import ROLE_OPTIONS, ROLE_PROMPTS
 from .security import (
     TRUSTED_SYSTEM_SECURITY_POLICY,
@@ -40,15 +40,35 @@ _RESUME_ANALYSIS_CRITERIA = (
 
 
 class ModelUnavailable(RuntimeError):
-    pass
+    def __init__(self, message: str, *, error_code: str = "provider_unavailable") -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
+class ModelTransientError(ModelUnavailable):
+    """A bounded retry may recover from an incomplete provider response."""
 
 
 class ModelTimeout(ModelUnavailable):
     """The provider did not finish within the logical operation deadline."""
 
+    def __init__(self, message: str) -> None:
+        super().__init__(message, error_code="model_timeout")
+
 
 class ModelPermanentError(RuntimeError):
     """A request failed validation or policy checks and must not be retried."""
+
+    def __init__(self, message: str, *, error_code: str = "permanent_model_error") -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
+class ModelOverloaded(ModelUnavailable):
+    """The durable queue is full; no request row was created."""
+
+    def __init__(self) -> None:
+        super().__init__("Durable model queue is at capacity", error_code="queue_overloaded")
 
 
 class ConnectionCheck(BaseModel):
@@ -88,6 +108,20 @@ def _safe_api_error_summary(error: APIError) -> str:
             return "HTTP 429: quota exceeded"
         return f"HTTP {status}"
     return error.__class__.__name__
+
+
+def _model_notice_error(content: str) -> ModelPermanentError | None:
+    """Recognize only standalone provider notices, never ordinary JSON fields."""
+    notice = " ".join(content.casefold().strip().split())
+    notice = notice.rstrip(".! ")
+    patterns = (
+        (r"(?:the )?model (?:is |has been )?(?:currently )?disabled", "model_disabled"),
+        (r"(?:the )?model (?:is |has been )?(?:currently )?retired", "model_retired"),
+    )
+    for pattern, code in patterns:
+        if re.fullmatch(pattern, notice):
+            return ModelPermanentError("Provider model is unavailable", error_code=code)
+    return None
 
 
 def _schema_for_role(role: str, schema: type[BaseModel]) -> dict:
@@ -140,7 +174,21 @@ def _system_prompt_for_role(role: str, payload: dict) -> str:
             prompt += (" Для КАЖДОГО green/red flag верни ровно один FlagMatch с тем же flag_id, "
                        "matched, confidence, evidence и explanation. Сопоставляй с job, threshold 0.70; "
                        "desired_industry может засчитать industry независимо от resume, desired_task учитывается локально, "
-                       "desired_salary имеет приоритет над зарплатой resume.")
+                       "desired_salary имеет приоритет над зарплатой resume. Для flag с required=true оценивай "
+                       "всю обязательную комбинацию как условие допуска, а не как бонус: если флаг соединяет условия "
+                       "через «и», каждое из них должно подтверждаться фактическими обязанностями и контекстом вакансии; "
+                       "если варианты соединены через «или», достаточно одного явно подходящего варианта. Сверяйся с "
+                       "точными цитатами из обязанностей, задач и описания продукта в job; совпадение отдельных слов "
+                       "или прошлый опыт кандидата сами по себе не подтверждают требование работодателя. При частичном, "
+                       "косвенном или неясном совпадении обязательного условия ставь matched=false, а не засчитывай его "
+                       "как смежный плюс. Оценивай роль по реальным обязанностям, а не только по названию: одинаковые "
+                       "названия могут скрывать разные функции, а разные названия — одну функцию. Например, общие "
+                       "бизнес-инициативы и небольшое упоминание IT не подтверждают обязательную работу с продуктом; "
+                       "исследование рынка для руководства само по себе не означает работу с пользователями продукта, "
+                       "метриками или экспериментами. Аналитика продуктовых метрик, экспериментов и поведения пользователей "
+                       "может соответствовать продуктовому направлению и при другом названии роли, если это подтверждают "
+                       "обязанности. Не повышай score за частичное совпадение с required-флагом и не выводи из резюме "
+                       "требования, которых нет в пользовательском policy.")
         elif role == "search_planner":
             prompt += " Green desired_industry является самостоятельным источником запросов даже без resume; red никогда не становится query. Сохраняй запрет title-equivalent."
         elif role == "hirehi_category":
@@ -477,8 +525,10 @@ class ModelGateway:
                 key = decrypt_secret(config.encrypted_api_key) if config and config.encrypted_api_key else ""
         except (RuntimeError, ValueError):
             config, key = None, ""
-        if config is None or (not key and not is_local_url(config.base_url)):
-            raise ModelUnavailable("Модель не настроена или ключ недоступен")
+        if config is None:
+            raise ModelPermanentError("Модель не настроена", error_code="model_not_configured")
+        if not key and not is_local_url(config.base_url):
+            raise ModelPermanentError("Ключ модели недоступен", error_code="model_not_configured")
         transport = model_http_client(config.base_url, settings.openai_timeout)
         client = AsyncOpenAI(
             base_url=normalize_base_url(config.base_url),
@@ -544,13 +594,23 @@ class ModelGateway:
                         if all(isinstance(value, int) for value in tokens.values()):
                             record("tokens", {"role": role, "diagnostic_id": diagnostic_id, **tokens})
                     try:
-                        message = response.choices[0].message
+                        choice = response.choices[0]
+                        if getattr(choice, "finish_reason", None) == "length":
+                            raise ModelTransientError(
+                                "OpenAI-compat truncated its response",
+                                error_code="output_truncated",
+                            )
+                        message = choice.message
                         if getattr(message, "tool_calls", None) or getattr(message, "function_call", None):
                             raise PromptInjectionDetected("unexpected_tool_call", context=f"{role}.output")
                         content = message.content
                         if not isinstance(content, str):
                             raise ModelPermanentError("OpenAI-compat вернул ответ неожиданной структуры")
                         content = content.strip()
+                        if content:
+                            notice_error = _model_notice_error(content)
+                            if notice_error is not None:
+                                raise notice_error
                     except PromptInjectionDetected:
                         # Tool/function calls are never executed.  Give the
                         # provider a bounded trusted repair opportunity while
@@ -568,13 +628,18 @@ class ModelGateway:
                         })
                         messages[0]["content"] += _TRUSTED_OUTPUT_REPAIR
                         continue
+                    except (ModelTransientError, ModelPermanentError):
+                        raise
                     except (IndexError, AttributeError, TypeError) as exc:
                         raise ModelPermanentError(
                             "OpenAI-compat API вернул ответ неожиданной структуры"
                         ) from exc
                     try:
                         if not content:
-                            raise ValueError("OpenAI-compat вернул пустой ответ")
+                            raise ModelTransientError(
+                                "OpenAI-compat returned an empty response",
+                                error_code="empty_output",
+                            )
                         # Check before compatibility cleanup: malformed output
                         # must never become a carrier for a repair instruction.
                         assert_safe_output(content, context=f"{role}.raw_output", payload=provider_payload)
@@ -617,11 +682,14 @@ class ModelGateway:
                             "diagnostic_id": diagnostic_id,
                         })
                         messages[0]["content"] += _TRUSTED_OUTPUT_REPAIR
+                    except ModelTransientError:
+                        raise
                     except (ValidationError, ValueError) as exc:
                         validation_error = _validation_reason(exc)
                         if attempt == attempts - 1:
                             raise ModelPermanentError(
-                                "OpenAI-compat вернул неполный или некорректный JSON после повторной попытки"
+                                "OpenAI-compat вернул неполный или некорректный JSON после повторной попытки",
+                                error_code="schema_validation_failed",
                             ) from exc
                         record("model_repair", {
                             "role": role,
@@ -651,9 +719,26 @@ class ModelGateway:
                     )
             except ModelUnavailable:
                 raise
+            except UnsupportedProviderCapability as exc:
+                raise ModelPermanentError(
+                    "Provider does not support the required structured request options",
+                    error_code="provider_capability_unsupported",
+                ) from exc
             except APIError as exc:
+                status = getattr(exc, "status_code", None)
+                if status in {401, 403}:
+                    raise ModelPermanentError(
+                        "Provider rejected authentication",
+                        error_code="provider_unauthorized",
+                    ) from exc
+                if status in {400, 422}:
+                    raise ModelPermanentError(
+                        "Provider rejected the request configuration",
+                        error_code="provider_capability_unsupported",
+                    ) from exc
                 raise ModelUnavailable(
-                    f"OpenAI-compat API недоступен: {_safe_api_error_summary(exc)}"
+                    f"OpenAI-compat API недоступен: {_safe_api_error_summary(exc)}",
+                    error_code="provider_unavailable",
                 ) from exc
             except TimeoutError as exc:
                 raise ModelTimeout(
@@ -668,6 +753,50 @@ class ModelGateway:
             return db.get(AIModelSettings, 1)
 
     def _mock(self, role: str, payload: dict, schema: type[T]) -> T:
+        if role == "required_preference_check":
+            return schema.model_validate({
+                "flags": [{
+                    "flag_id": flag.get("id", ""),
+                    "matched": False,
+                    "confidence": 1.0,
+                    "evidence": [],
+                    "missing_conditions": [str(flag.get("text") or "Обязательное условие")],
+                    "explanation": "Mock-провайдер не подтверждает обязательные условия вакансии.",
+                } for flag in payload.get("required_flags", [])]
+            })
+        if role == "letter_claim_check":
+            from backend.intelligence.letter_claims import (
+                _has_candidate_fact_claim,
+                _semantic_strings,
+            )
+            letter = str(payload.get("letter") or "")
+            resumes = payload.get("resumes", []) or []
+            evidence = []
+            unsupported = []
+            for sentence in re.split(r"(?<=[.!?])\s+|\n+", letter):
+                if not _has_candidate_fact_claim(sentence):
+                    continue
+                match = next((
+                    (index, source)
+                    for index, resume in enumerate(resumes)
+                    for source in _semantic_strings(resume)
+                    if source.casefold() in sentence.casefold()
+                ), None)
+                if match is None:
+                    unsupported.append(sentence.strip())
+                else:
+                    resume_index, source_quote = match
+                    evidence.append({
+                        "claim_span": sentence.strip(),
+                        "resume_index": resume_index,
+                        "source_quote": source_quote,
+                    })
+            return schema.model_validate({
+                "all_candidate_claims_supported": not unsupported,
+                "confidence": 1.0,
+                "unsupported_claims": unsupported,
+                "evidence": evidence,
+            })
         if role == "application_answers":
             # Offline mock never invents candidate facts or silently solves assessments.
             return schema.model_validate({"answers": []})
@@ -841,10 +970,10 @@ class ModelGateway:
                 )
             )
             if gender == "male" and has_grounded_facts:
-                lines.append(f"Уверен, что стану отличным кандидатом на вашу вакансию, ведь мой опыт связан с задачами роли «{title}».")
+                lines.append(f"Уверен, что задачи роли «{title}» мне интересны.")
                 lines.append("Буду рад продолжить с вами общение здесь в чате, телефонном звонке или мессенджерах!")
             elif gender == "female" and has_grounded_facts:
-                lines.append(f"Уверена, что стану отличным кандидатом на вашу вакансию, ведь мой опыт связан с задачами роли «{title}».")
+                lines.append(f"Уверена, что задачи роли «{title}» мне интересны.")
                 lines.append("Буду рада продолжить с вами общение здесь в чате, телефонном звонке или мессенджерах!")
             else:
                 lines.append(f"Считаю себя подходящим кандидатом на роль «{title}».")

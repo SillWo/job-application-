@@ -24,6 +24,8 @@ from backend.intelligence.model_broker import ModelRequestClient
 from backend.orchestrator import hh_application, workflow
 from backend.persistence.database import Base
 from backend.persistence.models import (
+    Application,
+    BrowserEvent,
     CoverLetter,
     JobSession,
     Notification,
@@ -318,10 +320,17 @@ async def test_historical_hh_duplicates_release_queue_for_new_reference(
                 external_id=f"historic-{index}",
                 url=f"https://hh.ru/vacancy/historic-{index}",
                 title=f"Historical role {index}",
-                state="REPORTED",
+                state="SUBMITTED",
                 data={"preserve": index},
             )
             for index in range(10)
+        ])
+        db.flush()
+        db.add_all([
+            Application(vacancy_id=vacancy.id, status="submitted")
+            for vacancy in db.scalars(select(Vacancy).where(
+                Vacancy.session_id == historical_session.id,
+            ))
         ])
         db.commit()
 
@@ -593,6 +602,109 @@ async def test_snapshot_application_answers_do_not_use_session_memory(monkeypatc
     assert outcome.submission is not None
     assert outcome.submission.status == "submitted"
     assert filled == [["Красноярск"]]
+
+
+@pytest.mark.asyncio
+async def test_questionnaire_model_timeout_recovers_and_submits_once(runtime, monkeypatch):
+    field = ApplicationField(id="city", label="Город")
+    form = ApplicationForm(fields=[field])
+
+    class QuestionnaireAdapter(FakeAdapter):
+        site_id = "hh"
+        search_exhausted = False
+
+        def __init__(self):
+            super().__init__([JobRef(external_id="questionnaire", url="https://fake/questionnaire")])
+            self.open_application_calls = 0
+            self.fill_calls = 0
+            self.submit_calls = 0
+
+        async def open_application(self, page):
+            self.open_application_calls += 1
+            return form
+
+        async def prepare_application(self, page, plan):
+            return form
+
+        async def read_application(self, page):
+            return form
+
+        async def fill_application(self, page, plan):
+            self.fill_calls += 1
+            assert plan.form_answers["city"].values == ["Красноярск"]
+            return FillResult(success=True, answered_fields=["city"])
+
+        async def can_retry_application(self, page):
+            return True
+
+        async def verify_submission(self, page):
+            return SubmissionResult(status="unknown", message="No send was confirmed")
+
+        async def submit_application(self, page):
+            self.submit_calls += 1
+            return SubmissionResult(status="submitted", message="submitted")
+
+    adapter = QuestionnaireAdapter()
+    sessions, session_id = runtime
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        item.adapter_id = "hh"
+        item.application_limit = 1
+        item.recovery = {"search_filters": {}}
+        snapshot = _normalize_extracted(
+            {
+                "external_id": "fixture", "identity": {"full_name": "Test", "gender": "male"},
+                "target": {"title": "Role"}, "about": "Fixture professional background",
+                "skills": [{"name": "Python"}],
+            },
+            adapter_id="hh", source_url="https://fake/resume/fixture",
+        )
+        persist_session_snapshot(db, session_id, snapshot)
+        db.commit()
+
+    monkeypatch.setattr(workflow.adapter_registry, "get", lambda _site: adapter)
+    async def apply_all(*_args, **_kwargs):
+        return evaluation("apply")
+
+    monkeypatch.setattr(workflow, "evaluate", apply_all)
+    async def write_letter(*_args, **_kwargs):
+        return "Synthetic cover letter for questionnaire test"
+
+    monkeypatch.setattr(workflow, "write_cover_letter", write_letter)
+    monkeypatch.setattr(workflow, "AdaptiveSearch", lambda raw, *_args, **_kwargs: raw)
+    prepare_calls = 0
+
+    async def timeout_then_answer(_gateway, _form, plan, *_args, **_kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if prepare_calls == 1:
+            raise workflow.ModelTimeout("questionnaire model timeout")
+        plan.form_answers = {
+            "city": FormAnswer(field=field, values=["Красноярск"], source="snapshot")
+        }
+        plan.unanswered_fields = {}
+        return plan
+
+    monkeypatch.setattr(hh_application, "prepare_answers", timeout_then_answer)
+    await asyncio.wait_for(workflow.WorkflowManager().run(session_id), timeout=8)
+
+    with sessions() as db:
+        item = db.get(JobSession, session_id)
+        vacancy = db.scalar(select(Vacancy).where(Vacancy.session_id == session_id))
+        retries = list(db.scalars(select(BrowserEvent).where(
+            BrowserEvent.session_id == session_id,
+            BrowserEvent.event_type == "recovery_retry",
+        )))
+        assert item.status == SessionStatus.COMPLETED
+        assert item.counters["submitted"] == 1
+        assert item.counters["errors"] == 0
+        assert vacancy.state == "SUBMITTED"
+        assert len(retries) == 1
+        assert retries[0].data["error_type"] == "ModelTimeout"
+    assert prepare_calls == 2
+    assert adapter.open_application_calls == 2
+    assert adapter.fill_calls == 1
+    assert adapter.submit_calls == 1
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from pathlib import Path
-from xml.sax.saxutils import escape
+from urllib.parse import urlsplit
+from xml.sax.saxutils import escape, quoteattr
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -18,6 +19,39 @@ ROUTE_LABELS = {
 
 def _safe(value: object) -> str:
     return escape(str(value or "")).replace("\n", "<br/>")
+
+
+def _safe_web_url(value: object) -> str | None:
+    url = str(value or "")
+    if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in url):
+        return None
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return url
+
+
+def _url_paragraph(value: object, style: ParagraphStyle) -> Paragraph:
+    text = str(value or "Не указано")
+    safe_url = _safe_web_url(text)
+    if safe_url:
+        markup = f"<link href={quoteattr(safe_url)} color=\"blue\" underline=\"1\">{_safe(text)}</link>"
+    else:
+        safe_text = "".join(
+            f"\\u{ord(char):04x}" if ord(char) < 32 or 127 <= ord(char) <= 159 else char
+            for char in text
+        )
+        markup = _safe(safe_text)
+    return Paragraph(markup, style)
 
 
 def write_session_pdf(session_id: int, rows: list[dict]) -> str:
@@ -106,7 +140,10 @@ def write_session_pdf(session_id: int, rows: list[dict]) -> str:
                     else "Не требуется для этого типа вакансии"
                 )
             story.append(Paragraph(_safe(field_label), label))
-            story.append(Paragraph(_safe(value or "Не указано"), body))
+            if key in {"hirehi_url", "target_url"}:
+                story.append(_url_paragraph(value or "Не указано", body))
+            else:
+                story.append(Paragraph(_safe(value or "Не указано"), body))
             # A trailing spacer can overflow an otherwise full page and make
             # ReportLab create a footer-only page.  The paragraph itself is
             # intentionally left splittable so long cover letters continue

@@ -502,16 +502,27 @@ def professional_model_payload(snapshot_or_view: SiteResumeSnapshot | ResumeProf
     view = professional_view(snapshot_or_view) if isinstance(snapshot_or_view, SiteResumeSnapshot) else snapshot_or_view
     data = view.model_dump(mode="json") if hasattr(view, "model_dump") else dict(view or {})
 
-    def flatten(value: Any) -> Any:
+    def semantic_values(value: Any) -> Any:
         if isinstance(value, dict):
-            if "value" in value and "availability" in value:
-                return flatten(value.get("value"))
-            return {key: flatten(item) for key, item in value.items()}
+            # SourceField is the only wrapper in this schema. Requiring the
+            # wrapper's metadata shape avoids mistaking an ordinary semantic
+            # object that happens to contain a `value` member for a field.
+            if (
+                "value" in value
+                and "availability" in value
+                and set(value).issubset({"value", "availability", "source_section", "source_locator"})
+            ):
+                return semantic_values(value.get("value"))
+            return {
+                key: semantic_values(item)
+                for key, item in value.items()
+                if key not in {"availability", "source_section", "source_locator"}
+            }
         if isinstance(value, list):
-            return [flatten(item) for item in value]
+            return [semantic_values(item) for item in value]
         return value
 
-    flattened = flatten(data)
+    flattened = semantic_values(data)
     # The normalized contract uses explicit ``target``/``experience`` blocks,
     # while existing intelligence consumers accept the legacy compact names.
     # Keep both views professional-only so the migration cannot silently drop
@@ -550,21 +561,25 @@ def full_resume_model_payload(value: SiteResumeSnapshot | dict) -> dict:
         "identity", "contacts", "self_employment", "job_search_status", "source_badges",
         "target", "location", "experience", "skills",
         "education", "projects", "languages", "courses", "certifications",
-        "awards", "portfolio", "about", "additional_sections", "coverage", "total_experience",
+        "awards", "portfolio", "about", "additional_sections", "total_experience",
     )
     data = item.model_dump(mode="json", include=set(fields))
 
-    def flatten(node: Any) -> Any:
+    def semantic_values(node: Any) -> Any:
         if isinstance(node, dict):
-            if "value" in node and "availability" in node:
-                return flatten(node.get("value"))
+            if (
+                "value" in node
+                and "availability" in node
+                and set(node).issubset({"value", "availability", "source_section", "source_locator"})
+            ):
+                return semantic_values(node.get("value"))
             return {
-                key: flatten(child)
+                key: semantic_values(child)
                 for key, child in node.items()
-                if key not in {"source_locator", "source_section"}
+                if key not in {"availability", "source_locator", "source_section"}
             }
         if isinstance(node, list):
-            return [flatten(child) for child in node]
+            return [semantic_values(child) for child in node]
         if isinstance(node, str):
             # Adapter contracts are text-oriented, but a site can still
             # accidentally pass markup from a rich-text section.  Keep the
@@ -572,7 +587,7 @@ def full_resume_model_payload(value: SiteResumeSnapshot | dict) -> dict:
             return _CONTROL.sub("", html.unescape(_HTML_TAG.sub("", _HTML_BLOCK.sub("", node))))
         return node
 
-    return flatten(data)
+    return semantic_values(data)
 
 
 def public_preview(snapshot: SiteResumeSnapshot, *, source_url: str | None = None) -> dict[str, Any]:

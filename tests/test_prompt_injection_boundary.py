@@ -19,6 +19,13 @@ class Gateway:
         self.calls.append(role)
         if role == "special_conditions":
             return schema.model_validate({"conditions": []})
+        if role == "letter_claim_check":
+            return schema.model_validate({
+                "all_candidate_claims_supported": True,
+                "confidence": 1,
+                "unsupported_claims": [],
+                "evidence": [],
+            })
         if role == "writer":
             return schema.model_validate({"text": self.letter, "fulfilled_special_conditions": []})
         return schema.model_validate(self.answers)
@@ -33,6 +40,13 @@ class SequenceLetterGateway(Gateway):
         self.calls.append(role)
         if role == "special_conditions":
             return schema.model_validate({"conditions": []})
+        if role == "letter_claim_check":
+            return schema.model_validate({
+                "all_candidate_claims_supported": True,
+                "confidence": 1,
+                "unsupported_claims": [],
+                "evidence": [],
+            })
         return schema.model_validate({
             "text": self.letters.pop(0), "fulfilled_special_conditions": [],
         })
@@ -71,7 +85,7 @@ async def test_vacancy_injection_is_ignored_and_provider_continues():
         {"gender": "male"}, [{"name": "Резюме"}], gateway,
     )
     assert result == "Короткое письмо."
-    assert gateway.calls == ["special_conditions", "writer"]
+    assert gateway.calls == ["special_conditions", "writer", "letter_claim_check"]
 
 
 @pytest.mark.asyncio
@@ -91,7 +105,7 @@ async def test_unsafe_letter_output_is_retried_without_echoing_it():
         job(), {"gender": "male"}, [{"name": "Резюме"}], gateway,
     )
     assert result == "Короткое письмо."
-    assert gateway.calls == ["special_conditions", "writer", "writer"]
+    assert gateway.calls == ["special_conditions", "writer", "writer", "letter_claim_check"]
 
 
 @pytest.mark.asyncio

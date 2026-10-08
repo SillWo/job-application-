@@ -12,14 +12,15 @@ from threading import Lock
 from time import perf_counter
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from backend.adapters import adapter_registry
-from backend.adapters.base.protocol import JobRef
+from backend.adapters.base.errors import JobDescriptionUnavailable
+from backend.adapters.base.protocol import JobRef, SubmissionResult
 from backend.browser.sessions import close_browser, get_browser, restore_browser
 from backend.config import settings
 from backend.intelligence.adaptive_search_planner import plan_portfolio
-from backend.intelligence.broker_gateway import BrokeredModelGateway
+from backend.intelligence.broker_gateway import BROKER_PROMPT_VERSION, BrokeredModelGateway
 from backend.intelligence.evaluator import _payload, evaluate
 from backend.intelligence.gateway import (
     ModelGateway,
@@ -29,13 +30,19 @@ from backend.intelligence.gateway import (
 )
 from backend.intelligence.hirehi_category import JobSummary, choose_hirehi_category
 from backend.intelligence.hirehi_grade import hirehi_grades
+from backend.intelligence.letter_claims import LETTER_CLAIMS_VERSION
 from backend.intelligence.letter_writer import (
     CoverLetterValidationError,
     validate_cover_letter,
+    validate_existing_letter_claims,
     write_cover_letter,
 )
 from backend.intelligence.model_broker import ModelRequestClient
-from backend.intelligence.preference_policy import compile_preference_policy
+from backend.intelligence.preference_policy import (
+    POLICY_CONTRACT_VERSION,
+    _required_not_applicable,
+    compile_preference_policy,
+)
 from backend.intelligence.search_planner import plan_search_queries
 from backend.intelligence.security import (
     PromptInjectionDetected,
@@ -66,6 +73,7 @@ from backend.orchestrator.search_version import (
 )
 from backend.persistence.database import SessionLocal
 from backend.persistence.models import (
+    AIModelSettings,
     Application,
     ApplicationPlanRecord,
     BrowserEvent,
@@ -92,6 +100,7 @@ from backend.services.resume_session import (
     full_resume_model_payload,
     professional_view,
 )
+from backend.services.vacancy_history_presentation import resolve_external_history
 
 _INJECTABLE_DIRECT_GATEWAY = ModelGateway
 
@@ -129,6 +138,17 @@ def _initial_hirehi_version(item: JobSession) -> str:
     if historical in {HIREHI_SEARCH_V1, "existing_v1"}:
         return HIREHI_SEARCH_V1
     return _configured_hirehi_version()
+
+
+def _legacy_search_seen_ids(checkpoint: Any) -> set[str]:
+    if not isinstance(checkpoint, dict):
+        return set()
+    raw = checkpoint.get("_search_seen_ids", checkpoint.get("seen_ids", []))
+    if isinstance(raw, dict):
+        raw = list(raw)
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    return {str(value) for value in raw if isinstance(value, (str, int)) and str(value)}
 
 
 def _hirehi_adaptive(item: JobSession | None, adapter: Any | None = None) -> bool:
@@ -188,7 +208,10 @@ def _normalized_recovery_counters(counters: Any) -> dict[str, int | float]:
 def _application_count(item: JobSession, adapter_id: str) -> int:
     """HireHi collects report entries; other adapters still submit applications."""
     key = "reported" if adapter_id == "hirehi" else "submitted"
-    return int((item.counters or {}).get(key, 0))
+    count = int((item.counters or {}).get(key, 0))
+    if adapter_id != "hirehi":
+        count += int((item.counters or {}).get("partial", 0))
+    return count
 
 
 def _application_limit_reason(adapter_id: str) -> str:
@@ -204,13 +227,77 @@ def _vacancy_scope(
     session_id: int,
 ) -> list[Any]:
     """HireHi report sessions may safely re-evaluate a posting; submit flows may not."""
-    conditions: list[Any] = [
+    return [
         Vacancy.source == source,
         Vacancy.external_id == external_id,
+        Vacancy.session_id == session_id,
     ]
-    if adapter_id == "hirehi":
-        conditions.append(Vacancy.session_id == session_id)
-    return conditions
+
+
+def _historical_submission_guard(db, source: str, external_id: str | None, session_id: int):
+    """Return old external progress that must never be resubmitted in this session."""
+    rows = db.scalars(select(Vacancy).where(
+        Vacancy.source == source,
+        Vacancy.external_id == external_id,
+        or_(Vacancy.session_id != session_id, Vacancy.session_id.is_(None)),
+    ).order_by(Vacancy.id.desc()))
+    for vacancy in rows:
+        data = vacancy.data if isinstance(vacancy.data, dict) else {}
+        resolution = resolve_external_history(db, vacancy)
+        if resolution.invalid_history:
+            return vacancy
+        has_submission_evidence = (
+            vacancy.state in {
+                "SUBMITTING", "PARTIAL", "SUBMITTED", "ALREADY_APPLIED", "SUBMISSION_UNCONFIRMED",
+            }
+            or bool(data.get("submission_attempted"))
+            or bool(data.get("submission_reconciliation_attempts"))
+            or data.get("error_code") == "SUBMISSION_UNCONFIRMED"
+            or resolution.used_alias
+        )
+        if resolution.outcome in {"confirmed", "already_applied", "partial"} or has_submission_evidence:
+            return resolution.origin or vacancy
+    return None
+
+
+def _historical_recovery_artifacts(
+    db, vacancy: Vacancy, current_session: JobSession, resume_content_hash: str | None,
+):
+    """Permit cross-session continuation only for the exact saved candidate and plan."""
+    if not resume_content_hash or not vacancy.session_id:
+        return None
+    source_session = db.get(JobSession, vacancy.session_id)
+    if source_session is None or (
+        (source_session.desired_job_description or "").strip()
+        != (current_session.desired_job_description or "").strip()
+        or (source_session.minimum_scores or {}) != (current_session.minimum_scores or {})
+        or source_session.guaranteed_application != current_session.guaranteed_application
+        or source_session.cover_letter_auto != current_session.cover_letter_auto
+        or source_session.cover_letter_template != current_session.cover_letter_template
+        or source_session.cover_letter_max_words != current_session.cover_letter_max_words
+    ):
+        return None
+    if db.scalar(select(Application.id).where(Application.vacancy_id == vacancy.id)) is not None:
+        return None
+    snapshot = db.scalar(select(SessionResumeSnapshot).where(
+        SessionResumeSnapshot.session_id == vacancy.session_id,
+    ))
+    if snapshot is None or snapshot.content_hash != resume_content_hash:
+        return None
+    plan = db.scalar(select(ApplicationPlanRecord).where(
+        ApplicationPlanRecord.vacancy_id == vacancy.id,
+    ))
+    if plan is None or not _cache_matches_resume(plan.data, resume_content_hash):
+        return None
+    if vacancy.state not in {"SUBMITTING", "PARTIAL", "ERROR"}:
+        return None
+    progress = (vacancy.data or {}).get("submission_progress", {})
+    if vacancy.state == "PARTIAL" and not (
+        isinstance(progress, dict) and progress.get("cv_confirmed")
+        and progress.get("cover_letter_pending")
+    ):
+        return None
+    return dict(plan.data)
 
 
 _VACANCY_ERROR_CODES = {
@@ -224,6 +311,7 @@ _VACANCY_ERROR_CODES = {
     "SECURITY_BLOCKED",
     "SITE_ACCESS_BLOCKED",
     "VACANCY_PROCESSING_FAILED",
+    "VACANCY_DESCRIPTION_UNAVAILABLE",
     "SUBMISSION_UNCONFIRMED",
     "SESSION_STOPPED",
     "SESSION_FAILED",
@@ -252,6 +340,79 @@ def _record_vacancy_error(
         counters = dict(item.counters or {})
         counters["errors"] = counters.get("errors", 0) + 1
         item.counters = counters
+
+
+def _persist_submission_progress(item: JobSession, vacancy: Vacancy, progress: Any) -> None:
+    """Save each adapter-confirmed step and account for accepted-CV partials."""
+    if not isinstance(progress, dict):
+        return
+    data = dict(vacancy.data or {})
+    previous_progress = data.get("submission_progress", {})
+    previous_attempted = (
+        isinstance(previous_progress, dict)
+        and previous_progress.get("cover_letter_attempted") is True
+    )
+    flags = {
+        key: bool(progress.get(key))
+        for key in ("cv_confirmed", "cover_letter_pending", "cover_letter_confirmed")
+    }
+    attempted = progress.get("cover_letter_attempted")
+    if previous_attempted or isinstance(attempted, bool):
+        flags["cover_letter_attempted"] = previous_attempted or attempted is True
+    data["submission_progress"] = flags
+    diagnostic = progress.get("cover_letter_diagnostic")
+    if isinstance(diagnostic, dict):
+        safe_diagnostic = {}
+        for key in ("category", "exception_category"):
+            value = diagnostic.get(key)
+            if isinstance(value, str):
+                safe_diagnostic[key] = value[:80]
+        for key in ("visible", "enabled"):
+            if isinstance(diagnostic.get(key), bool):
+                safe_diagnostic[key] = diagnostic[key]
+        count = diagnostic.get("count")
+        if isinstance(count, int) and not isinstance(count, bool):
+            safe_diagnostic["count"] = max(0, min(count, 1000))
+        if safe_diagnostic:
+            data["cover_letter_diagnostic"] = safe_diagnostic
+    is_partial = flags["cv_confirmed"] and flags["cover_letter_pending"]
+    counted = bool(data.get("partial_counted"))
+    if is_partial:
+        vacancy.state = "PARTIAL"
+        if not counted:
+            counters = dict(item.counters or {})
+            counters["partial"] = int(counters.get("partial", 0)) + 1
+            item.counters = counters
+            data["partial_counted"] = True
+    elif counted and flags["cover_letter_confirmed"]:
+        counters = dict(item.counters or {})
+        counters["partial"] = max(0, int(counters.get("partial", 0)) - 1)
+        item.counters = counters
+        data.pop("partial_counted", None)
+    vacancy.data = data
+
+
+def _record_partial_application_error(
+    item: JobSession, vacancy: Vacancy, error_code: str, error_message: str,
+) -> None:
+    """Keep a confirmed CV visible and resumable when the letter remains pending."""
+    if error_code not in _VACANCY_ERROR_CODES:
+        error_code = "VACANCY_PROCESSING_FAILED"
+    try:
+        cleaned = sanitize_untrusted_input(str(error_message), context="partial application error")
+    except PromptInjectionDetected:
+        cleaned = "Не удалось продолжить письмо после подтверждения резюме"
+    data = dict(vacancy.data or {})
+    data["error_code"] = error_code
+    data["error_message"] = (cleaned if isinstance(cleaned, str) else "")[:1000]
+    vacancy.data = data
+    vacancy.state = "PARTIAL"
+    if not data.get("partial_error_counted"):
+        counters = dict(item.counters or {})
+        counters["errors"] = int(counters.get("errors", 0)) + 1
+        item.counters = counters
+        data["partial_error_counted"] = True
+        vacancy.data = data
 
 
 def _record_blocker_outcome(item: JobSession, blocker: Any, vacancy: Vacancy) -> None:
@@ -368,10 +529,14 @@ _COVER_LETTER_RETRY_LIMIT = 3
 _SUBMISSION_RECONCILIATION_LIMIT = 3
 _SESSION_RECOVERY_RETRY_LIMIT = 8
 _MODEL_STAGE_RETRY_LIMIT = 8
+_PARTIAL_LETTER_RETRY_LIMIT = 3
 _RECOVERY_COUNTERS_KEY = "progress_counters"
 _EVALUATION_SECURITY_VERSION = 1
 _RESUME_HASH_KEY = "_resume_content_hash"
+_EVALUATION_FINGERPRINT_KEY = "_evaluation_fingerprint"
 _COVER_LETTER_HASH_KEY = "cover_letter_content_hash"
+_LETTER_CLAIMS_PROOF_KEY = "letter_claims_proof"
+_EVALUATION_CONTRACT = "job-evaluation-v4-required-preference-verification"
 _PLAN_URL_RE = re.compile(r"https?://[^\s<>\]\[(){}]+", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = '.,;:!?\"\''
 
@@ -404,6 +569,83 @@ def _cache_matches_resume(data: Any, content_hash: str | None) -> bool:
         return content_hash is None
     cached_hash = data.get(_RESUME_HASH_KEY)
     return cached_hash == content_hash if content_hash else cached_hash is None
+
+
+def _letter_resume_hash(resumes: list[Any], content_hash: str | None) -> str:
+    if content_hash:
+        return content_hash
+    payload = json.dumps(
+        [_payload(resume) for resume in resumes],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return _sha256(payload)
+
+
+def _letter_claims_proof(letter: str, resumes: list[Any], content_hash: str | None) -> dict[str, str]:
+    return {
+        "version": LETTER_CLAIMS_VERSION,
+        "resume_hash": _letter_resume_hash(resumes, content_hash),
+        "letter_hash": _sha256(str(letter or "")),
+    }
+
+
+def _letter_claims_proof_matches(
+    vacancy: Vacancy, letter: str, resumes: list[Any], content_hash: str | None,
+) -> bool:
+    proof = (vacancy.data or {}).get(_LETTER_CLAIMS_PROOF_KEY)
+    return isinstance(proof, dict) and proof == _letter_claims_proof(
+        letter, resumes, content_hash
+    )
+
+
+async def _validate_cached_letter_claims(
+    gateway: Any,
+    vacancy: Vacancy,
+    letter: str,
+    resumes: list[Any],
+    content_hash: str | None,
+    *,
+    private_view: Any = None,
+) -> bool:
+    """Validate a cached letter once per exact letter/resume/version tuple."""
+    if _letter_claims_proof_matches(vacancy, letter, resumes, content_hash):
+        return False
+    await validate_existing_letter_claims(
+        gateway, letter, resumes, private_view=private_view
+    )
+    data = dict(vacancy.data or {})
+    data[_LETTER_CLAIMS_PROOF_KEY] = _letter_claims_proof(
+        letter, resumes, content_hash
+    )
+    vacancy.data = data
+    return True
+
+
+def _evaluation_fingerprint(db, resume_content_hash, minimum_scores, preference_policy, gateway):
+    """Tie a cached evaluation to the candidate, criteria, contract, and model."""
+    if not resume_content_hash:
+        return None
+    model_settings = db.get(AIModelSettings, 1)
+    model = {
+        "provider": getattr(gateway, "provider", settings.llm_provider),
+        "model": model_settings.model if model_settings else settings.openai_model,
+        "base_url": model_settings.base_url if model_settings else settings.openai_base_url,
+    }
+    criteria = {
+        "minimum_scores": minimum_scores or {},
+        "preference_policy": (
+            preference_policy.model_dump(mode="json")
+            if hasattr(preference_policy, "model_dump") else preference_policy or {}
+        ),
+    }
+    payload = {
+        "resume_content_hash": resume_content_hash,
+        "criteria": criteria,
+        "evaluation_contract": _EVALUATION_CONTRACT,
+        "broker_prompt_version": BROKER_PROMPT_VERSION,
+        "model": model,
+    }
+    return _sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
 def _private_mapping(private: Any) -> dict[str, str]:
@@ -806,6 +1048,7 @@ def _resume_desired_title(resume: dict) -> str:
 class WorkflowManager:
     retry_base_seconds = 5
     retry_max_seconds = 300
+    description_retry_seconds = 1
 
     def __init__(self, *, generation: int | None = None) -> None:
         self.tasks: dict[int, asyncio.Task] = {}
@@ -855,6 +1098,139 @@ class WorkflowManager:
             generation=self.generation,
             vacancy_id=vacancy_id,
         )
+
+    async def _extract_job_with_description_retries(
+        self, session_id: int, adapter: Any, page: Any, ref: JobRef
+    ) -> Any:
+        """Read a non-empty vacancy description, with a durable three-try budget."""
+        external_id = ref.external_id
+        while True:
+            if not await self._wait_if_paused(session_id):
+                raise asyncio.CancelledError
+            with SessionLocal() as db:
+                if cancellation_fence(db, session_id, self.generation):
+                    raise asyncio.CancelledError
+                item = db.get(JobSession, session_id)
+                if item is None:
+                    raise asyncio.CancelledError
+                recovery = dict(item.recovery or {})
+                attempts_by_id = dict(recovery.get("description_read_attempts") or {})
+                try:
+                    attempts = max(0, int(attempts_by_id.get(external_id, 0)))
+                except (TypeError, ValueError):
+                    attempts = 0
+            if attempts >= 3:
+                raise JobDescriptionUnavailable(
+                    JobDescriptionUnavailable.DEFAULT_MESSAGE,
+                    title=getattr(ref, "title", None),
+                )
+
+            try:
+                posting = await adapter.extract_job(page)
+                if not str(getattr(posting, "description", "") or "").strip():
+                    raise JobDescriptionUnavailable(
+                        JobDescriptionUnavailable.DEFAULT_MESSAGE,
+                        title=getattr(posting, "title", None),
+                        company=getattr(posting, "company", None),
+                    )
+            except JobDescriptionUnavailable as exc:
+                with SessionLocal() as db:
+                    if cancellation_fence(db, session_id, self.generation):
+                        raise asyncio.CancelledError from None
+                    item = db.get(JobSession, session_id)
+                    if item is None:
+                        raise asyncio.CancelledError from None
+                    recovery = dict(item.recovery or {})
+                    attempts_by_id = dict(recovery.get("description_read_attempts") or {})
+                    try:
+                        attempts = max(0, int(attempts_by_id.get(external_id, 0)))
+                    except (TypeError, ValueError):
+                        attempts = 0
+                    attempts += 1
+                    attempts_by_id[external_id] = attempts
+                    recovery["description_read_attempts"] = attempts_by_id
+                    item.recovery = recovery
+                    db.commit()
+                if attempts >= 3:
+                    if not await self._wait_if_paused(session_id):
+                        raise asyncio.CancelledError from None
+                    raise JobDescriptionUnavailable(
+                        str(exc) or JobDescriptionUnavailable.DEFAULT_MESSAGE,
+                        title=getattr(exc, "title", None) or getattr(ref, "title", None),
+                        company=getattr(exc, "company", None),
+                    ) from exc
+                if not await self._wait_if_paused(session_id):
+                    raise asyncio.CancelledError from None
+                with SessionLocal() as db:
+                    if cancellation_fence(db, session_id, self.generation):
+                        raise asyncio.CancelledError from None
+                await asyncio.sleep(self.description_retry_seconds)
+                if not await self._wait_if_paused(session_id):
+                    raise asyncio.CancelledError from None
+                with SessionLocal() as db:
+                    if cancellation_fence(db, session_id, self.generation):
+                        raise asyncio.CancelledError from None
+                await adapter.open_job(page, ref)
+                blockers = await adapter.detect_blockers(page)
+                if blockers:
+                    blocker = blockers[0]
+                    if blocker.kind == "captcha":
+                        raise CaptchaRequired(blocker.message) from None
+                    with SessionLocal() as db:
+                        if cancellation_fence(db, session_id, self.generation):
+                            raise asyncio.CancelledError from None
+                        item = db.get(JobSession, session_id)
+                        if item is None:
+                            raise asyncio.CancelledError from None
+                        vacancy = db.scalar(select(Vacancy).where(
+                            *_vacancy_scope(adapter.site_id, adapter.site_id, external_id, session_id)
+                        ))
+                        if vacancy is None or vacancy.session_id != session_id:
+                            vacancy = Vacancy(
+                                session_id=session_id,
+                                source=adapter.site_id,
+                                external_id=external_id,
+                                url=ref.url,
+                                title=external_id,
+                                data={"blocker": blocker.kind, "message": blocker.message},
+                            )
+                            db.add(vacancy)
+                            db.flush()
+                        _record_blocker_outcome(item, blocker, vacancy)
+                        recovery = dict(item.recovery or {})
+                        attempts_by_id = dict(recovery.get("description_read_attempts") or {})
+                        attempts_by_id.pop(external_id, None)
+                        if attempts_by_id:
+                            recovery["description_read_attempts"] = attempts_by_id
+                        else:
+                            recovery.pop("description_read_attempts", None)
+                        item.recovery = recovery
+                        self.emit(db, session_id, "blocker_skipped", blocker.message,
+                                  {"kind": blocker.kind, "external_id": external_id})
+                        vacancy_id = vacancy.id
+                    self._advance_pipeline(
+                        session_id, adapter.site_id, external_id, "completed", vacancy_id=vacancy_id
+                    )
+                    return None
+                continue
+
+            with SessionLocal() as db:
+                if cancellation_fence(db, session_id, self.generation):
+                    raise asyncio.CancelledError
+                item = db.get(JobSession, session_id)
+                if item is None:
+                    raise asyncio.CancelledError
+                recovery = dict(item.recovery or {})
+                attempts_by_id = dict(recovery.get("description_read_attempts") or {})
+                if external_id in attempts_by_id:
+                    attempts_by_id.pop(external_id, None)
+                    if attempts_by_id:
+                        recovery["description_read_attempts"] = attempts_by_id
+                    else:
+                        recovery.pop("description_read_attempts", None)
+                    item.recovery = recovery
+                    db.commit()
+            return posting
 
     def _complete_duplicate_pipeline_item(
         self, session_id: int, site_id: str, external_id: str, vacancy_id: int
@@ -1100,12 +1476,22 @@ class WorkflowManager:
                 )
                 db.commit()
                 return False
+            if isinstance(exc, ModelPermanentError):
+                item.status = SessionStatus.FAILED
+                item.stop_reason = "Модель отклонила запрос по постоянной ошибке"
+                item.finished_at = datetime.now(timezone.utc)
+                self.emit(
+                    db, session_id, "session_failed", item.stop_reason,
+                    {"kind": "permanent_model_error", "error_code": getattr(exc, "error_code", "permanent_model_error")},
+                )
+                db.commit()
+                return False
             recovery = dict(item.recovery or {})
             try:
                 previous_attempt = max(0, int(recovery.get("attempt", 0)))
             except (TypeError, ValueError):
                 previous_attempt = 0
-            dependency_wait = isinstance(exc, (ModelUnavailable, AuthenticationPending))
+            dependency_wait = isinstance(exc, AuthenticationPending)
             current_counters = _normalized_recovery_counters(item.counters)
             previous_counters = recovery.get(_RECOVERY_COUNTERS_KEY)
             has_progress_snapshot = isinstance(previous_counters, dict)
@@ -1127,13 +1513,9 @@ class WorkflowManager:
                 )
                 db.commit()
                 return False
-            # Model outages can last longer than a browser timeout. Persist an
-            # unbounded attempt counter and back off exponentially while the
-            # short-slice wait below keeps Stop responsive. Authentication
-            # waits remain at a steady cadence so a restored login is noticed.
-            attempt = previous_attempt + 1 if isinstance(exc, ModelUnavailable) else (
-                previous_attempt if dependency_wait else previous_attempt + 1
-            )
+            # Model outages and timeouts use the same finite session budget.
+            # Authentication checks keep a steady cadence until the user signs in.
+            attempt = previous_attempt if dependency_wait else previous_attempt + 1
             delay = min(
                 self.retry_max_seconds,
                 self.retry_base_seconds * 2 ** min(max(attempt - 1, 0), 10),
@@ -1210,42 +1592,50 @@ class WorkflowManager:
                 "outcome": "permanent_error",
             })
             raise
-        except ModelTimeout:
-            search_metrics.record("model", {
-                "stage": stage, "seconds": perf_counter() - started,
-                "outcome": "logical_timeout",
-            })
-            _stage_retry_attempt(vacancy, stage)
-            _record_vacancy_error(
-                item, vacancy, "VACANCY_PROCESSING_FAILED",
-                f"Истекло время модельного запроса на этапе {stage}",
-            )
-            self.emit(
-                db, item.id, "vacancy_error",
-                "Вакансия пропущена: модельный запрос превысил допустимое время",
-                {"vacancy_id": vacancy.id, "stage": stage, "error_type": "ModelTimeout"},
-            )
-            db.commit()
-            return False, None
         except CoverLetterValidationError:
             # Validation failures are handled by the vacancy-local bounded
             # cover-letter retry path below. They are not provider outages.
             raise
-        except ModelUnavailable as exc:
+        except (ModelTimeout, ModelUnavailable) as exc:
             search_metrics.record("model", {
                 "stage": stage, "seconds": perf_counter() - started,
-                "outcome": "unavailable",
+                "outcome": "logical_timeout" if isinstance(exc, ModelTimeout) else "unavailable",
             })
             attempts = _stage_retry_attempt(vacancy, stage)
             if attempts >= _MODEL_STAGE_RETRY_LIMIT:
-                _record_vacancy_error(
-                    item, vacancy, "VACANCY_PROCESSING_FAILED",
-                    f"Исчерпаны повторы временной ошибки этапа {stage}",
-                )
+                if vacancy.state == "PARTIAL":
+                    _record_partial_application_error(
+                        item, vacancy, "VACANCY_PROCESSING_FAILED",
+                        (
+                            "Не удалось проверить факты сохранённого письма после ограниченных повторов модели"
+                            if stage == "letter" else
+                            "Не удалось заново подтвердить критерии вакансии после ограниченных повторов модели"
+                        ),
+                    )
+                    data = dict(vacancy.data or {})
+                    data["partial_recovery_blocked"] = True
+                    data.pop("model_retry_stage", None)
+                    data.pop("model_retry_at", None)
+                    vacancy.data = data
+                else:
+                    _record_vacancy_error(
+                        item, vacancy, "VACANCY_PROCESSING_FAILED",
+                        f"Исчерпаны повторы временной ошибки этапа {stage}",
+                    )
                 self.emit(
-                    db, item.id, "vacancy_error",
-                    "Вакансия пропущена: исчерпаны повторы временной ошибки модели",
-                    {"vacancy_id": vacancy.id, "stage": stage, "attempts": attempts},
+                    db, item.id,
+                    "application_partial" if vacancy.state == "PARTIAL" else "vacancy_error",
+                    (
+                        (
+                            "Резюме принято, но проверка сохранённого письма отложена без отправки"
+                            if stage == "letter" else
+                            "Резюме принято, но обязательные критерии вакансии не удалось перепроверить без отправки письма"
+                        ) if vacancy.state == "PARTIAL" else
+                        "Вакансия пропущена: исчерпаны повторы временной ошибки модели"
+                    ),
+                    {"vacancy_id": vacancy.id, "stage": stage, "attempts": attempts,
+                     **({"reason_code": "partial_recovery_blocked"}
+                        if vacancy.state == "PARTIAL" else {})},
                 )
                 db.commit()
                 return False, None
@@ -1284,7 +1674,9 @@ class WorkflowManager:
         with SessionLocal() as db:
             rows = list(db.scalars(select(Vacancy).where(
                 Vacancy.session_id == session_id,
-                Vacancy.state.in_(("EXTRACTED", "EVALUATING", "READY_TO_SUBMIT")),
+                Vacancy.state.in_(
+                    ("EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "PARTIAL")
+                ),
             )))
             deadlines = []
             for vacancy in rows:
@@ -1345,10 +1737,29 @@ class WorkflowManager:
                 Vacancy.session_id == session_id,
                 Vacancy.state.in_((
                     "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT",
-                    "READY_TO_REPORT", "SUBMITTING",
+                    "READY_TO_REPORT", "SUBMITTING", "PARTIAL",
                 )),
             )))
-            unfinished.sort(key=lambda vacancy: (vacancy.state != "SUBMITTING", vacancy.id))
+            unfinished = [
+                vacancy for vacancy in unfinished
+                if not (
+                    vacancy.state == "PARTIAL"
+                    and isinstance(vacancy.data, dict)
+                    and vacancy.data.get("partial_recovery_blocked")
+                )
+            ]
+            legacy_partial_errors = list(db.scalars(select(Vacancy).where(
+                Vacancy.session_id == session_id,
+                Vacancy.state == "ERROR",
+            )))
+            unfinished.extend(
+                vacancy for vacancy in legacy_partial_errors
+                if isinstance(vacancy.data, dict)
+                and isinstance(vacancy.data.get("submission_progress"), dict)
+                and vacancy.data["submission_progress"].get("cv_confirmed")
+                and vacancy.data["submission_progress"].get("cover_letter_pending")
+            )
+            unfinished.sort(key=lambda vacancy: (vacancy.state not in {"SUBMITTING", "PARTIAL"}, vacancy.id))
             started_refs: list[JobRef] = []
             started_ids: set[str] = set()
             for vacancy in unfinished:
@@ -1392,16 +1803,6 @@ class WorkflowManager:
             "SUBMISSION_UNCONFIRMED",
             "Не удалось подтвердить отправку отклика после нескольких попыток",
         )
-        existing = db.scalar(select(Application).where(Application.vacancy_id == vacancy.id))
-        if existing is None:
-            db.add(
-                Application(
-                    vacancy_id=vacancy.id,
-                    status="unknown",
-                )
-            )
-        elif existing.status != "unknown":
-            existing.status = "unknown"
         self.emit(
             db, item.id, "submission", message,
             {"vacancy_id": vacancy.id, "status": "unknown"},
@@ -1450,12 +1851,19 @@ class WorkflowManager:
             return False
         vacancy.state = transport_status.upper()
         existing = db.scalar(select(Application).where(Application.vacancy_id == vacancy.id))
-        if existing is None:
+        if existing is None and submission.status in {"submitted", "already_applied"}:
             db.add(Application(vacancy_id=vacancy.id,
                                status=submission.status,
                                submitted_at=datetime.now(timezone.utc) if submission.status == "submitted" else None))
             if submission.status in {"submitted", "already_applied"}:
                 _increment_counter(db, item, submission.status)
+        if submission.status in {"submitted", "already_applied"}:
+            data = dict(vacancy.data or {})
+            if data.pop("partial_counted", False):
+                counters = dict(item.counters or {})
+                counters["partial"] = max(0, int(counters.get("partial", 0)) - 1)
+                item.counters = counters
+                vacancy.data = data
         # The outcome and its counter are one transaction, including crash recovery.
         self.emit(db, item.id, "submission", submission.message,
                   {"vacancy_id": vacancy.id, "status": submission.status})
@@ -1484,6 +1892,7 @@ class WorkflowManager:
                 "submitted": 0,
                 "reported": 0,
                 "already_applied": 0,
+                "partial": 0,
                 "errors": 0,
             }
             if not first_start:
@@ -1498,7 +1907,21 @@ class WorkflowManager:
             self.emit(db, session_id, "session", "Сессия запущена")
             if item.adapter_id == "hirehi":
                 raw_adapter = adapter_registry.get(item.adapter_id)
-            if not _hirehi_adaptive(item, raw_adapter) and _limit_reached(_application_count(item, item.adapter_id), item.application_limit):
+            pending_external_rows = list(db.scalars(select(Vacancy).where(
+                Vacancy.session_id == session_id,
+                Vacancy.state.in_(("SUBMITTING", "PARTIAL")),
+            )))
+            pending_external_progress = next((
+                vacancy.id for vacancy in pending_external_rows
+                if not (
+                    vacancy.state == "PARTIAL"
+                    and isinstance(vacancy.data, dict)
+                    and vacancy.data.get("partial_recovery_blocked")
+                )
+            ), None)
+            if (not _hirehi_adaptive(item, raw_adapter)
+                    and _limit_reached(_application_count(item, item.adapter_id), item.application_limit)
+                    and pending_external_progress is None):
                 self.finalize(session_id, _application_limit_reason(item.adapter_id))
                 return
 
@@ -1540,10 +1963,16 @@ class WorkflowManager:
                 preference_description = _redact_private_string(
                     preference_description, private_context
                 )
+            if isinstance(stored_policy, dict):
+                try:
+                    stored_contract_version = int(stored_policy.get("contract_version", 1))
+                except (TypeError, ValueError):
+                    stored_contract_version = 1
+                if stored_contract_version < POLICY_CONTRACT_VERSION:
+                    stored_policy = None
             preference_policy = (
                 DesiredJobPolicy.model_validate(stored_policy)
-                if preference_description and stored_policy
-                else None
+                if preference_description and stored_policy else None
             )
             adaptive_hirehi = _hirehi_adaptive(item, raw_adapter)
             if not adaptive_hirehi:
@@ -1582,7 +2011,7 @@ class WorkflowManager:
                 db.commit()
         adaptive_engine = None
         hh_engine = None
-        if adapter_id == "hh":
+        if adapter_id in {"hh", "zarplata"}:
             hh_engine = AdaptiveSearch(adapter.adapter, gateway, selected_resumes, preference_policy)
             adapter = RecoveryAdapter(hh_engine)
         elif adaptive_hirehi:
@@ -1618,7 +2047,7 @@ class WorkflowManager:
                     {"years": experience_years, "grades": hirehi_grade_values},
                 )
                 event_db.commit()
-        elif adapter_id == "hh":
+        elif adapter_id in {"hh", "zarplata"}:
             portfolio_queries = await plan_portfolio(gateway, selected_resumes, preference_policy)
             search_filters = {"portfolio_queries": portfolio_queries}
         else:
@@ -1642,21 +2071,57 @@ class WorkflowManager:
             try:
                 await _await_if_needed(restore_cursor(saved_cursor))
             except (ValueError, TypeError, KeyError) as exc:
-                if not adaptive_hirehi:
+                if adapter_id in {"hh", "zarplata"}:
+                    # These adapters historically stored only their own page
+                    # cursor and exact-ID set. Carry the durable dedup set into
+                    # a fresh generic scheduler, then replace the old shape
+                    # with an AdaptiveSearch checkpoint on the next save.
+                    hh_engine.seen.update(_legacy_search_seen_ids(saved_cursor))
+                    saved_cursor = None
+                    with SessionLocal() as db:
+                        item = db.get(JobSession, session_id)
+                        recovery = dict(item.recovery or {})
+                        recovery.pop("search_checkpoint", None)
+                        item.recovery = recovery
+                        self.emit(
+                            db, session_id, "checkpoint_migrated",
+                            f"Старый checkpoint поиска {getattr(raw_adapter, 'display_name', adapter_id)} безопасно преобразован",
+                            {"kind": "legacy_exact_ids_preserved", "adapter_id": adapter_id},
+                        )
+                        db.commit()
+                elif not adaptive_hirehi:
                     raise
-                with SessionLocal() as db:
-                    item = db.get(JobSession, session_id)
-                    recovery = dict(item.recovery or {})
-                    recovery.pop("search_checkpoint", None)
-                    item.recovery = recovery
-                    self.emit(
-                        db, session_id, "checkpoint_discarded",
-                        "Адаптивный checkpoint не прошёл проверку; начинаем безопасный сбор заново",
-                        {"kind": "invalid_adaptive_checkpoint", "error_type": type(exc).__name__},
-                    )
-                    db.commit()
-                saved_cursor = None
-            else:
+                else:
+                    with SessionLocal() as db:
+                        item = db.get(JobSession, session_id)
+                        recovery = dict(item.recovery or {})
+                        recovery.pop("search_checkpoint", None)
+                        item.recovery = recovery
+                        self.emit(
+                            db, session_id, "checkpoint_discarded",
+                            "Адаптивный checkpoint не прошёл проверку; начинаем безопасный сбор заново",
+                            {"kind": "invalid_adaptive_checkpoint", "error_type": type(exc).__name__},
+                        )
+                        db.commit()
+                    saved_cursor = None
+            if adapter_id in {"hh", "zarplata"} and saved_cursor is not None:
+                # Older site-specific cursors do not carry the scheduler
+                # contract. Preserve only exact IDs and reset site pagination.
+                if not isinstance(saved_cursor, dict) or saved_cursor.get("algorithm") != "adaptive_v1":
+                    hh_engine.seen.update(_legacy_search_seen_ids(saved_cursor))
+                    with SessionLocal() as db:
+                        item = db.get(JobSession, session_id)
+                        recovery = dict(item.recovery or {})
+                        recovery.pop("search_checkpoint", None)
+                        item.recovery = recovery
+                        self.emit(
+                            db, session_id, "checkpoint_migrated",
+                            f"Старый checkpoint поиска {getattr(raw_adapter, 'display_name', adapter_id)} безопасно преобразован",
+                            {"kind": "legacy_exact_ids_preserved", "adapter_id": adapter_id},
+                        )
+                        db.commit()
+                    saved_cursor = None
+            elif saved_cursor is not None:
                 restored_from_checkpoint = True
 
         await adapter.open_search(executor.page, search_filters)
@@ -1711,8 +2176,50 @@ class WorkflowManager:
         # ref: overflow remains durable and must become eligible after the
         # current window reaches terminal vacancy states.
         seen_ref_ids: set[str] = set()
+        historical_overlap_ids: set[str] = set()
+        historical_overlap_raw_count = 0
+
+        def remember_historical_overlaps(candidates: list[JobRef]) -> None:
+            nonlocal historical_overlap_raw_count
+            candidate_ids = {candidate.external_id for candidate in candidates if candidate.external_id}
+            if not candidate_ids:
+                return
+            found: set[str] = set()
+            with SessionLocal() as db:
+                ordered_ids = sorted(candidate_ids)
+                for offset in range(0, len(ordered_ids), 500):
+                    chunk = ordered_ids[offset:offset + 500]
+                    found.update(db.scalars(select(Vacancy.external_id).where(
+                        Vacancy.source == adapter.site_id,
+                        Vacancy.external_id.in_(chunk),
+                        or_(Vacancy.session_id != session_id, Vacancy.session_id.is_(None)),
+                    )))
+            if found:
+                historical_overlap_ids.update(found)
+                historical_overlap_raw_count += sum(
+                    1 for candidate in candidates if candidate.external_id in found
+                )
+
+        def flush_historical_overlaps() -> None:
+            nonlocal historical_overlap_raw_count
+            if not historical_overlap_ids:
+                return
+            overlap_ids = sorted(historical_overlap_ids)
+            historical_overlap_ids.clear()
+            search_metrics.record(
+                "overlap", {"ids": overlap_ids, "raw_count": historical_overlap_raw_count}
+            )
+            historical_overlap_raw_count = 0
+            with SessionLocal() as metric_db:
+                search_metrics.flush(metric_db, session_id)
+                metric_db.commit()
+
+        discovered_refs = list(refs)
         if not refs and collect_more is not None and saved_cursor is None:
-            refs.extend(await collect_more(executor.page))
+            initial_more = await collect_more(executor.page)
+            refs.extend(initial_more)
+            discovered_refs.extend(initial_more)
+        remember_historical_overlaps(discovered_refs)
         refs = self._save_refs(session_id, refs, adapter)
         if adaptive_engine is not None:
             with SessionLocal() as db:
@@ -1766,12 +2273,13 @@ class WorkflowManager:
                 await asyncio.sleep(min(0.25, remaining))
 
         async def wait_hh_refresh() -> bool:
-            """Keep an exhausted HH session running until its durable refresh is due."""
+            """Keep an exhausted adaptive search running until refresh is due."""
             delay = max(0.1, float(hh_engine.next_retry_delay()))
+            source_name = getattr(raw_adapter, "display_name", adapter_id)
             if hh_engine.search_exhausted:
-                message = f"Все текущие источники HH проверены. Поиск обновится автоматически через {int(delay + 0.999)} с."
+                message = f"Все текущие источники {source_name} проверены. Поиск обновится автоматически через {int(delay + 0.999)} с."
             else:
-                message = f"Источник HH временно недоступен. Повторная проверка через {int(delay + 0.999)} с."
+                message = f"Источник {source_name} временно недоступен. Повторная проверка через {int(delay + 0.999)} с."
             with SessionLocal() as db:
                 current = db.get(JobSession, session_id)
                 if not current:
@@ -1807,9 +2315,11 @@ class WorkflowManager:
             with SessionLocal() as db:
                 current = db.get(JobSession, session_id)
                 message = (current.recovery or {}).get("message") if current else None
-                if current and isinstance(message, str) and message.startswith((
-                    "Все текущие источники HH проверены.", "Источник HH временно недоступен."
-                )):
+                is_adaptive_wait = isinstance(message, str) and (
+                    " проверены. Поиск обновится автоматически через " in message
+                    or " временно недоступен. Повторная проверка через " in message
+                )
+                if current and is_adaptive_wait:
                     recovery = dict(current.recovery)
                     recovery["message"] = None
                     current.recovery = recovery
@@ -1872,6 +2382,7 @@ class WorkflowManager:
                     # pages still advance the HH source cursor and may lead
                     # to another source or a paced whole-epoch refresh.
                     next_refs = await collect_more(executor.page)
+                    remember_historical_overlaps(next_refs)
                     accepted_refs = self._save_refs(session_id, next_refs, adapter)
                     new_refs = [candidate for candidate in accepted_refs
                                 if candidate.external_id not in seen_ref_ids]
@@ -1899,6 +2410,7 @@ class WorkflowManager:
                         collect_more = None
                         return False
                     next_refs = await collect_more(executor.page)
+                    remember_historical_overlaps(next_refs)
                     mark_adaptive_source_unavailable()
                     accepted_refs = self._save_refs(session_id, next_refs, adapter)
                     new_refs = [
@@ -1915,6 +2427,7 @@ class WorkflowManager:
             # ``enqueue`` is the capacity gate. If ten items remain active,
             # this call is skipped on the next pass until evaluation drains.
             next_refs = await collect_more(executor.page)
+            remember_historical_overlaps(next_refs)
             mark_adaptive_source_unavailable()
             accepted_refs = self._save_refs(session_id, next_refs, adapter)
             while not next_refs and not getattr(adapter, "search_exhausted", True):
@@ -1936,6 +2449,7 @@ class WorkflowManager:
             return False
 
         hh_prefetched: dict[str, tuple[Any, asyncio.Task]] = {}
+        hh_description_errors: dict[str, JobDescriptionUnavailable] = {}
         browser_ref_external_id: str | None = None
         if adapter_id == "hh" and refs:
             # Keep browser access strictly serial while overlapping model
@@ -1959,13 +2473,26 @@ class WorkflowManager:
                     # path below; a prefetch must never bypass duplicate fences.
                     if existing is not None:
                         continue
+                    if _historical_submission_guard(
+                        db, adapter.site_id, candidate.external_id, session_id,
+                    ) is not None:
+                        # The main workflow loop will materialize a current-
+                        # session row and reconcile compatible saved progress.
+                        continue
                 try:
                     await adapter.open_job(executor.page, candidate)
                     browser_ref_external_id = candidate.external_id
                     if await adapter.detect_blockers(executor.page):
                         break
-                    source_posting = await adapter.extract_job(executor.page)
+                    source_posting = await self._extract_job_with_description_retries(
+                        session_id, adapter, executor.page, candidate
+                    )
+                    if source_posting is None:
+                        continue
                     posting = sanitize_untrusted_input(source_posting, context="vacancy")
+                except JobDescriptionUnavailable as exc:
+                    hh_description_errors[candidate.external_id] = exc
+                    continue
                 except (CaptchaRequired, PromptInjectionDetected):
                     raise
                 except Exception:
@@ -2038,6 +2565,7 @@ class WorkflowManager:
         deferred_model_work = False
         while True:
             if ref_index >= len(refs):
+                flush_historical_overlaps()
                 if deferred_model_work:
                     deferred_model_work = False
                     if not await self._wait_for_model_retry(session_id):
@@ -2066,23 +2594,146 @@ class WorkflowManager:
             with SessionLocal() as db:
                 item = db.get(JobSession, session_id)
                 application_limit = item.application_limit
-                if not adaptive_hirehi and _limit_reached(_application_count(item, adapter_id), application_limit):
-                    completion_reason = _application_limit_reason(adapter_id)
-                    break
                 existing = db.scalar(select(Vacancy).where(
                     *_vacancy_scope(adapter_id, adapter.site_id, ref.external_id, session_id)
                 ))
-                skip_existing = bool(existing and (existing.session_id != session_id or existing.state not in {
-                    "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING",
-                }))
+                if existing is not None and existing.state == "ERROR":
+                    legacy_progress = (existing.data or {}).get("submission_progress", {})
+                    if (adapter_id in {"hh", "zarplata"}
+                            and isinstance(legacy_progress, dict)
+                            and legacy_progress.get("cv_confirmed")
+                            and legacy_progress.get("cover_letter_pending")):
+                        _persist_submission_progress(item, existing, legacy_progress)
+                        db.commit()
+                historical_guard = (
+                    _historical_submission_guard(db, adapter.site_id, ref.external_id, session_id)
+                    if existing is None else None
+                )
+                historical_plan_data = (
+                    _historical_recovery_artifacts(db, historical_guard, item, resume_content_hash)
+                    if historical_guard is not None else None
+                )
+                if (not adaptive_hirehi
+                        and _limit_reached(_application_count(item, adapter_id), application_limit)
+                        and not (existing and existing.state in {"SUBMITTING", "PARTIAL"})
+                        and historical_plan_data is None):
+                    completion_reason = _application_limit_reason(adapter_id)
+                    break
+                if historical_guard is not None:
+                    history_resolution = resolve_external_history(db, historical_guard)
+                    history_outcome = (
+                        "unconfirmed" if history_resolution.invalid_history
+                        else history_resolution.outcome
+                    )
+                    observer = getattr(adapter, "observe_overlap", None)
+                    if observer:
+                        observer(ref.external_id)
+                    recovered_plan_data = historical_plan_data
+                    old_data = dict(historical_guard.data or {})
+                    old_progress = old_data.get("submission_progress", {})
+                    resumable_partial = (
+                        recovered_plan_data is not None
+                        and isinstance(old_progress, dict)
+                        and old_progress.get("cv_confirmed")
+                        and old_progress.get("cover_letter_pending")
+                    )
+                    recovery_state = (
+                        "PARTIAL" if resumable_partial else "SUBMITTING"
+                    )
+                    if recovered_plan_data is not None:
+                        recovery_data = {
+                            **old_data,
+                            "historical_source_vacancy_id": historical_guard.id,
+                        }
+                        # Proofs are local to the source row; a cross-session
+                        # continuation must validate its copied letter again.
+                        recovery_data.pop(_LETTER_CLAIMS_PROOF_KEY, None)
+                        # Accounting belongs to a session-owned Vacancy.
+                        # Stage facts migrate, while prior counter guards do not.
+                        recovery_data.pop("partial_counted", None)
+                        recovery_data.pop("partial_error_counted", None)
+                        recovery_state = "PARTIAL" if resumable_partial else "SUBMITTING"
+                    else:
+                        old_progress = old_progress if isinstance(old_progress, dict) else {}
+                        known_partial = history_outcome == "partial" or bool(
+                            old_progress.get("cv_confirmed")
+                            and old_progress.get("cover_letter_pending")
+                        )
+                        recovery_data = {
+                            "cross_session_suppressed": True,
+                            "historical_vacancy_id": historical_guard.id,
+                            "historical_state": historical_guard.state,
+                        }
+                        if known_partial:
+                            recovery_data.update({
+                                "submission_progress": {
+                                    "cv_confirmed": True,
+                                    "cover_letter_pending": True,
+                                    "cover_letter_confirmed": False,
+                                    **({"cover_letter_diagnostic": old_progress["cover_letter_diagnostic"]}
+                                       if isinstance(old_progress.get("cover_letter_diagnostic"), dict)
+                                       else {}),
+                                },
+                                "partial_recovery_blocked": True,
+                                "partial_letter_attempts": _PARTIAL_LETTER_RETRY_LIMIT,
+                            })
+                            recovery_state = "PARTIAL"
+                        elif history_outcome == "unconfirmed":
+                            recovery_data.update({
+                                "error_code": "SUBMISSION_UNCONFIRMED",
+                                "error_message": "Предыдущую отправку нельзя безопасно проверить в текущей сессии",
+                            })
+                            recovery_state = "SUBMISSION_UNCONFIRMED"
+                        else:
+                            recovery_state = "ALREADY_APPLIED"
+                    existing = Vacancy(
+                        session_id=session_id,
+                        source=adapter.site_id,
+                        external_id=ref.external_id,
+                        url=ref.url,
+                        title=historical_guard.title or ref.external_id,
+                        company=historical_guard.company,
+                        state=recovery_state,
+                        data=recovery_data,
+                    )
+                    db.add(existing)
+                    db.flush()
+                    if recovered_plan_data is not None:
+                        recovered_plan_data["vacancy_id"] = existing.id
+                        db.add(ApplicationPlanRecord(vacancy_id=existing.id, data=recovered_plan_data))
+                    if resumable_partial or recovery_data.get("partial_recovery_blocked"):
+                        _persist_submission_progress(item, existing, old_progress)
+                    db.commit()
+                    db.refresh(existing)
+                    if recovered_plan_data is not None:
+                        self.emit(
+                            db, session_id,
+                            "application_partial" if resumable_partial else "submission_reconciliation",
+                            "Восстанавливаем незавершённый отклик из исходной сессии после сверки резюме",
+                            {"external_id": ref.external_id, "source": adapter.site_id,
+                             "vacancy_id": existing.id,
+                             "historical_vacancy_id": historical_guard.id},
+                        )
+                    else:
+                        self.emit(
+                            db, session_id, "duplicate",
+                            "Вакансия пропущена: для неё уже сохранена отправка или незавершённый отклик",
+                            {"external_id": ref.external_id, "source": adapter.site_id,
+                             "vacancy_id": existing.id},
+                        )
+                skip_existing = bool(existing and (
+                    existing.state not in {
+                        "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT",
+                        "SUBMITTING", "PARTIAL",
+                    }
+                    or (existing.state == "PARTIAL"
+                        and (existing.data or {}).get("partial_recovery_blocked"))
+                ))
                 existing_vacancy_id = existing.id if skip_existing else None
                 if skip_existing and existing.session_id != session_id:
                     observer = getattr(adapter, "observe_overlap", None)
                     if observer:
                         observer(ref.external_id)
-                    search_metrics.record("overlap", {"external_id": ref.external_id})
-                    search_metrics.flush(db, session_id)
-                    db.commit()
             if skip_existing:
                 # The durable queue belongs to this session even when the
                 # vacancy record belongs to an older session. Mark only the
@@ -2105,14 +2756,18 @@ class WorkflowManager:
                         *_vacancy_scope(adapter_id, adapter.site_id, ref.external_id, session_id)
                     ))
                     if saved_vacancy and saved_vacancy.state in {
-                        "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT",
+                        "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "PARTIAL",
                     } and isinstance(saved_vacancy.data, dict):
-                        saved_posting_data = dict(saved_vacancy.data)
+                        saved_description = saved_vacancy.data.get("description")
+                        if isinstance(saved_description, str) and saved_description.strip():
+                            saved_posting_data = dict(saved_vacancy.data)
             try:
                 processing_started = perf_counter()
                 self._advance_pipeline(
                     session_id, adapter.site_id, ref.external_id, "extraction"
                 )
+                if ref.external_id in hh_description_errors:
+                    raise hh_description_errors.pop(ref.external_id)
                 if prefetched is not None:
                     source_posting = prefetched[0]
                     posting = sanitize_untrusted_input(source_posting, context="vacancy")
@@ -2173,7 +2828,11 @@ class WorkflowManager:
                                 self.emit(db, session_id, "human_required", blocker.message)
                                 return
                         continue
-                    source_posting = await adapter.extract_job(executor.page)
+                    source_posting = await self._extract_job_with_description_retries(
+                        session_id, adapter, executor.page, ref
+                    )
+                    if source_posting is None:
+                        continue
                     # Keep the adapter's original posting for the UI/audit trail,
                     # while every evaluator and model path receives a sanitized
                     # working copy. IDs and URLs are preserved by the sanitizer.
@@ -2186,6 +2845,91 @@ class WorkflowManager:
                     posting_was_sanitized = original_payload != working_payload
             except CaptchaRequired:
                 raise
+            except JobDescriptionUnavailable as exc:
+                if not await self._wait_if_paused(session_id):
+                    break
+                vacancy_id = None
+                with SessionLocal() as db:
+                    if cancellation_fence(db, session_id, self.generation):
+                        raise asyncio.CancelledError from None
+                    item = db.get(JobSession, session_id)
+                    if item is None:
+                        continue
+                    if item.status != SessionStatus.RUNNING:
+                        continue
+                    reported_title = getattr(exc, "title", None)
+                    reported_title = reported_title.strip() if isinstance(reported_title, str) else ""
+                    reported_company = getattr(exc, "company", None)
+                    reported_company = (
+                        reported_company.strip()
+                        if isinstance(reported_company, str) and reported_company.strip()
+                        else None
+                    )
+                    vacancy = db.scalar(select(Vacancy).where(
+                        *_vacancy_scope(adapter_id, adapter.site_id, ref.external_id, session_id)
+                    ))
+                    if vacancy is not None and vacancy.session_id != session_id:
+                        vacancy = None
+                    created_vacancy = vacancy is None
+                    if vacancy is None:
+                        vacancy = Vacancy(
+                            session_id=session_id,
+                            source=adapter.site_id,
+                            external_id=ref.external_id,
+                            url=ref.url,
+                            title=reported_title or ref.external_id,
+                            company=reported_company,
+                            data={"description_read_attempts": 3},
+                        )
+                        db.add(vacancy)
+                        db.flush()
+                    else:
+                        vacancy.url = ref.url
+                        vacancy.title = reported_title or vacancy.title or ref.external_id
+                        if reported_company:
+                            vacancy.company = reported_company
+                        data = dict(vacancy.data or {})
+                        data["description_read_attempts"] = 3
+                        vacancy.data = data
+                    _record_vacancy_error(
+                        item,
+                        vacancy,
+                        "VACANCY_DESCRIPTION_UNAVAILABLE",
+                        "Описание вакансии отсутствует или не удалось прочитать после 3 попыток",
+                    )
+                    data = dict(vacancy.data or {})
+                    if created_vacancy:
+                        counters = dict(item.counters or {})
+                        counters["viewed"] = counters.get("viewed", 0) + 1
+                        item.counters = counters
+                    vacancy.data = data
+                    recovery = dict(item.recovery or {})
+                    attempts_by_id = dict(recovery.get("description_read_attempts") or {})
+                    attempts_by_id.pop(ref.external_id, None)
+                    if attempts_by_id:
+                        recovery["description_read_attempts"] = attempts_by_id
+                    else:
+                        recovery.pop("description_read_attempts", None)
+                    item.recovery = recovery
+                    vacancy_id = vacancy.id
+                    self.emit(
+                        db,
+                        session_id,
+                        "vacancy_error",
+                        "Описание вакансии отсутствует или не удалось прочитать после 3 попыток",
+                        {
+                            "vacancy_id": vacancy.id,
+                            "external_id": ref.external_id,
+                            "attempts": 3,
+                            "code": "VACANCY_DESCRIPTION_UNAVAILABLE",
+                        },
+                    )
+                if vacancy_id is not None:
+                    self._advance_pipeline(
+                        session_id, adapter.site_id, ref.external_id, "completed",
+                        vacancy_id=vacancy_id,
+                    )
+                continue
             except PromptInjectionDetected as exc:
                 with SessionLocal() as db:
                     item = db.get(JobSession, session_id)
@@ -2252,6 +2996,7 @@ class WorkflowManager:
                     "READY_TO_SUBMIT",
                     "READY_TO_REPORT",
                     "SUBMITTING",
+                    "PARTIAL",
                 }:
                     self.emit(
                         db,
@@ -2331,25 +3076,112 @@ class WorkflowManager:
                         },
                     )
 
-                if vacancy.state == "SUBMITTING":
+                if vacancy.state == "ERROR":
+                    legacy_progress = (vacancy.data or {}).get("submission_progress", {})
+                    if (adapter_id in {"hh", "zarplata"}
+                            and isinstance(legacy_progress, dict)
+                            and legacy_progress.get("cv_confirmed")
+                            and legacy_progress.get("cover_letter_pending")):
+                        _persist_submission_progress(item, vacancy, legacy_progress)
+                        db.commit()
+
+                if vacancy.state in {"SUBMITTING", "PARTIAL"}:
                     persisted_progress = (vacancy.data or {}).get("submission_progress", {})
                     if (
-                        adapter_id == "hh"
+                        adapter_id in {"hh", "zarplata"}
                         and isinstance(persisted_progress, dict)
                         and persisted_progress.get("cv_confirmed")
                         and persisted_progress.get("cover_letter_pending")
                         and callable(getattr(adapter, "verify_cv_submission", None))
                         and callable(getattr(adapter, "resume_application", None))
                     ):
-                        # HH may have accepted the CV before the letter upload
-                        # was interrupted. Reconcile that fact, then resume
-                        # only the letter step from the saved plan.
+                        is_partial_recovery = vacancy.state == "PARTIAL"
+                        if is_partial_recovery:
+                            data = dict(vacancy.data or {})
+                            try:
+                                attempts = max(0, int(data.get("partial_letter_attempts", 0)))
+                            except (TypeError, ValueError):
+                                attempts = 0
+                            if attempts >= _PARTIAL_LETTER_RETRY_LIMIT:
+                                self.emit(
+                                    db, session_id, "application_partial",
+                                    "Резюме принято, письмо осталось незавершённым; лимит автоматических продолжений исчерпан",
+                                    {"vacancy_id": vacancy.id, "attempts": attempts,
+                                     "reason_code": data.get("error_code")},
+                                )
+                                db.commit()
+                                continue
+                        # These adapters may accept the CV before the separate
+                        # letter step is completed. Reconcile the CV, then
+                        # resume only the letter step from the saved plan.
                         verified_cv = await adapter.verify_cv_submission(executor.page)
                         if verified_cv.status not in {"submitted", "already_applied"}:
                             if verified_cv.status == "blocked" and verified_cv.confirmed:
                                 self._record_submission(db, item, vacancy, verified_cv)
                             else:
-                                retry_needed = True
+                                if is_partial_recovery:
+                                    _record_partial_application_error(
+                                        item, vacancy, "SUBMISSION_UNCONFIRMED",
+                                        "Не удалось подтвердить принятое резюме перед продолжением письма",
+                                    )
+                                else:
+                                    retry_needed = True
+                            db.commit()
+                            continue
+                        persisted_progress = (vacancy.data or {}).get("submission_progress", {})
+                        letter_attempted = (
+                            isinstance(persisted_progress, dict)
+                            and persisted_progress.get("cover_letter_attempted") is True
+                        )
+                        if letter_attempted:
+                            db.refresh(item)
+                            if cancellation_fence(db, session_id, self.generation):
+                                return
+                            reconciler = getattr(adapter, "reconcile_submission_progress", None)
+                            try:
+                                reconciled = (
+                                    await reconciler(executor.page, letter_expected=True)
+                                    if callable(reconciler) else None
+                                )
+                            except (AuthenticationPending, CaptchaRequired):
+                                raise
+                            except Exception:
+                                reconciled = None
+                            db.refresh(item)
+                            if cancellation_fence(db, session_id, self.generation):
+                                return
+                            reconciled = reconciled if isinstance(reconciled, dict) else {}
+                            cv_confirmed = bool(
+                                verified_cv.status in {"submitted", "already_applied"}
+                                or reconciled.get("cv_confirmed")
+                            )
+                            letter_confirmed = bool(
+                                cv_confirmed and reconciled.get("cover_letter_confirmed")
+                            )
+                            reconciled_progress = {
+                                "cv_confirmed": cv_confirmed,
+                                "cover_letter_pending": not letter_confirmed,
+                                "cover_letter_confirmed": letter_confirmed,
+                                "cover_letter_attempted": True,
+                            }
+                            _persist_submission_progress(item, vacancy, reconciled_progress)
+                            if letter_confirmed:
+                                self._record_submission(
+                                    db, item, vacancy,
+                                    SubmissionResult(
+                                        status="submitted",
+                                        message="На сайте подтверждены резюме и сопроводительное письмо",
+                                    ),
+                                )
+                                db.commit()
+                                continue
+                            _record_partial_application_error(
+                                item, vacancy, "SUBMISSION_UNCONFIRMED",
+                                "Результат отправки письма не подтверждён; повторная отправка заблокирована",
+                            )
+                            data = dict(vacancy.data or {})
+                            data["partial_recovery_blocked"] = True
+                            vacancy.data = data
                             db.commit()
                             continue
                         recovered_plan_record = db.scalar(select(ApplicationPlanRecord).where(
@@ -2358,11 +3190,176 @@ class WorkflowManager:
                         if not recovered_plan_record or not _cache_matches_resume(
                             recovered_plan_record.data, resume_content_hash
                         ):
-                            self._record_submission_reconciliation_error(
-                                db, item, vacancy,
-                                message="Не удалось восстановить письмо после подтверждения резюме на HH",
+                            _record_partial_application_error(
+                                item, vacancy, "SUBMISSION_UNCONFIRMED",
+                                "Не удалось восстановить письмо с исходными данными сессии после подтверждения резюме на сайте",
                             )
+                            db.commit()
                             continue
+                        required_recovery_flags = (
+                            [
+                                flag for flag in preference_policy.green_flags
+                                if flag.required and not _required_not_applicable(flag)
+                            ]
+                            if preference_policy is not None
+                            and preference_policy.contract_version >= POLICY_CONTRACT_VERSION
+                            else []
+                        )
+                        if required_recovery_flags:
+                            evaluation_record = db.scalar(
+                                select(Evaluation).where(Evaluation.vacancy_id == vacancy.id)
+                            )
+                            current_fingerprint = _evaluation_fingerprint(
+                                db, resume_content_hash, minimum_scores,
+                                preference_policy, gateway,
+                            )
+                            saved_data = evaluation_record.data if evaluation_record else {}
+                            evaluation_is_compatible = bool(
+                                current_fingerprint
+                                and isinstance(saved_data, dict)
+                                and saved_data.get(_EVALUATION_FINGERPRINT_KEY) == current_fingerprint
+                                and (vacancy.data or {}).get("evaluation_security_version")
+                                == _EVALUATION_SECURITY_VERSION
+                            )
+                            partial_evaluation = None
+                            if evaluation_is_compatible:
+                                try:
+                                    partial_evaluation = JobEvaluation.model_validate(saved_data)
+                                    assert_safe_output(
+                                        partial_evaluation,
+                                        context="partial_recovery_cached_evaluation",
+                                    )
+                                except PromptInjectionDetected as exc:
+                                    _record_security_incident(
+                                        db, item, vacancy, exc,
+                                        context="partial_recovery_evaluation", emit=self.emit,
+                                    )
+                                    data = dict(vacancy.data or {})
+                                    data["partial_recovery_blocked"] = True
+                                    vacancy.data = data
+                                    vacancy.state = "PARTIAL"
+                                    db.commit()
+                                    self._advance_pipeline(
+                                        session_id, adapter.site_id, ref.external_id,
+                                        "completed", vacancy_id=vacancy.id,
+                                    )
+                                    continue
+                                except (TypeError, ValueError):
+                                    # A fingerprint alone cannot make malformed
+                                    # cached evaluation data authoritative.
+                                    partial_evaluation = None
+                                    evaluation_is_compatible = False
+
+                            if not evaluation_is_compatible:
+                                try:
+                                    async def evaluate_partial_recovery(
+                                        current_posting=posting,
+                                        current_gateway=gateway,
+                                        current_scores=minimum_scores,
+                                        current_policy=preference_policy,
+                                    ):
+                                        return await evaluate(
+                                            current_posting, profile, selected_resumes,
+                                            current_gateway, current_scores, current_policy,
+                                        )
+
+                                    succeeded, partial_evaluation = await self._model_stage_call(
+                                        db, item, vacancy, "evaluation",
+                                        evaluate_partial_recovery,
+                                    )
+                                    db.refresh(item)
+                                    if cancellation_fence(db, session_id, self.generation):
+                                        return
+                                    if item.status != SessionStatus.RUNNING:
+                                        return
+                                    db.refresh(vacancy)
+                                    if not succeeded:
+                                        if not (vacancy.data or {}).get("partial_recovery_blocked"):
+                                            deferred_model_work = True
+                                        else:
+                                            self._advance_pipeline(
+                                                session_id, adapter.site_id, ref.external_id,
+                                                "completed", vacancy_id=vacancy.id,
+                                            )
+                                        continue
+                                    assert_safe_output(
+                                        partial_evaluation,
+                                        context="partial_recovery_evaluation",
+                                    )
+                                except PromptInjectionDetected as exc:
+                                    _record_security_incident(
+                                        db, item, vacancy, exc,
+                                        context="partial_recovery_evaluation", emit=self.emit,
+                                    )
+                                    data = dict(vacancy.data or {})
+                                    data["partial_recovery_blocked"] = True
+                                    vacancy.data = data
+                                    vacancy.state = "PARTIAL"
+                                    db.commit()
+                                    self._advance_pipeline(
+                                        session_id, adapter.site_id, ref.external_id,
+                                        "completed", vacancy_id=vacancy.id,
+                                    )
+                                    continue
+                                except ModelPermanentError as exc:
+                                    _record_partial_application_error(
+                                        item, vacancy, "VACANCY_PROCESSING_FAILED",
+                                        f"Не удалось повторно подтвердить обязательные критерии ({type(exc).__name__})",
+                                    )
+                                    data = dict(vacancy.data or {})
+                                    data["partial_recovery_blocked"] = True
+                                    vacancy.data = data
+                                    self.emit(
+                                        db, session_id, "application_partial",
+                                        "Резюме принято, но письмо заблокировано после постоянной ошибки проверки критериев",
+                                        {"vacancy_id": vacancy.id, "stage": "evaluation",
+                                         "reason_code": "partial_recovery_blocked"},
+                                    )
+                                    db.commit()
+                                    self._advance_pipeline(
+                                        session_id, adapter.site_id, ref.external_id,
+                                        "completed", vacancy_id=vacancy.id,
+                                    )
+                                    continue
+
+                                db.refresh(item)
+                                if cancellation_fence(db, session_id, self.generation):
+                                    return
+                                if item.status != SessionStatus.RUNNING:
+                                    return
+                                evaluation_data = partial_evaluation.model_dump()
+                                if current_fingerprint:
+                                    evaluation_data[_EVALUATION_FINGERPRINT_KEY] = current_fingerprint
+                                if evaluation_record is None:
+                                    db.add(Evaluation(vacancy_id=vacancy.id, data=evaluation_data))
+                                else:
+                                    evaluation_record.data = evaluation_data
+                                vacancy.data = {
+                                    **(vacancy.data or {}),
+                                    "evaluation_security_version": _EVALUATION_SECURITY_VERSION,
+                                }
+                                db.commit()
+
+                            if partial_evaluation is None or partial_evaluation.decision != "apply":
+                                _record_partial_application_error(
+                                    item, vacancy, "VACANCY_PROCESSING_FAILED",
+                                    "Новая проверка обязательных критериев не разрешила продолжение письма",
+                                )
+                                data = dict(vacancy.data or {})
+                                data["partial_recovery_blocked"] = True
+                                vacancy.data = data
+                                self.emit(
+                                    db, session_id, "application_partial",
+                                    "Резюме принято, письмо не отправлено: обязательные критерии вакансии не подтверждены",
+                                    {"vacancy_id": vacancy.id, "stage": "evaluation",
+                                     "reason_code": "partial_recovery_blocked"},
+                                )
+                                db.commit()
+                                self._advance_pipeline(
+                                    session_id, adapter.site_id, ref.external_id,
+                                    "completed", vacancy_id=vacancy.id,
+                                )
+                                continue
                         try:
                             recovered_plan = ApplicationPlan.model_validate(recovered_plan_record.data)
                             if private_context:
@@ -2372,6 +3369,44 @@ class WorkflowManager:
                                 [*selected_resumes, private_context] if private_context else selected_resumes,
                                 context="recovered_hh_letter_plan",
                             )
+                            redacted_letter = (
+                                _redact_private_string(recovered_plan.cover_letter, private_context)
+                                if private_context else recovered_plan.cover_letter
+                            )
+                            async def validate_recovered_letter_claims(
+                                current_gateway=gateway,
+                                current_vacancy=vacancy,
+                                current_letter=redacted_letter,
+                                current_resumes=selected_resumes,
+                                current_hash=resume_content_hash,
+                                current_private=private_context,
+                            ):
+                                return await _validate_cached_letter_claims(
+                                    current_gateway, current_vacancy, current_letter,
+                                    current_resumes, current_hash,
+                                    private_view=current_private or None,
+                                )
+
+                            claim_check_succeeded, _ = await self._model_stage_call(
+                                db, item, vacancy, "letter",
+                                validate_recovered_letter_claims,
+                            )
+                            if not claim_check_succeeded:
+                                db.refresh(item)
+                                if item.status != SessionStatus.RUNNING:
+                                    return
+                                deferred_model_work = True
+                                continue
+                            if is_partial_recovery:
+                                attempts += 1
+                                data = dict(vacancy.data or {})
+                                data["partial_letter_attempts"] = attempts
+                                vacancy.data = data
+                                db.commit()
+                            if is_partial_recovery:
+                                db.refresh(item)
+                                if cancellation_fence(db, session_id, self.generation):
+                                    return
                             await adapter.resume_application(
                                 executor.page,
                                 recovered_plan,
@@ -2394,19 +3429,29 @@ class WorkflowManager:
                                 db.commit()
                                 return True
 
+                            def recovered_progress_checkpoint(
+                                progress, current_item=item, current_vacancy=vacancy,
+                            ):
+                                if cancellation_fence(db, session_id, self.generation):
+                                    return False
+                                _persist_submission_progress(current_item, current_vacancy, progress)
+                                db.commit()
+                                return True
+
                             resumed_outcome = await complete_application(
                                 adapter, executor.page, recovered_plan, posting,
                                 profile, selected_resumes, preference_description,
                                 gateway, recovered_checkpoint,
                                 guaranteed_application=item.guaranteed_application,
                                 private_view=private_context or None,
+                                progress_checkpoint=recovered_progress_checkpoint,
                             )
                             if resumed_outcome.stopped:
                                 return
                             if resumed_outcome.error_code:
-                                _record_vacancy_error(
+                                _record_partial_application_error(
                                     item, vacancy, resumed_outcome.error_code,
-                                    resumed_outcome.error_message or "Не удалось продолжить отправку письма на HH",
+                                    resumed_outcome.error_message or "Не удалось продолжить отправку письма на сайте",
                                 )
                                 db.commit()
                                 continue
@@ -2422,23 +3467,32 @@ class WorkflowManager:
                             )
                             db.commit()
                             continue
+                        except CoverLetterValidationError as exc:
+                            _record_partial_application_error(
+                                item, vacancy, "VACANCY_PROCESSING_FAILED",
+                                f"Факты в сохранённом сопроводительном письме не подтверждены резюме: {exc}",
+                            )
+                            data = dict(vacancy.data or {})
+                            data["partial_recovery_blocked"] = True
+                            vacancy.data = data
+                            db.commit()
+                            continue
                         finally:
                             progress_reader = getattr(adapter, "get_submission_progress", None)
                             if callable(progress_reader):
                                 progress = progress_reader()
                                 if isinstance(progress, dict):
-                                    vacancy.data = {
-                                        **(vacancy.data or {}),
-                                        "submission_progress": {
-                                            key: bool(progress.get(key)) for key in (
-                                                "cv_confirmed", "cover_letter_pending",
-                                                "cover_letter_confirmed",
-                                            )
-                                        },
-                                    }
+                                    _persist_submission_progress(item, vacancy, progress)
                                     db.commit()
                         if self._record_submission(db, item, vacancy, submission):
                             retry_needed = True
+                        self.emit(
+                            db, session_id,
+                            "application_partial" if vacancy.state == "PARTIAL" else "submission",
+                            "Продолжение отправки письма обработано",
+                            {"vacancy_id": vacancy.id,
+                             "cover_letter_diagnostic": (vacancy.data or {}).get("cover_letter_diagnostic")},
+                        )
                         db.commit()
                         continue
                     # First reconcile the durable submit attempt against the
@@ -2454,6 +3508,130 @@ class WorkflowManager:
                     if verified.status == "already_applied" and (vacancy.data or {}).get("submission_was_absent"):
                         verified = verified.model_copy(update={"status": "submitted"})
                     if verified.status in {"submitted", "already_applied"}:
+                        if adapter_id in {"hh", "zarplata"} and (vacancy.data or {}).get("submission_was_absent"):
+                            saved_plan_record = db.scalar(select(ApplicationPlanRecord).where(
+                                ApplicationPlanRecord.vacancy_id == vacancy.id
+                            ))
+                            saved_plan_matches = bool(
+                                saved_plan_record
+                                and _cache_matches_resume(saved_plan_record.data, resume_content_hash)
+                            )
+                            saved_plan = None
+                            if saved_plan_matches:
+                                try:
+                                    saved_plan = ApplicationPlan.model_validate(saved_plan_record.data)
+                                except (TypeError, ValueError):
+                                    saved_plan = None
+                            if not saved_plan_matches or saved_plan is None:
+                                progress = dict((vacancy.data or {}).get("submission_progress") or {})
+                                progress.update({
+                                    "cv_confirmed": verified.status == "submitted",
+                                    "cover_letter_pending": True,
+                                    "cover_letter_confirmed": False,
+                                })
+                                _persist_submission_progress(item, vacancy, progress)
+                                _record_partial_application_error(
+                                    item, vacancy, "SUBMISSION_UNCONFIRMED",
+                                    "На сайте подтверждён отклик, но сохранённый план письма отсутствует или не совпадает с текущим резюме; автоматическое продолжение заблокировано",
+                                )
+                                data = dict(vacancy.data or {})
+                                data["partial_recovery_blocked"] = True
+                                vacancy.data = data
+                                db.commit()
+                                continue
+                            expected_letter = bool(
+                                isinstance(saved_plan.cover_letter, str)
+                                and saved_plan.cover_letter.strip()
+                            )
+                            if expected_letter:
+                                progress = (vacancy.data or {}).get("submission_progress", {})
+                                progress = progress if isinstance(progress, dict) else {}
+                                letter_attempted = progress.get("cover_letter_attempted") is True
+                                letter_confirmed = bool(
+                                    progress.get("cv_confirmed")
+                                    and progress.get("cover_letter_confirmed")
+                                )
+                                if not letter_confirmed:
+                                    reconciler = getattr(adapter, "reconcile_submission_progress", None)
+                                    try:
+                                        reconciled = (
+                                            await reconciler(executor.page, letter_expected=True)
+                                            if callable(reconciler) else None
+                                        )
+                                    except AuthenticationPending:
+                                        raise
+                                    except CaptchaRequired:
+                                        raise
+                                    except Exception as exc:
+                                        if type(exc).__name__ in {
+                                            "BrowserClosed", "UnexpectedPage", "TargetClosedError",
+                                        } or (
+                                            type(exc).__module__.startswith("playwright.")
+                                            and "closed" in str(exc).casefold()
+                                        ):
+                                            raise
+                                        reconciled = None
+                                    if letter_attempted:
+                                        db.refresh(item)
+                                    if letter_attempted and cancellation_fence(
+                                        db, session_id, self.generation,
+                                    ):
+                                        _persist_submission_progress(item, vacancy, {
+                                            "cv_confirmed": verified.status == "submitted",
+                                            "cover_letter_pending": True,
+                                            "cover_letter_confirmed": False,
+                                            "cover_letter_attempted": True,
+                                        })
+                                        vacancy.state = "PARTIAL"
+                                        _record_partial_application_error(
+                                            item, vacancy, "SUBMISSION_UNCONFIRMED",
+                                            "Ожидание остановлено до подтверждения результата отправки письма",
+                                        )
+                                        db.commit()
+                                        return
+                                    reconciled = reconciled if isinstance(reconciled, dict) else {}
+                                    cv_confirmed = bool(
+                                        verified.status == "submitted"
+                                        or reconciled.get("cv_confirmed")
+                                    )
+                                    letter_confirmed = bool(
+                                        cv_confirmed and reconciled.get("cover_letter_confirmed")
+                                    )
+                                    normalized_progress = {
+                                        "cv_confirmed": cv_confirmed,
+                                        "cover_letter_pending": not letter_confirmed,
+                                        "cover_letter_confirmed": letter_confirmed,
+                                    }
+                                    if letter_attempted or isinstance(
+                                        reconciled.get("cover_letter_attempted"), bool
+                                    ):
+                                        normalized_progress["cover_letter_attempted"] = (
+                                            letter_attempted
+                                            or reconciled.get("cover_letter_attempted") is True
+                                        )
+                                    _persist_submission_progress(item, vacancy, normalized_progress)
+                                    if not letter_confirmed:
+                                        safe_to_resume_letter = bool(
+                                            cv_confirmed
+                                            and reconciled.get("letter_recovery_safe")
+                                            and not letter_attempted
+                                        )
+                                        vacancy.state = "PARTIAL"
+                                        _record_partial_application_error(
+                                            item, vacancy, "SUBMISSION_UNCONFIRMED",
+                                            (
+                                                "Результат отправки письма не подтверждён; повторная отправка заблокирована"
+                                                if letter_attempted else
+                                                "Сайт подтвердил отклик, но отправка сопроводительного письма не подтверждена"
+                                            ),
+                                        )
+                                        data = dict(vacancy.data or {})
+                                        data["partial_recovery_blocked"] = not safe_to_resume_letter
+                                        vacancy.data = data
+                                        if safe_to_resume_letter:
+                                            refs.insert(ref_index, ref)
+                                        db.commit()
+                                        continue
                         self._record_submission(db, item, vacancy, verified)
                         continue
                     if verified.status == "blocked" and bool(getattr(verified, "confirmed", False)):
@@ -2563,6 +3741,9 @@ class WorkflowManager:
                 evaluation_record = db.scalar(
                     select(Evaluation).where(Evaluation.vacancy_id == vacancy.id)
                 )
+                current_evaluation_fingerprint = _evaluation_fingerprint(
+                    db, resume_content_hash, minimum_scores, preference_policy, gateway,
+                )
                 refresh_cached_evaluation = False
                 semantic_reused = False
                 semantic_reuse_info = None
@@ -2597,7 +3778,9 @@ class WorkflowManager:
                                 self.emit(db, session_id, "semantic_reuse",
                                           "\u041e\u0446\u0435\u043d\u043a\u0430 \u043f\u0435\u0440\u0435\u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u0430 \u0434\u043b\u044f \u0441\u0435\u043c\u0430\u043d\u0442\u0438\u0447\u0435\u0441\u043a\u043e\u0433\u043e \u0434\u0443\u0431\u043b\u0438\u043a\u0430", semantic_reuse_info)
                                 search_metrics.record("semantic_reuse", semantic_reuse_info)
-                if evaluation_record and _cache_matches_resume(evaluation_record.data, resume_content_hash):
+                if (evaluation_record and current_evaluation_fingerprint
+                        and (evaluation_record.data or {}).get(_EVALUATION_FINGERPRINT_KEY)
+                        == current_evaluation_fingerprint):
                     result = JobEvaluation.model_validate(evaluation_record.data)
                     try:
                         # Cached model output is untrusted just like a fresh response.
@@ -2629,9 +3812,8 @@ class WorkflowManager:
                         # after passing the current evaluator path.
                         refresh_cached_evaluation = True
                 elif evaluation_record:
-                    # A row without the current immutable snapshot hash is a
-                    # legacy/foreign artifact. Keep the row for its unique
-                    # vacancy key, but force a fresh model evaluation.
+                    # Legacy and incompatible evaluations lack the complete
+                    # candidate/criteria/contract/model fingerprint.
                     refresh_cached_evaluation = True
                 if (evaluation_record is None and not semantic_reused) or refresh_cached_evaluation:
                     try:
@@ -2704,20 +3886,14 @@ class WorkflowManager:
                             "canonical_external_id": semantic_reuse_info["canonical_external_id"],
                             "semantic_reused": True,
                         })
-                    if resume_content_hash:
-                        evaluation_data[_RESUME_HASH_KEY] = resume_content_hash
+                    if current_evaluation_fingerprint:
+                        evaluation_data[_EVALUATION_FINGERPRINT_KEY] = current_evaluation_fingerprint
                     db.add(Evaluation(vacancy_id=vacancy.id, data=evaluation_data))
                 elif refresh_cached_evaluation:
                     evaluation_record.data = {
                         **result.model_dump(),
-                        **({_RESUME_HASH_KEY: resume_content_hash} if resume_content_hash else {}),
-                    }
-                elif resume_content_hash and _RESUME_HASH_KEY not in (evaluation_record.data or {}):
-                    # This branch is only reachable for an old result that
-                    # was accepted by a legacy caller; never let a snapshot
-                    # session persist an unscoped cache marker.
-                    evaluation_record.data = {
-                        **(evaluation_record.data or {}), _RESUME_HASH_KEY: resume_content_hash
+                        **({_EVALUATION_FINGERPRINT_KEY: current_evaluation_fingerprint}
+                           if current_evaluation_fingerprint else {}),
                     }
                 if evaluation_record is None or refresh_cached_evaluation:
                     vacancy.data = {
@@ -2833,6 +4009,7 @@ class WorkflowManager:
                     if cover_record is not None and not cover_reusable:
                         stale_cover_record = cover_record
                         cover_record = None
+                    fresh_letter_written = False
                     if cover_record and cover_reusable:
                         letter = cover_record.text
                         if private_context:
@@ -2905,6 +4082,7 @@ class WorkflowManager:
                             assert_safe_outgoing_text(
                                 letter, profile, selected_resumes, context="cover_letter"
                             )
+                            fresh_letter_written = True
                         except PromptInjectionDetected as exc:
                             _record_security_incident(
                                 db, item, vacancy, exc, context="cover_letter", emit=self.emit
@@ -2991,8 +4169,54 @@ class WorkflowManager:
                         vacancy.data = {
                             **(vacancy.data or {}), _COVER_LETTER_HASH_KEY: resume_content_hash
                         }
+                    if fresh_letter_written:
+                        vacancy.data = {
+                            **(vacancy.data or {}),
+                            _LETTER_CLAIMS_PROOF_KEY: _letter_claims_proof(
+                                letter, selected_resumes, resume_content_hash
+                            ),
+                        }
                     vacancy.state = "READY_TO_REPORT" if adapter_id == "hirehi" else "READY_TO_SUBMIT"
                 if vacancy.state in {"READY_TO_SUBMIT", "READY_TO_REPORT"}:
+                    redacted_letter = (
+                        _redact_private_string(plan.cover_letter, private_context)
+                        if private_context and plan.cover_letter else plan.cover_letter or ""
+                    )
+                    if redacted_letter:
+                        try:
+                            async def validate_ready_letter_claims(
+                                current_gateway=gateway,
+                                current_vacancy=vacancy,
+                                current_letter=redacted_letter,
+                                current_resumes=selected_resumes,
+                                current_hash=resume_content_hash,
+                                current_private=private_context,
+                            ):
+                                return await _validate_cached_letter_claims(
+                                    current_gateway, current_vacancy, current_letter,
+                                    current_resumes, current_hash,
+                                    private_view=current_private or None,
+                                )
+
+                            claim_check_succeeded, _ = await self._model_stage_call(
+                                db, item, vacancy, "letter",
+                                validate_ready_letter_claims,
+                            )
+                        except CoverLetterValidationError as exc:
+                            _record_vacancy_error(
+                                item, vacancy, "VACANCY_PROCESSING_FAILED",
+                                f"Факты в сохранённом сопроводительном письме не подтверждены резюме: {exc}",
+                            )
+                            self.emit(
+                                db, session_id, "vacancy_error",
+                                "Вакансия пропущена: факты в сопроводительном письме не подтверждены резюме",
+                                {"vacancy_id": vacancy.id, "reason_code": "VACANCY_PROCESSING_FAILED"},
+                            )
+                            db.commit()
+                            continue
+                        if not claim_check_succeeded:
+                            deferred_model_work = True
+                            continue
                     db.commit()
                     next_stage = "reporting" if adapter_id == "hirehi" else "submission"
                     if (
@@ -3062,23 +4286,35 @@ class WorkflowManager:
                             vacancy.data = {
                                 **(vacancy.data or {}),
                                 "submission_was_absent": absent,
-                                # Opening/filling a form is not a submission;
-                                # this flips only immediately before the
-                                # adapter's actual submit operation.
-                                "submission_attempted": False,
+                                # Zarplata's open_application may send a
+                                # one-click CV, so persist its intent before
+                                # the first click. HH opens its form here and
+                                # marks submission immediately before submit.
+                                "submission_attempted": adapter_id == "zarplata",
                             }
-                            # Opening HH's form can itself send a one-click application.
+                            # Opening these sites' forms can itself send a one-click application.
                             vacancy.state = "SUBMITTING"
                             db.commit()
                             db.refresh(item)
                             if cancellation_fence(db, session_id, self.generation) or item.status in {SessionStatus.STOPPING, SessionStatus.STOPPED, SessionStatus.CANCELLED, SessionStatus.PAUSED}:
                                 return
-                            allowed, form = await _guarded_representational_call(
-                                db,
-                                session_id,
-                                self.generation,
-                                lambda: adapter.open_application(executor.page),
-                            )
+                            try:
+                                allowed, form = await _guarded_representational_call(
+                                    db,
+                                    session_id,
+                                    self.generation,
+                                    lambda: adapter.open_application(executor.page),
+                                )
+                            finally:
+                                progress_reader = getattr(adapter, "get_submission_progress", None)
+                                if adapter_id in {"hh", "zarplata"} and callable(progress_reader):
+                                    try:
+                                        progress = progress_reader()
+                                    except Exception:
+                                        progress = None
+                                    if isinstance(progress, dict):
+                                        _persist_submission_progress(item, vacancy, progress)
+                                        db.commit()
                             if not allowed:
                                 return
                             # Keep the live form for adapter binding, while the
@@ -3149,7 +4385,7 @@ class WorkflowManager:
                             )
                             db.commit()
                             continue
-                        if adapter_id == "hh":
+                        if adapter_id in {"hh", "zarplata"}:
                             def checkpoint(current_plan, item=item, plan_record=plan_record):
                                 db.refresh(item)
                                 if cancellation_fence(db, session_id, self.generation) or item.status in {
@@ -3166,6 +4402,21 @@ class WorkflowManager:
                                 if resume_content_hash:
                                     plan_data[_RESUME_HASH_KEY] = resume_content_hash
                                 plan_record.data = plan_data
+                                db.commit()
+                                return True
+
+                            def progress_checkpoint(
+                                progress, current_item=item, current_vacancy=vacancy,
+                            ):
+                                db.refresh(current_item)
+                                if cancellation_fence(db, session_id, self.generation) or current_item.status in {
+                                    SessionStatus.STOPPING,
+                                    SessionStatus.STOPPED,
+                                    SessionStatus.CANCELLED,
+                                    SessionStatus.PAUSED,
+                                }:
+                                    return False
+                                _persist_submission_progress(current_item, current_vacancy, progress)
                                 db.commit()
                                 return True
 
@@ -3191,27 +4442,89 @@ class WorkflowManager:
                                         current_resumes, current_preference, current_gateway, current_checkpoint,
                                         guaranteed_application=guaranteed,
                                         private_view=private or None,
+                                        progress_checkpoint=progress_checkpoint,
                                     ),
                                 )
                             finally:
                                 progress_reader = getattr(adapter, "get_submission_progress", None)
-                                if adapter_id == "hh" and callable(progress_reader):
+                                if adapter_id in {"hh", "zarplata"} and callable(progress_reader):
                                     progress = progress_reader()
                                     if isinstance(progress, dict):
-                                        vacancy.data = {
-                                            **(vacancy.data or {}),
-                                            "submission_progress": {
-                                                key: bool(progress.get(key)) for key in (
-                                                    "cv_confirmed", "cover_letter_pending",
-                                                    "cover_letter_confirmed",
-                                                )
-                                            },
-                                        }
+                                        _persist_submission_progress(item, vacancy, progress)
                                         db.commit()
                             if not allowed:
                                 return
                             if outcome.stopped:
                                 return
+                            async def reconcile_attempted_letter_result(
+                                current_item=item,
+                                current_vacancy=vacancy,
+                                current_adapter=adapter,
+                                current_page=executor.page,
+                                current_session_id=session_id,
+                            ):
+                                progress = (current_vacancy.data or {}).get("submission_progress", {})
+                                if not (
+                                    isinstance(progress, dict)
+                                    and progress.get("cv_confirmed")
+                                    and progress.get("cover_letter_pending")
+                                    and progress.get("cover_letter_attempted") is True
+                                ):
+                                    return False, None
+                                if cancellation_fence(db, current_session_id, self.generation):
+                                    return True, None
+                                reconciler = getattr(current_adapter, "reconcile_submission_progress", None)
+                                try:
+                                    reconciled = (
+                                        await reconciler(current_page, letter_expected=True)
+                                        if callable(reconciler) else None
+                                    )
+                                except (AuthenticationPending, CaptchaRequired):
+                                    raise
+                                except Exception:
+                                    reconciled = None
+                                db.refresh(current_item)
+                                if cancellation_fence(db, current_session_id, self.generation):
+                                    return True, None
+                                reconciled = reconciled if isinstance(reconciled, dict) else {}
+                                cv_confirmed = bool(
+                                    progress.get("cv_confirmed") or reconciled.get("cv_confirmed")
+                                )
+                                letter_confirmed = bool(
+                                    cv_confirmed and reconciled.get("cover_letter_confirmed")
+                                )
+                                _persist_submission_progress(current_item, current_vacancy, {
+                                    "cv_confirmed": cv_confirmed,
+                                    "cover_letter_pending": not letter_confirmed,
+                                    "cover_letter_confirmed": letter_confirmed,
+                                    "cover_letter_attempted": True,
+                                })
+                                if letter_confirmed:
+                                    return True, SubmissionResult(
+                                        status="submitted",
+                                        message="На сайте подтверждены резюме и сопроводительное письмо",
+                                    )
+                                _record_partial_application_error(
+                                    current_item, current_vacancy, "SUBMISSION_UNCONFIRMED",
+                                    "Результат отправки письма не подтверждён; повторная отправка заблокирована",
+                                )
+                                data = dict(current_vacancy.data or {})
+                                data["partial_recovery_blocked"] = True
+                                current_vacancy.data = data
+                                return True, None
+
+                            attempted_letter_handled, reconciled_submission = (
+                                await reconcile_attempted_letter_result()
+                            )
+                            if attempted_letter_handled:
+                                if reconciled_submission is not None:
+                                    self._record_submission(
+                                        db, item, vacancy, reconciled_submission,
+                                    )
+                                db.commit()
+                                if cancellation_fence(db, session_id, self.generation):
+                                    return
+                                continue
                             if outcome.error_code:
                                 if outcome.unanswered_questions:
                                     vacancy.data = {
@@ -3219,12 +4532,22 @@ class WorkflowManager:
                                         "application_error_reasons": outcome.unanswered_questions,
                                         "application_unanswered_questions": outcome.unanswered_questions,
                                     }
-                                _record_vacancy_error(
-                                    item,
-                                    vacancy,
-                                    outcome.error_code,
-                                    outcome.error_message or "Не удалось обработать форму отклика",
+                                progress = (vacancy.data or {}).get("submission_progress", {})
+                                is_partial = (
+                                    isinstance(progress, dict)
+                                    and progress.get("cv_confirmed")
+                                    and progress.get("cover_letter_pending")
                                 )
+                                if is_partial:
+                                    _record_partial_application_error(
+                                        item, vacancy, outcome.error_code,
+                                        outcome.error_message or "Не удалось обработать форму отклика",
+                                    )
+                                else:
+                                    _record_vacancy_error(
+                                        item, vacancy, outcome.error_code,
+                                        outcome.error_message or "Не удалось обработать форму отклика",
+                                    )
                                 self.emit(
                                     db,
                                     session_id,
@@ -3236,6 +4559,7 @@ class WorkflowManager:
                                         "reason_count": len(outcome.unanswered_questions),
                                         "automatic": True,
                                         "reason_code": outcome.error_code,
+                                        "cover_letter_diagnostic": (vacancy.data or {}).get("cover_letter_diagnostic"),
                                     },
                                 )
                                 db.commit()
@@ -3392,6 +4716,7 @@ class WorkflowManager:
                     db.commit()
             await asyncio.sleep(0.05)
 
+        flush_historical_overlaps()
         with SessionLocal() as db:
             item = db.get(JobSession, session_id)
             if item is None or item.status in {

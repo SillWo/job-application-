@@ -27,8 +27,9 @@ _QUESTION_BEARING_DATA_KEYS = frozenset({
     "unresolved", "application_error_reasons", "application_unanswered_questions",
 })
 _PENDING_VACANCY_STATES = {
-    "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT", "SUBMITTING",
+    "EXTRACTED", "EVALUATING", "READY_TO_SUBMIT", "READY_TO_REPORT",
 }
+_RECOVERABLE_EXTERNAL_STATES = {"SUBMITTING", "PARTIAL"}
 _TERMINAL_STATUSES = {
     SessionStatus.STOPPED, SessionStatus.CANCELLED,
     SessionStatus.FAILED, SessionStatus.COMPLETED,
@@ -124,10 +125,16 @@ def scrub_snapshot_question_artifacts(db, session_id: int) -> None:
         literals.update(_collect_question_literals(record.data))
     for event in events:
         literals.update(_collect_question_literals(event.data))
+    recoverable_ids = {
+        vacancy.id for vacancy in vacancies
+        if vacancy.state in _RECOVERABLE_EXTERNAL_STATES
+    }
     for record in records:
-        record.data = _scrub_question_data(record.data or {})
+        if record.vacancy_id not in recoverable_ids:
+            record.data = _scrub_question_data(record.data or {})
     for vacancy in vacancies:
-        vacancy.data = _replace_question_literals(_scrub_question_data(vacancy.data or {}), literals)
+        if vacancy.id not in recoverable_ids:
+            vacancy.data = _replace_question_literals(_scrub_question_data(vacancy.data or {}), literals)
     recovery = _scrub_question_data(item.recovery or {})
     for key in (
         "pending_refs", "pending_questions", "manual_application_vacancy_ids",

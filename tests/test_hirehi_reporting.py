@@ -14,6 +14,17 @@ def _pdf_text(path: str) -> str:
     return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
 
 
+def _pdf_uris(path: str) -> list[str]:
+    uris = []
+    for page in PdfReader(path).pages:
+        for annotation_ref in page.get("/Annots", []):
+            annotation = annotation_ref.get_object()
+            action = annotation.get("/A")
+            if action and action.get("/S") == "/URI":
+                uris.append(str(action.get("/URI")))
+    return uris
+
+
 def test_hirehi_application_limit_counts_reported_rows() -> None:
     session = SimpleNamespace(counters={"reported": 5, "submitted": 0})
 
@@ -22,9 +33,15 @@ def test_hirehi_application_limit_counts_reported_rows() -> None:
     assert _application_limit_reason("hirehi") == "Достигнут лимит выбранных вакансий"
 
 
-def test_hirehi_duplicate_scope_is_session_local_but_hh_remains_global() -> None:
-    assert len(_vacancy_scope("hirehi", "hirehi", "42", 7)) == 3
-    assert len(_vacancy_scope("hh", "hh", "42", 7)) == 2
+def test_duplicate_scope_is_session_local_for_all_sites() -> None:
+    for site in ("hh", "zarp", "hirehi"):
+        scope = _vacancy_scope(site, site, "42", 7)
+        other_session_scope = _vacancy_scope(site, site, "42", 8)
+
+        assert len(scope) == 3
+        assert scope[2].left.key == "session_id"
+        assert scope[2].right.value == 7
+        assert other_session_scope[2].right.value == 8
 
 
 def test_write_session_pdf_contains_all_report_fields(tmp_path, monkeypatch) -> None:
@@ -55,6 +72,50 @@ def test_write_session_pdf_contains_all_report_fields(tmp_path, monkeypatch) -> 
     assert "https://employer.example/jobs/42" in text
     assert "Рекомендуемое сопроводительное письмо" in text
     assert "Страница 1" in text
+
+
+def test_write_session_pdf_links_safe_web_urls_and_keeps_invalid_urls_plain(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    hirehi_url = 'https://hirehi.example/role/42?source=report&filter="quoted"'
+    employer_url = 'https://employer.example/jobs/42?team=R%26D&view="full"'
+
+    path = write_session_pdf(
+        900004,
+        [
+            {
+                "title": "Safe links",
+                "route_kind": "external_employer",
+                "hirehi_url": hirehi_url,
+                "target_url": employer_url,
+            },
+            {
+                "title": "Unsafe links",
+                "route_kind": "external_employer",
+                "hirehi_url": "javascript:alert(1)",
+                "target_url": "file:///C:/private/jobs/42",
+            },
+            {
+                "title": "Credential URL",
+                "route_kind": "external_employer",
+                "target_url": "https://user:password@employer.example/jobs/42",
+            },
+            {
+                "title": "Control character URL",
+                "route_kind": "external_employer",
+                "target_url": "https://employer.example/jobs/42?x=bad\x01value",
+            },
+        ],
+    )
+
+    reader = PdfReader(path)
+    assert _pdf_uris(path) == [hirehi_url, employer_url]
+    assert "javascript:alert(1)" in _pdf_text(path)
+    assert "file:///C:/private/jobs/42" in _pdf_text(path)
+    assert "https://user:password@employer.example/jobs/42" in _pdf_text(path)
+    assert "bad\\u0001value" in _pdf_text(path)
+    assert all(not page.get("/Annots") for page in reader.pages[1:])
 
 
 def test_write_session_pdf_does_not_add_footer_only_boundary_page(

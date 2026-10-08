@@ -9,7 +9,12 @@ from openai import APIError
 from pydantic import BaseModel
 
 from backend.intelligence import gateway as gateway_module
-from backend.intelligence.gateway import ModelGateway, ModelPermanentError, ModelUnavailable
+from backend.intelligence.gateway import (
+    ModelGateway,
+    ModelPermanentError,
+    ModelTransientError,
+    ModelUnavailable,
+)
 from backend.intelligence.hirehi_category import JobSummary
 from backend.intelligence.security import (
     PromptInjectionDetected,
@@ -125,15 +130,16 @@ class _UnionEnvelope(BaseModel):
 
 
 class _Completions:
-    def __init__(self, content, *, tool_calls=None):
+    def __init__(self, content, *, tool_calls=None, finish_reason="stop"):
         self.calls = []
         self.content = content
         self.tool_calls = tool_calls
+        self.finish_reason = finish_reason
 
     async def create(self, **kwargs):
         self.calls.append(copy.deepcopy(kwargs))
         message = SimpleNamespace(content=self.content, tool_calls=self.tool_calls)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=self.finish_reason)])
 
 
 class _Client:
@@ -212,6 +218,45 @@ async def test_provider_optional_nested_extra_is_rejected(monkeypatch):
     _configured(monkeypatch, completions)
     with pytest.raises(ModelPermanentError):
         await ModelGateway(provider="openai_compat").structured("job_summary", {}, _OptionalEnvelope)
+
+
+@pytest.mark.asyncio
+async def test_empty_provider_output_has_a_finite_retryable_error(monkeypatch):
+    completions = _Completions("")
+    _configured(monkeypatch, completions)
+    with pytest.raises(ModelTransientError) as raised:
+        await ModelGateway(provider="openai_compat").structured("job_summary", {}, JobSummary)
+    assert raised.value.error_code == "empty_output"
+    assert len(completions.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_truncated_provider_output_has_a_finite_retryable_error(monkeypatch):
+    completions = _Completions('{"summary":"partial', finish_reason="length")
+    _configured(monkeypatch, completions)
+    with pytest.raises(ModelTransientError) as raised:
+        await ModelGateway(provider="openai_compat").structured("job_summary", {}, JobSummary)
+    assert raised.value.error_code == "output_truncated"
+    assert len(completions.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_narrow_disabled_notice_is_permanent_and_does_not_leak_notice(monkeypatch):
+    completions = _Completions("The model is currently disabled.")
+    _configured(monkeypatch, completions)
+    with pytest.raises(ModelPermanentError) as raised:
+        await ModelGateway(provider="openai_compat").structured("job_summary", {}, JobSummary)
+    assert raised.value.error_code == "model_disabled"
+    assert "currently disabled" not in str(raised.value)
+    assert len(completions.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_notice_like_json_remains_a_schema_validation_error(monkeypatch):
+    completions = _Completions('{"summary":"model is disabled"}')
+    _configured(monkeypatch, completions)
+    result = await ModelGateway(provider="openai_compat").structured("job_summary", {}, JobSummary)
+    assert result.summary == "model is disabled"
 
 
 @pytest.mark.asyncio

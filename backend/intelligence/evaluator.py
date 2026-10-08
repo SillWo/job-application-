@@ -11,11 +11,13 @@ from backend.schemas.domain import (
     JobEvaluation,
     JobPosting,
     MatchAssessment,
+    RequiredPreferenceVerification,
     ResumeAnalysis,
     ScoreComponent,
 )
 
 from .gateway import ModelGateway
+from .preference_policy import POLICY_CONTRACT_VERSION, _required_not_applicable
 
 
 def _payload(value: Any) -> Any:
@@ -137,6 +139,15 @@ def _quote_grounded(quote: str, source_text: str) -> bool:
     return len(overlap) >= required
 
 
+def _quote_exactly_grounded(quote: str, source_text: str) -> bool:
+    """Require required-preference evidence to be a literal normalized quote."""
+    def normalize(value: str) -> str:
+        return " ".join(str(value).split()).casefold()
+
+    normalized_quote = normalize(quote)
+    return bool(normalized_quote and normalized_quote in normalize(source_text))
+
+
 def _has_explicit_special_requirements(job: JobPosting) -> bool:
     source = " ".join([job.description, *job.required_skills, *job.optional_skills])
     return bool(_SPECIAL_REQUIREMENT.search(source))
@@ -151,6 +162,7 @@ def _job_grounding_text(job: JobPosting) -> str:
     return " ".join(
         [
             job.title,
+            job.company or "",
             job.description,
             *job.responsibilities,
             *job.required_skills,
@@ -361,9 +373,19 @@ async def evaluate(
 
     # Keep the project's deterministic safety layer unchanged.
     analysis = _ground_resume_analysis(analysis, job, profile, resumes)
-    ungrounded_positive_scores = _ungrounded_positive_scores(analysis, job)
     job_text = _job_grounding_text(job)
     known = {flag.id: flag for flag in [*policy.green_flags, *policy.red_flags]}
+    required_green_flags = (
+        [
+            flag
+            for flag in policy.green_flags
+            if flag.required and not _required_not_applicable(flag)
+        ]
+        if policy.contract_version >= POLICY_CONTRACT_VERSION
+        else []
+    )
+    required_green_ids = {flag.id for flag in required_green_flags}
+    exact_required_evidence: dict[str, bool] = {}
     red_safety_issue = _red_flag_safety_issue(analysis, job, policy) if preference_policy else False
     matches: list[FlagMatch] = []
     seen_ids: set[str] = set()
@@ -371,12 +393,146 @@ async def evaluate(
         if match.flag_id not in known or match.flag_id in seen_ids:
             continue
         seen_ids.add(match.flag_id)
+        if match.flag_id in required_green_ids:
+            exact_required_evidence[match.flag_id] = any(
+                _quote_exactly_grounded(str(item), job_text) for item in match.evidence
+            )
         evidence = [str(item) for item in match.evidence if _quote_grounded(str(item), job_text)]
         matches.append(match.model_copy(update={"matched": bool(match.matched and match.confidence >= FLAG_CONFIDENCE_THRESHOLD and evidence), "evidence": evidence}))
     for flag_id in known:
         if flag_id not in seen_ids:
             matches.append(FlagMatch(flag_id=flag_id))
     analysis.flag_matches = matches
+
+    # Only spend a second independent check when the primary analyst has
+    # already cleared every required flag using grounded vacancy evidence.
+    # This verifier receives no applicant data or primary model output.
+    required_ids = [flag.id for flag in required_green_flags]
+    duplicate_required_ids = {
+        flag_id for flag_id in required_ids if required_ids.count(flag_id) > 1
+    }
+    if duplicate_required_ids:
+        # Ambiguous policy IDs cannot be verified independently or resolved
+        # against the analyst's ID-keyed matches. Fail closed for every copy.
+        matches = [
+            match.model_copy(update={
+                "matched": False,
+                "explanation": "Обязательные условия пожелания не подтверждены описанием вакансии.",
+            })
+            if match.flag_id in duplicate_required_ids
+            else match
+            for match in matches
+        ]
+        analysis.flag_matches = matches
+    elif required_green_flags:
+        primary_matches = {match.flag_id: match for match in matches}
+        primary_gate_passes = all(
+            bool(flag.source_quote)
+            and (match := primary_matches.get(flag.id)) is not None
+            and match.matched
+            and match.confidence >= FLAG_CONFIDENCE_THRESHOLD
+            and bool(match.evidence)
+            and exact_required_evidence.get(flag.id, False)
+            for flag in required_green_flags
+        )
+        if primary_gate_passes:
+            verification = await gateway.structured(
+                "required_preference_check",
+                {
+                    "job": job.model_dump(mode="json"),
+                    "required_flags": [flag.model_dump(mode="json") for flag in required_green_flags],
+                },
+                RequiredPreferenceVerification,
+            )
+            verified_rows = verification.flags
+            verification_ids = [item.flag_id for item in verified_rows]
+            has_unexpected_id = any(flag_id not in set(required_ids) for flag_id in verification_ids)
+            verified_by_id: dict[str, list] = {}
+            for item in verified_rows:
+                verified_by_id.setdefault(item.flag_id, []).append(item)
+
+            for index, match in enumerate(matches):
+                flag = next((item for item in required_green_flags if item.id == match.flag_id), None)
+                if flag is None:
+                    continue
+                candidates = verified_by_id.get(flag.id, [])
+                candidate = candidates[0] if len(candidates) == 1 else None
+                evidence = candidate.evidence if candidate is not None else []
+                evidence_is_exact = bool(evidence) and all(
+                    isinstance(quote, str) and _quote_exactly_grounded(quote, job_text)
+                    for quote in evidence
+                )
+                independently_matched = bool(
+                    not has_unexpected_id
+                    and candidate is not None
+                    and candidate.matched is True
+                    and candidate.confidence >= 0.90
+                    and not candidate.missing_conditions
+                    and evidence_is_exact
+                )
+                if independently_matched:
+                    matches[index] = match.model_copy(update={
+                        "evidence": list(dict.fromkeys(evidence)),
+                        "explanation": candidate.explanation.strip() or match.explanation,
+                    })
+                else:
+                    matches[index] = match.model_copy(update={
+                        "matched": False,
+                        "explanation": "Обязательные условия пожелания не подтверждены описанием вакансии.",
+                    })
+            analysis.flag_matches = matches
+
+    if policy.contract_version >= POLICY_CONTRACT_VERSION:
+        industry_flags = {
+            flag.id: flag
+            for flag in policy.green_flags
+            if flag.category == "desired_industry" and (flag.source_quote or "").strip()
+        }
+        exact_industry_evidence: list[str] = []
+        industry_confidence: list[float] = []
+        for match in matches:
+            flag = industry_flags.get(match.flag_id)
+            if (
+                flag is None
+                or not match.matched
+                or match.confidence < FLAG_CONFIDENCE_THRESHOLD
+            ):
+                continue
+            exact_evidence = [
+                str(quote)
+                for quote in match.evidence
+                if _quote_exactly_grounded(str(quote), job_text)
+            ]
+            if exact_evidence:
+                exact_industry_evidence.extend(exact_evidence)
+                industry_confidence.append(match.confidence)
+        if exact_industry_evidence:
+            industry_evidence = list(dict.fromkeys(exact_industry_evidence))
+            analysis.industry = analysis.industry.model_copy(
+                update={
+                    "score": 4,
+                    "confidence": max(industry_confidence),
+                    "evidence": industry_evidence,
+                    "explanation": (
+                        "Вакансия соответствует пожеланию по сфере: "
+                        + "; ".join(industry_evidence)
+                    ),
+                }
+            )
+    ungrounded_positive_scores = _ungrounded_positive_scores(analysis, job)
+    verified_matches = {match.flag_id: match for match in matches}
+    required_unconfirmed = [
+        flag
+        for flag in required_green_flags
+        if not flag.source_quote
+        or not (
+            (match := verified_matches.get(flag.id))
+            and match.matched
+            and match.confidence >= FLAG_CONFIDENCE_THRESHOLD
+            and match.evidence
+            and exact_required_evidence.get(flag.id, False)
+        )
+    ]
     red_hit = any(item.matched and item.flag_id in {flag.id for flag in policy.red_flags} for item in matches)
     salary_hit = False
     if policy.desired_salary and job.salary and job.salary.currency.casefold() == policy.desired_salary.currency.casefold():
@@ -415,6 +571,7 @@ async def evaluate(
         or salary_hit
         or red_safety_issue
         or ungrounded_positive_scores
+        or required_unconfirmed
     )
     # Keep the detailed violations in their dedicated internal fields, while the
     # reason shown in the vacancies UI stays short and understandable.
@@ -430,6 +587,8 @@ async def evaluate(
             blockers.append("результат проверки красных флагов не подтверждён")
         if ungrounded_positive_scores:
             blockers.append("положительные оценки не подтверждены текстом")
+        if required_unconfirmed:
+            blockers.append("обязательное требование из желаемой работы не подтверждено вакансией")
         reason = f"{reason.rstrip('.')} Вакансия не рекомендована: {', '.join(blockers)}."
     else:
         reason = f"{reason.rstrip('.')} Вакансия подходит для отклика."
@@ -444,9 +603,13 @@ async def evaluate(
         + (["preference_red_flag"] if red_hit else [])
         + (["preference_red_flag_unverified"] if red_safety_issue else [])
         + (["ungrounded_positive_score"] if ungrounded_positive_scores else [])
+        + [f"preference_required_unconfirmed:{flag.id}" for flag in required_unconfirmed]
         + (["salary_below_preference"] if salary_hit else []),
         flag_matches=matches,
-        preference_flags_verified=bool(preference_policy) and not red_safety_issue and not ungrounded_positive_scores,
+        preference_flags_verified=bool(preference_policy)
+        and not red_safety_issue
+        and not ungrounded_positive_scores
+        and not required_unconfirmed,
         decision="skip" if blocked else "apply",
         reason=reason,
         has_test_assignment=bool(job.has_test_assignment),

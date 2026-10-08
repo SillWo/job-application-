@@ -186,6 +186,7 @@ def test_status_filter_groups(vacancy_api):
                 Vacancy(source="test", site="", external_id="error-one", url="https://example.test/error-one", title="Error one", state="ERROR", data={"error_code": "SUBMISSION_UNCONFIRMED", "error_message": "Не подтверждено"}),
                 Vacancy(source="test", site="", external_id="error-two", url="https://example.test/error-two", title="Error two", state="ERROR", data={"error_code": "MFA_REQUIRED", "error_message": "Нужна проверка"}),
                 Vacancy(source="test", site="", external_id="processing", url="https://example.test/processing", title="Processing", state="EVALUATING", data={}),
+                Vacancy(source="test", site="", external_id="partial", url="https://example.test/partial", title="Partial", state="PARTIAL", data={}),
             ]
         )
         db.commit()
@@ -204,6 +205,11 @@ def test_status_filter_groups(vacancy_api):
 
     processing = client.get("/api/vacancies", params={"status_group": "PROCESSING"})
     assert {item["state"] for item in processing.json()["items"]} == {"EVALUATING"}
+
+    partial = client.get("/api/vacancies", params={"status_group": "PARTIAL"})
+    assert partial.status_code == 200
+    assert {item["state"] for item in partial.json()["items"]} == {"PARTIAL"}
+    assert all(item["status_group"] == "PARTIAL" for item in partial.json()["items"])
 
     exact = client.get("/api/vacancies", params={"state": "SUBMITTED"})
     assert exact.status_code == 200

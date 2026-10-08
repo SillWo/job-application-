@@ -66,8 +66,17 @@ def test_real_sdk_negotiates_explicitly_unsupported_parameters(monkeypatch, step
         assert "temperature" not in last
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 429, 500])
-def test_probe_does_not_retry_other_errors_or_expose_arbitrary_key(monkeypatch, status):
+@pytest.mark.parametrize(("status", "error_type", "error_code"), [
+    (400, gateway.ModelPermanentError, "provider_capability_unsupported"),
+    (401, gateway.ModelPermanentError, "provider_unauthorized"),
+    (403, gateway.ModelPermanentError, "provider_unauthorized"),
+    (404, gateway.ModelUnavailable, "provider_unavailable"),
+    (429, gateway.ModelUnavailable, "provider_unavailable"),
+    (500, gateway.ModelUnavailable, "provider_unavailable"),
+])
+def test_probe_does_not_retry_other_errors_or_expose_arbitrary_key(
+    monkeypatch, status, error_type, error_code,
+):
     requests = []
 
     def handle(request):
@@ -76,12 +85,13 @@ def test_probe_does_not_retry_other_errors_or_expose_arbitrary_key(monkeypatch, 
 
     transport = httpx.AsyncClient(transport=httpx.MockTransport(handle))
     monkeypatch.setattr(gateway, "model_http_client", lambda *args: transport)
-    with pytest.raises(gateway.ModelUnavailable) as error:
+    with pytest.raises(error_type) as error:
         asyncio.run(REAL_CHECK_CONNECTION(
             gateway.ModelGateway(provider="openai_compat"), "https://provider.example/v1",
             "arbitrary-secret-123", "model",
         ))
     assert "arbitrary-secret-123" not in str(error.value)
+    assert error.value.error_code == error_code
     assert len(requests) == 1
     assert transport.is_closed
 

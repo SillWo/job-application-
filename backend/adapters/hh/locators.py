@@ -61,7 +61,27 @@ SUBMISSION_TEXT_MARKERS = (
     "отклик успешно отправлен",
     "ваш отклик отправлен",
 )
-CAPTCHA_MARKERS = ("captcha", "Подтвердите, что вы не робот")
+# Only inspect visible challenge UI. Vacancy text can mention captchas as an
+# ordinary topic, so generic body-text matching is intentionally avoided.
+CAPTCHA_CHALLENGE = (
+    "iframe[src*='captcha' i], iframe[title*='captcha' i], "
+    "img[src*='captcha' i], img[alt*='captcha' i], "
+    "input:not([type='hidden'])[name*='captcha' i], "
+    "input:not([type='hidden'])[id*='captcha' i], "
+    "input:not([type='hidden'])[placeholder*='captcha' i], "
+    "[role='dialog']:has(img[alt*='captcha' i]):has(input:not([type='hidden'])), "
+    "[data-qa*='captcha' i], [data-testid*='captcha' i], "
+    "[data-smartcaptcha], [id*='captcha' i], [class*='captcha' i], "
+    "[id*='smartcaptcha' i], [class*='smartcaptcha' i]"
+)
+CAPTCHA_DIALOG = "[role='dialog']"
+CAPTCHA_TEXT_MARKERS = (
+    "подтвердите, что вы не робот",
+    "подтвердите, что вы человек",
+    "пройдите проверку безопасности",
+    "verify you are human",
+    "security check",
+)
 
 # Explicit empty-result UI; a blank/error page is never exhaustion.
 SEARCH_EMPTY = "[data-qa='vacancy-serp__vacancy-not-found'], [data-qa='vacancy-serp__no-results']"

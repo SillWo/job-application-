@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
-from backend.intelligence.gateway import ModelGateway, ModelPermanentError
+from backend.intelligence.gateway import ModelGateway, ModelOverloaded, ModelPermanentError
 from backend.intelligence.hirehi_category import JobSummary
 from backend.intelligence.model_broker import (
+    GLOBAL_OUTSTANDING_LIMIT,
+    QUEUE_WAIT_SECONDS,
+    SESSION_OUTSTANDING_LIMIT,
     ModelRequestBroker,
     ModelRequestClient,
-    ModelRequestFailed,
     ModelVersions,
     SubmitRequest,
 )
@@ -152,6 +155,50 @@ async def test_scheduler_never_runs_more_than_two_for_one_session(broker_db):
     assert broker.poll(receipts[2].request_id).status == "completed"
 
 
+def test_queue_admission_is_bounded_without_creating_rejected_rows(broker_db):
+    client = ModelRequestClient(broker_db)
+    receipts = [client.submit(request(1, "hh", f"session-{i}")) for i in range(SESSION_OUTSTANDING_LIMIT)]
+    with pytest.raises(ModelOverloaded) as raised:
+        client.submit(request(1, "hh", "session-overflow"))
+    assert raised.value.error_code == "queue_overloaded"
+    assert client.poll(receipts[-1].request_id).status == "queued"
+    with broker_db() as db:
+        assert db.scalar(select(func.count(ModelRequest.id))) == SESSION_OUTSTANDING_LIMIT
+
+
+def test_global_queue_admission_is_bounded_across_sessions(broker_db):
+    with broker_db() as db:
+        db.add(JobSession(id=4, adapter_id="other", status="RUNNING", counters={}))
+        db.commit()
+    client = ModelRequestClient(broker_db)
+    for session_id in (1, 2, 3):
+        for index in range(SESSION_OUTSTANDING_LIMIT):
+            client.submit(request(session_id, f"site-{session_id}", f"{session_id}-{index}"))
+    with pytest.raises(ModelOverloaded):
+        client.submit(request(4, "fourth-site", "global-overflow"))
+    with broker_db() as db:
+        assert db.scalar(select(func.count(ModelRequest.id))) == GLOBAL_OUTSTANDING_LIMIT
+
+
+def test_concurrent_submitters_cannot_claim_the_same_last_session_slot(broker_db):
+    client = ModelRequestClient(broker_db)
+    for index in range(SESSION_OUTSTANDING_LIMIT - 1):
+        client.submit(request(1, "hh", f"before-race-{index}"))
+
+    def submit(marker):
+        try:
+            return client.submit(request(1, "hh", marker))
+        except ModelOverloaded:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(submit, ("racer-one", "racer-two")))
+
+    assert sum(outcome is not None for outcome in outcomes) == 1
+    with broker_db() as db:
+        assert db.scalar(select(func.count(ModelRequest.id))) == SESSION_OUTSTANDING_LIMIT
+
+
 @pytest.mark.asyncio
 async def test_capacity_blocked_site_head_does_not_starve_other_session(broker_db):
     provider = BlockingProvider(expected=1)
@@ -176,6 +223,22 @@ async def test_capacity_blocked_site_head_does_not_starve_other_session(broker_d
     await asyncio.wait_for(provider.entered.wait(), timeout=1)
     assert provider.seen[0].request_id == runnable.request_id
     assert broker.poll(blocked_head.request_id).status == "queued"
+    provider.release.set()
+    await finish_active(broker)
+
+
+@pytest.mark.asyncio
+async def test_same_site_queue_rotates_to_another_session_with_capacity(broker_db):
+    provider = BlockingProvider(expected=3)
+    broker = ModelRequestBroker(broker_db, provider=provider)
+    for index in range(SESSION_OUTSTANDING_LIMIT):
+        broker.submit(request(1, "hh", f"session-one-{index}"))
+    broker.submit(request(2, "hh", "session-two"))
+
+    assert await broker.run_once() == 3
+    await asyncio.wait_for(provider.entered.wait(), timeout=1)
+    assert [call.session_id for call in provider.seen].count(1) == 2
+    assert [call.session_id for call in provider.seen].count(2) == 1
     provider.release.set()
     await finish_active(broker)
 
@@ -271,6 +334,78 @@ class MutableClock:
 
 
 @pytest.mark.asyncio
+async def test_ten_45_second_jobs_keep_queue_wait_separate_from_execution_deadline(broker_db):
+    clock = MutableClock()
+
+    class FortyFiveSecondProvider:
+        def __init__(self):
+            self.calls = []
+            self.clock_lock = asyncio.Lock()
+
+        async def generate(self, call):
+            self.calls.append(call)
+            async with self.clock_lock:
+                clock.advance(45)
+            return {"summary": call.payload["job"]["title"]}
+
+        async def catalog_status(self):
+            return {}
+
+    provider = FortyFiveSecondProvider()
+    broker = ModelRequestBroker(broker_db, provider=provider, clock=clock)
+    stages = ["discovery", "evaluation", "cover_letter", "submission"]
+    roles = ["job_summary", "resume_analyst", "writer", "application_answers"]
+    receipts = []
+    for index in range(10):
+        base = request(1, "hh" if index % 2 else "hirehi", f"slow-{index}")
+        receipts.append(broker.submit(replace(
+            base,
+            stage=stages[index % len(stages)],
+            role=roles[index % len(roles)],
+        )))
+
+    await broker.drain(timeout=5)
+
+    assert len(provider.calls) == 10
+    assert {broker.poll(receipt.request_id).status for receipt in receipts} == {"completed"}
+    assert {broker.poll(receipt.request_id).attempt for receipt in receipts} == {1}
+    assert clock.value >= datetime(2026, 9, 23, tzinfo=timezone.utc) + timedelta(seconds=450)
+
+
+def test_queue_deadline_expires_once_and_never_restarts_its_budget(broker_db):
+    clock = MutableClock()
+
+    class Provider:
+        async def generate(self, call):
+            raise AssertionError("expired queue row must not be claimed")
+
+        async def catalog_status(self):
+            return {}
+
+    broker = ModelRequestBroker(broker_db, provider=Provider(), clock=clock)
+    receipt = broker.submit(request(1, "hh", "queue-expiry"))
+    clock.advance(QUEUE_WAIT_SECONDS + 1)
+
+    assert broker._claim_one() is None
+    first = broker.poll(receipt.request_id)
+    assert first.status == "failed"
+    assert first.error_code == "queue_wait_exceeded"
+    assert first.attempt == 0
+    assert first.deadline_at == receipt.deadline_at
+    with broker_db() as db:
+        first_completed_at = db.get(ModelRequest, receipt.request_id).completed_at
+
+    clock.advance(QUEUE_WAIT_SECONDS)
+    assert broker._claim_one() is None
+    second = broker.poll(receipt.request_id)
+    assert second.deadline_at == first.deadline_at
+    with broker_db() as db:
+        row = db.get(ModelRequest, receipt.request_id)
+        assert row.completed_at == first_completed_at
+        assert row.attempt == 0
+
+
+@pytest.mark.asyncio
 async def test_retry_uses_bounded_backoff_and_same_logical_deadline(broker_db):
     class Flaky:
         def __init__(self):
@@ -289,12 +424,14 @@ async def test_retry_uses_bounded_backoff_and_same_logical_deadline(broker_db):
     provider = Flaky()
     broker = ModelRequestBroker(broker_db, provider=provider, clock=clock)
     receipt = broker.submit(request(1, "hh", "retry"))
-    original_deadline = receipt.deadline_at
+    queue_deadline = receipt.deadline_at
 
     await broker.run_once()
     await finish_active(broker)
     state = broker.poll(receipt.request_id)
     assert state.status == "retry" and state.attempt == 1
+    execution_deadline = state.deadline_at
+    assert execution_deadline < queue_deadline
     with broker_db() as db:
         row = db.get(ModelRequest, receipt.request_id)
         assert row.available_at == clock.value.replace(tzinfo=None) + timedelta(seconds=5)
@@ -305,7 +442,7 @@ async def test_retry_uses_bounded_backoff_and_same_logical_deadline(broker_db):
     await finish_active(broker)
     state = broker.poll(receipt.request_id)
     assert state.status == "completed" and state.attempt == 2
-    assert state.deadline_at == original_deadline
+    assert state.deadline_at == execution_deadline
     assert provider.calls[1].remaining_seconds == pytest.approx(175)
 
 
@@ -442,17 +579,15 @@ async def test_periodic_recovery_waits_for_live_heartbeat_then_recovers(broker_d
 
 
 @pytest.mark.asyncio
-async def test_worker_wait_persists_terminal_deadline_without_broker_tick(broker_db):
+async def test_worker_wait_does_not_expire_unclaimed_work_at_execution_limit(broker_db):
     clock = MutableClock()
     client = ModelRequestClient(broker_db, clock=clock)
     receipt = client.submit(request(1, "hh", "worker-timeout"))
     clock.advance(181)
-    with pytest.raises(ModelRequestFailed) as raised:
-        await client.wait(receipt.request_id, poll_interval=0)
-    assert raised.value.state.status == "failed"
     state = client.poll(receipt.request_id)
-    assert state.status == "failed"
-    assert state.error_code == "deadline_exceeded"
+    assert state.status == "queued"
+    assert state.deadline_at == receipt.deadline_at
+    assert state.error_code is None
 
 
 @pytest.mark.asyncio
